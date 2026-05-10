@@ -21,3 +21,15 @@ keywords:
   - extraction
   - proxy
 kubeVersion: ">=1.28.0"
+annotations:
+  # GHCR auto-links the package to this repo. When the repo is public
+  # the package inherits public visibility on push (no manual UI flip).
+  org.opencontainers.image.source: https://github.com/ctolon/owui-cee-proxy
+  org.opencontainers.image.licenses: MIT
+  org.opencontainers.image.documentation: https://github.com/ctolon/owui-cee-proxy/blob/main/README.md
+  artifacthub.io/license: MIT
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/ctolon/owui-cee-proxy
+    - name: documentation
+      url: https://github.com/ctolon/owui-cee-proxy/blob/main/docs/ARCHITECTURE.md
