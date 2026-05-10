@@ -14,9 +14,10 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/breaker"
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
-	"github.com/ctolon/owui-cee-proxy/internal/engine/docling"
-	"github.com/ctolon/owui-cee-proxy/internal/engine/kreuzberg"
-	"github.com/ctolon/owui-cee-proxy/internal/engine/tika"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/docling"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/doclingexternal"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/external"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/tika"
 	"github.com/ctolon/owui-cee-proxy/internal/httpclient"
 	"github.com/ctolon/owui-cee-proxy/internal/observability"
 	"github.com/ctolon/owui-cee-proxy/internal/tasks"
@@ -88,48 +89,46 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 	}, nil
 }
 
+// buildRegistry iterates over the user-defined engines map and
+// constructs each adapter from its compat_type. Adding a new
+// compat_type is one switch arm here plus a new package under
+// internal/engine/compat/.
 func buildRegistry(cfg *config.Config) (engine.Registry, error) {
 	entries := map[engine.Name]engine.RegistryEntry{}
-	if cfg.Engines.Docling.Enable {
-		client, err := httpclient.New(cfg.Engines.Docling)
-		if err != nil {
-			return nil, err
+	for name, ec := range cfg.Engines {
+		if !ec.Enable {
+			continue
 		}
-		br := breaker.New("docling", cfg.Engines.Docling.Breaker)
-		ad, err := docling.New(cfg.Engines.Docling, client, br)
+		client, err := httpclient.New(ec)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("engine %s: httpclient: %w", name, err)
 		}
-		entries[engine.Docling] = engine.RegistryEntry{Engine: ad, MimeTypes: cfg.Engines.Docling.MimeTypes}
-	}
-	if cfg.Engines.Tika.Enable {
-		client, err := httpclient.New(cfg.Engines.Tika)
+		br := breaker.New(name, ec.Breaker)
+		ad, err := newAdapterByCompat(engine.Name(name), ec, client, br)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("engine %s: %w", name, err)
 		}
-		br := breaker.New("tika", cfg.Engines.Tika.Breaker)
-		ad, err := tika.New(cfg.Engines.Tika, client, br)
-		if err != nil {
-			return nil, err
-		}
-		entries[engine.Tika] = engine.RegistryEntry{Engine: ad, MimeTypes: cfg.Engines.Tika.MimeTypes}
-	}
-	if cfg.Engines.Kreuzberg.Enable {
-		client, err := httpclient.New(cfg.Engines.Kreuzberg)
-		if err != nil {
-			return nil, err
-		}
-		br := breaker.New("kreuzberg", cfg.Engines.Kreuzberg.Breaker)
-		ad, err := kreuzberg.New(cfg.Engines.Kreuzberg, client, br)
-		if err != nil {
-			return nil, err
-		}
-		entries[engine.Kreuzberg] = engine.RegistryEntry{Engine: ad, MimeTypes: cfg.Engines.Kreuzberg.MimeTypes}
+		entries[engine.Name(name)] = engine.RegistryEntry{Engine: ad, MimeTypes: ec.MimeTypes}
 	}
 	if len(entries) == 0 {
 		return nil, errors.New("no engines enabled")
 	}
-	return engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultCEEEngine))
+	return engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultEngine))
+}
+
+func newAdapterByCompat(name engine.Name, ec config.EngineConfig, client *httpclient.Client, br *breaker.Breaker) (engine.Engine, error) {
+	switch ec.CompatType {
+	case config.CompatDocling:
+		return docling.New(name, ec, client, br)
+	case config.CompatExternal:
+		return external.New(name, ec, client, br)
+	case config.CompatTika:
+		return tika.New(name, ec, client, br)
+	case config.CompatDoclingExternal:
+		return doclingexternal.New(name, ec, client, br)
+	default:
+		return nil, fmt.Errorf("unknown compat_type %q", ec.CompatType)
+	}
 }
 
 // Run starts the HTTP server and (optional) async worker. It blocks
@@ -155,7 +154,6 @@ func (a *Application) Run(ctx context.Context) error {
 		a.logger.Info().Msg("shutdown_signal_received")
 	case err := <-errCh:
 		a.logger.Error().Err(err).Msg("subsystem_failed")
-		// fall through to ordered shutdown
 	}
 
 	return a.shutdown()
@@ -183,5 +181,4 @@ func (a *Application) shutdown() error {
 }
 
 // errContextDone is a sentinel matching http.ErrServerClosed semantics.
-// Captured at runtime via errors.Is.
 var errContextDone = errors.New("context done")

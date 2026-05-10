@@ -23,7 +23,11 @@ type healthStubEngine struct {
 }
 
 func (s *healthStubEngine) Name() engine.Name { return s.name }
-func (s *healthStubEngine) Convert(ctx context.Context, _ *engine.ConvertRequest) (*engine.ConvertResponse, error) {
+func (s *healthStubEngine) Capabilities() engine.EngineCapabilities {
+	return engine.EngineCapabilities{Facades: []engine.Facade{engine.FacadeDocling}}
+}
+
+func (s *healthStubEngine) Convert(_ context.Context, _ *engine.ConvertRequest) (*engine.ConvertResponse, error) {
 	return nil, nil
 }
 
@@ -50,26 +54,26 @@ func (r *healthStubRegistry) Get(name engine.Name) (engine.Engine, error) {
 	return e, nil
 }
 func (r *healthStubRegistry) Default() engine.Engine { return r.engines[r.order[0]] }
-func (r *healthStubRegistry) Pick(_ string) engine.Engine {
+
+func (r *healthStubRegistry) Pick(_ engine.Facade, _ string) engine.Engine {
 	return r.engines[r.order[0]]
 }
+
+func (r *healthStubRegistry) PickWithError(_ engine.Facade, _ string) (engine.Engine, error) {
+	return r.engines[r.order[0]], nil
+}
+
 func (r *healthStubRegistry) Names() []engine.Name { return r.order }
 
 func TestReadiness_RunsHealthChecksConcurrently(t *testing.T) {
 	t.Parallel()
-	// Two stub engines, each sleeping ~400ms in Health(). If the
-	// handler runs them sequentially the total wall time is ~800ms
-	// + overhead. Concurrent execution should finish in ~400ms +
-	// overhead. We assert clearly under 700ms — generous to keep
-	// the test stable on slow CI but tight enough to catch a
-	// regression to sequential.
 	delay := 400 * time.Millisecond
 	reg := &healthStubRegistry{
 		engines: map[engine.Name]engine.Engine{
-			engine.Docling: &healthStubEngine{name: engine.Docling, delay: delay},
-			engine.Tika:    &healthStubEngine{name: engine.Tika, delay: delay},
+			"primary":   &healthStubEngine{name: "primary", delay: delay},
+			"secondary": &healthStubEngine{name: "secondary", delay: delay},
 		},
-		order: []engine.Name{engine.Docling, engine.Tika},
+		order: []engine.Name{"primary", "secondary"},
 	}
 	h := &Health{Registry: reg}
 
@@ -90,22 +94,18 @@ func TestReadiness_RunsHealthChecksConcurrently(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Equal(t, "ready", body.Status)
-	require.Equal(t, "ok", body.Engines["docling"])
-	require.Equal(t, "ok", body.Engines["tika"])
+	require.Equal(t, "ok", body.Engines["primary"])
+	require.Equal(t, "ok", body.Engines["secondary"])
 }
 
-// M4 — readyz must not echo upstream error strings into the response
-// body. The response should carry the literal "unhealthy" instead, so
-// callers cannot fingerprint backend hostnames, ports, or breaker
-// state. The full error text still reaches the configured logger.
 func TestReadiness_RedactsUpstreamErrorString(t *testing.T) {
 	t.Parallel()
-	internal := "post http://docling.internal:8080/health: connect: connection refused"
+	internalErr := "post http://docling.internal:8080/health: connect: connection refused"
 	reg := &healthStubRegistry{
 		engines: map[engine.Name]engine.Engine{
-			engine.Docling: &healthStubEngine{name: engine.Docling, err: errors.New(internal)},
+			"primary": &healthStubEngine{name: "primary", err: errors.New(internalErr)},
 		},
-		order: []engine.Name{engine.Docling},
+		order: []engine.Name{"primary"},
 	}
 	h := &Health{Registry: reg}
 	rec := httptest.NewRecorder()
@@ -123,22 +123,18 @@ func TestReadiness_RedactsUpstreamErrorString(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &parsed))
 	require.Equal(t, "not-ready", parsed.Status)
-	require.Equal(t, "unhealthy", parsed.Engines["docling"],
+	require.Equal(t, "unhealthy", parsed.Engines["primary"],
 		"readyz body must use the redacted literal, never an error message")
 }
 
 func TestReadiness_FailureSurfacesAcrossOtherProbes(t *testing.T) {
 	t.Parallel()
-	// One engine fails, another succeeds. The successful one's
-	// status should still be reported, and overall should flip to
-	// 503. This protects the parallel-probe contract: a failure
-	// must not abort still-running probes.
 	reg := &healthStubRegistry{
 		engines: map[engine.Name]engine.Engine{
-			engine.Docling: &healthStubEngine{name: engine.Docling, delay: 50 * time.Millisecond},
-			engine.Tika:    &healthStubEngine{name: engine.Tika, delay: 50 * time.Millisecond, err: context.DeadlineExceeded},
+			"primary":   &healthStubEngine{name: "primary", delay: 50 * time.Millisecond},
+			"secondary": &healthStubEngine{name: "secondary", delay: 50 * time.Millisecond, err: context.DeadlineExceeded},
 		},
-		order: []engine.Name{engine.Docling, engine.Tika},
+		order: []engine.Name{"primary", "secondary"},
 	}
 	h := &Health{Registry: reg}
 

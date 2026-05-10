@@ -116,46 +116,40 @@ config:
       client_auth: "none"
       client_ca_file: ""
   routing:
-    default_cee_engine: "docling"
-    facade_path_prefix: "/v1"
+    default_engine: "main-docling"
+    facade:
+      docling:
+        enabled: true
+        prefix: "/v1"
+      external:
+        enabled: true
+        path: "/process"
     passthrough:
-      docling_prefix: "/docling"
-      tika_prefix: "/tika"
-      kreuzberg_prefix: "/kreuzberg"
+      enabled: true
+  # User-defined engine map. Each entry's compat_type selects the
+  # adapter (docling | external | docling-external | tika).
   engines:
-    docling:
+    main-docling:
       enable: true
+      compat_type: "docling"
       url: "http://docling-serve:5001"
       api_key_env: "DOCLING_API_KEY"
+      auth_header: "X-Api-Key"
+      auth_scheme: "raw"
       request_timeout: 120s
       health_path: "/health"
-      # ignored for default engine; catch-all wins.
       mime_types: []
-    tika:
-      enable: true
-      url: "http://tika:9998"
-      api_key_env: "TIKA_API_KEY"
-      request_timeout: 90s
-      health_path: "/version"
-      mime_types:
-        - "application/pdf"
-        - "application/msword"
-        - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        - "application/vnd.ms-excel"
-        - "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        - "application/rtf"
-    kreuzberg:
-      enable: true
+    fallback-kreuzberg:
+      enable: false
+      compat_type: "docling"
       url: "http://kreuzberg:8000"
       api_key_env: "KREUZBERG_API_KEY"
-      request_timeout: 90s
+      auth_header: "Authorization"
+      auth_scheme: "bearer"
       health_path: "/health"
       mime_types:
-        - "image/*"
-        - "application/vnd.ms-powerpoint"
-        - "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        - "text/html"
-        - "text/markdown"
+        - "application/vnd.ms-outlook"
+        - "message/rfc822"
   security:
     proxy_api_keys_env: "PROXY_API_KEYS"
     proxy_api_key_header: "X-Proxy-Api-Key"

@@ -44,9 +44,16 @@ func TestTika_FacadeReturnsDoclingShape(t *testing.T) {
 	tikaURL := "http://" + host + ":" + port.Port()
 
 	cfg := config.Default()
-	cfg.Routing.DefaultCEEEngine = "tika"
-	cfg.Engines.Tika.Enable = true
-	cfg.Engines.Tika.URL = tikaURL
+	cfg.Routing.DefaultEngine = "tika"
+	cfg.Engines = map[string]config.EngineConfig{
+		"tika": {
+			Enable:     true,
+			CompatType: config.CompatTika,
+			URL:        tikaURL,
+			AuthHeader: "X-Api-Key",
+			AuthScheme: "raw",
+		},
+	}
 
 	proxy := newProxyServer(t, cfg)
 	waitForReadiness(t, proxy.URL+"/healthz", 30*time.Second)
@@ -91,9 +98,16 @@ func TestTika_PassthroughReturnsNativeJSON(t *testing.T) {
 	tikaURL := "http://" + host + ":" + port.Port()
 
 	cfg := config.Default()
-	cfg.Routing.DefaultCEEEngine = "tika"
-	cfg.Engines.Tika.Enable = true
-	cfg.Engines.Tika.URL = tikaURL
+	cfg.Routing.DefaultEngine = "tika"
+	cfg.Engines = map[string]config.EngineConfig{
+		"tika": {
+			Enable:     true,
+			CompatType: config.CompatTika,
+			URL:        tikaURL,
+			AuthHeader: "X-Api-Key",
+			AuthScheme: "raw",
+		},
+	}
 
 	proxy := newProxyServer(t, cfg)
 	waitForReadiness(t, proxy.URL+"/healthz", 30*time.Second)

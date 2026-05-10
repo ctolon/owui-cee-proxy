@@ -78,11 +78,16 @@ func (w *Worker) handleConvert(ctx context.Context, t *asynq.Task) error {
 		})
 	}
 
+	facade := engine.Facade(p.Facade)
+	if facade == "" {
+		facade = engine.FacadeDocling
+	}
 	req := &engine.ConvertRequest{
 		Files:     files,
 		Sources:   p.Sources,
 		Options:   p.Options,
 		RequestID: p.RequestID,
+		Facade:    facade,
 	}
 
 	w.logger.Info().

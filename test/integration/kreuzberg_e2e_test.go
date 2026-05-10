@@ -37,10 +37,17 @@ func TestKreuzberg_FacadeReturnsDoclingShape(t *testing.T) {
 	kbURL := "http://" + host + ":" + port.Port()
 
 	cfg := config.Default()
-	cfg.Routing.DefaultCEEEngine = "kreuzberg"
-	cfg.Engines.Kreuzberg.Enable = true
-	cfg.Engines.Kreuzberg.URL = kbURL
-	cfg.Engines.Kreuzberg.ForwardOptions = map[string]string{"output_format": "markdown"}
+	cfg.Routing.DefaultEngine = "kreuzberg"
+	cfg.Engines = map[string]config.EngineConfig{
+		"kreuzberg": {
+			Enable:         true,
+			CompatType:     config.CompatDocling, // Kreuzberg's /v1/convert/file is docling-compat.
+			URL:            kbURL,
+			AuthHeader:     "Authorization",
+			AuthScheme:     "bearer",
+			ForwardOptions: map[string]string{"output_format": "markdown"},
+		},
+	}
 
 	proxy := newProxyServer(t, cfg)
 	waitForReadiness(t, proxy.URL+"/healthz", 30*time.Second)

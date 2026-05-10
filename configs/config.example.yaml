@@ -42,26 +42,35 @@ server:
     client_ca_file: ""
 
 routing:
-  # default_cee_engine handles requests whose first file Content-Type
-  # does not match any non-default engine's mime_types list. Per-engine
+  # default_engine handles requests whose first file Content-Type does
+  # not match any non-default engine's mime_types list. Per-engine
   # mime_types are declared inside engines.<name>.mime_types below.
   # Patterns may be exact ("application/pdf") or top-level wildcards
   # ("image/*"). Matching is case-insensitive and ignores params.
-  default_cee_engine: "docling"   # docling | tika | kreuzberg
-  facade_path_prefix: "/v1"
+  default_engine: "docling"
+  facade:
+    docling:
+      enabled: true
+      prefix: "/v1"
+    external:
+      enabled: true
+      path: "/process"
   passthrough:
-    docling_prefix: "/docling"
-    tika_prefix: "/tika"
-    kreuzberg_prefix: "/kreuzberg"
+    enabled: true   # mounts /<engine-name>/* per enabled engine
 
+# engines: is a user-keyed map. Each entry's compat_type drives the
+# adapter implementation (docling | external | docling-external | tika).
 engines:
   docling:
     enable: true
+    compat_type: "docling"
     url: "http://docling-serve:5001"
     api_key_env: "DOCLING_API_KEY"
+    auth_header: "X-Api-Key"
+    auth_scheme: "raw"
     request_timeout: 120s
     health_path: "/health"
-    # mime_types is ignored for the engine selected as default_cee_engine
+    # mime_types is ignored for the engine selected as default_engine
     # (the default is the catch-all). It is honored for non-default
     # enabled engines.
     mime_types: []
@@ -91,8 +100,11 @@ engines:
 
   tika:
     enable: true
+    compat_type: "tika"
     url: "http://tika:9998"
     api_key_env: "TIKA_API_KEY"
+    auth_header: "X-Api-Key"
+    auth_scheme: "raw"
     request_timeout: 90s
     health_path: "/version"
     mime_types:
@@ -122,8 +134,11 @@ engines:
 
   kreuzberg:
     enable: true
+    compat_type: "docling"          # Kreuzberg's /v1/convert/file is docling-shape.
     url: "http://kreuzberg:8000"
     api_key_env: "KREUZBERG_API_KEY"
+    auth_header: "Authorization"
+    auth_scheme: "bearer"
     request_timeout: 90s
     health_path: "/health"
     mime_types:
@@ -149,6 +164,19 @@ engines:
     rate_limit:
       rps: 50
       burst: 100
+
+  # Example: an OpenWebUI-external-loader-shape backend (e.g., MinerU).
+  # Disabled by default; enable + set MINERU_API_KEY to use.
+  mineru:
+    enable: false
+    compat_type: "external"
+    url: "http://mineru:8000"
+    api_key_env: "MINERU_API_KEY"
+    auth_header: "Authorization"
+    auth_scheme: "bearer"
+    paths:
+      external_process: "/process"
+    mime_types: []
 
 security:
   proxy_api_keys_env: "PROXY_API_KEYS"

@@ -56,18 +56,22 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 	defer cleanup()
 
+	// Async endpoints belong to the docling facade.
+	payload.Facade = string(engine.FacadeDocling)
 	eng := a.Registry.Default()
 	if !source && len(payload.BlobKeys) > 0 {
-		eng = a.Registry.Pick(payload.BlobKeys[0].ContentType)
+		eng = a.Registry.Pick(engine.FacadeDocling, payload.BlobKeys[0].ContentType)
 	}
 
-	// M14: source-mode is only supported by Docling. Reject early so
-	// callers see a 400 instead of a synthetic 501 surfaced from the
-	// worker after a Redis round-trip.
-	if source && len(payload.Sources) > 0 && eng.Name() != engine.Docling {
+	// M14 (capability-based): reject source mode early when the chosen
+	// engine does not advertise HTTPSources support, so callers see a
+	// 400 instead of a synthetic 501 surfaced from the worker after a
+	// Redis round-trip. This replaces the old hard-coded
+	// "engine == Docling" check with the generic capability lookup.
+	if source && len(payload.Sources) > 0 && !eng.Capabilities().HTTPSources {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"status": "failure",
-			"errors": []map[string]string{{"message": fmt.Sprintf("engine %s does not support http_sources; use docling", eng.Name())}},
+			"errors": []map[string]string{{"message": fmt.Sprintf("engine %s does not support http_sources", eng.Name())}},
 		})
 		return
 	}

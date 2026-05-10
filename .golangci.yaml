@@ -66,7 +66,7 @@ linters:
       # Adapter helpers wrap http.Client.Do; bodyclose can't trace through
       # one indirection. The actual handlers DO close response bodies via
       # defer in convertOne / Convert.
-      - path: internal/engine/(docling|kreuzberg|tika)/.*\.go
+      - path: internal/engine/compat/(docling|external|tika|doclingexternal)/.*\.go
         linters:
           - bodyclose
 

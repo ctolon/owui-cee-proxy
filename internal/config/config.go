@@ -4,17 +4,18 @@
 //  1. Built-in defaults (Default()).
 //  2. YAML file at the path passed to Load.
 //  3. Environment variables prefixed with OWUI_PROXY_ using "__" as
-//     the path separator (e.g. OWUI_PROXY_ENGINES__TIKA__URL).
+//     the path separator (e.g. OWUI_PROXY_ENGINES__MAIN-DOCLING__URL).
 //
 // Secrets (API keys) are never read from YAML. The YAML names the env
 // variable (api_key_env) and the loader resolves it into the runtime
-// struct via ResolveSecrets.
+// struct via resolveSecrets.
 package config
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,18 +27,9 @@ import (
 )
 
 // Secret wraps a string value that must never be printed or marshaled
-// in cleartext. It exists so accidental inclusion in logs / debug
-// dumps / JSON status endpoints redacts to "***" instead of leaking the
-// secret. The underlying type is `string` so that:
-//   - YAML/env deserialisation still works (koanf assigns plain strings),
-//   - existing call sites can convert with `string(s)` when they need
-//     the actual value (e.g. setting an Authorization header).
+// in cleartext.
 type Secret string
 
-// String implements fmt.Stringer. Always returns "***" for non-empty
-// secrets; empty secrets render as "" so callers can still detect
-// "is the secret unset?" by comparing the Stringer output for empty —
-// but the canonical empty check is `s == ""` against the typed value.
 func (s Secret) String() string {
 	if s == "" {
 		return ""
@@ -45,9 +37,6 @@ func (s Secret) String() string {
 	return "***"
 }
 
-// MarshalJSON ensures Secret values never bleed into JSON-formatted
-// logs or status responses. Empty secrets serialise to "" so consumers
-// can distinguish "unset" from "redacted set value".
 func (s Secret) MarshalJSON() ([]byte, error) {
 	if s == "" {
 		return json.Marshal("")
@@ -55,100 +44,137 @@ func (s Secret) MarshalJSON() ([]byte, error) {
 	return json.Marshal("***")
 }
 
-// MarshalText mirrors MarshalJSON for text-encoders (zerolog console,
-// fmt %v with stringer, etc).
 func (s Secret) MarshalText() ([]byte, error) {
 	return []byte(s.String()), nil
 }
 
 const (
-	envPrefix     = "OWUI_PROXY_"
-	envSeparator  = "__"
-	keySeparator  = "."
-	defaultEngine = "docling"
+	envPrefix    = "OWUI_PROXY_"
+	envSeparator = "__"
+	keySeparator = "."
 )
 
+// CompatType identifies the wire-protocol family an engine speaks. The
+// transport layer dispatches each request to the adapter package
+// matching this value.
+const (
+	CompatDocling         = "docling"
+	CompatExternal        = "external"
+	CompatDoclingExternal = "docling-external"
+	CompatTika            = "tika"
+)
+
+// Engine name validation. We use the YAML key as a URL path segment
+// for the passthrough mounts; restrict it to a safe charset.
+var engineNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
+
+// Auth header validation: visible ASCII only, no CR/LF, reasonable
+// length cap.
+var authHeaderRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
+
 type Config struct {
-	Server          ServerConfig        `koanf:"server" validate:"required"`
-	Routing         RoutingConfig       `koanf:"routing" validate:"required"`
-	Engines         EnginesConfig       `koanf:"engines" validate:"required"`
-	Security        SecurityConfig      `koanf:"security"`
-	RateLimitGlobal RateLimitConfig     `koanf:"ratelimit_global"`
-	Tasks           TasksConfig         `koanf:"tasks"`
-	Observability   ObservabilityConfig `koanf:"observability"`
+	Server          ServerConfig            `koanf:"server" validate:"required"`
+	Routing         RoutingConfig           `koanf:"routing" validate:"required"`
+	Engines         map[string]EngineConfig `koanf:"engines" validate:"required,dive"`
+	Security        SecurityConfig          `koanf:"security"`
+	RateLimitGlobal RateLimitConfig         `koanf:"ratelimit_global"`
+	Tasks           TasksConfig             `koanf:"tasks"`
+	Observability   ObservabilityConfig     `koanf:"observability"`
 }
 
 type ServerConfig struct {
-	Listen            string        `koanf:"listen" validate:"required,hostname_port"`
-	ReadTimeout       time.Duration `koanf:"read_timeout"`
-	ReadHeaderTimeout time.Duration `koanf:"read_header_timeout"`
-	WriteTimeout      time.Duration `koanf:"write_timeout"`
-	IdleTimeout       time.Duration `koanf:"idle_timeout"`
-	// RequestTimeout caps the per-request handler deadline applied to the
-	// authenticated subtree by the Timeout middleware. Distinct from the
-	// transport-level Read/Write timeouts because we want streaming
-	// uploads/downloads to be governed by handler context, not the socket.
-	RequestTimeout time.Duration   `koanf:"request_timeout"`
-	MaxHeaderBytes int             `koanf:"max_header_bytes" validate:"gte=0"`
-	MaxBodyBytes   int64           `koanf:"max_body_bytes" validate:"gte=0"`
-	ShutdownGrace  time.Duration   `koanf:"shutdown_grace"`
-	HTTP2          bool            `koanf:"http2"`
-	H2C            bool            `koanf:"h2c"`
-	TLS            TLSServerConfig `koanf:"tls"`
+	Listen            string          `koanf:"listen" validate:"required,hostname_port"`
+	ReadTimeout       time.Duration   `koanf:"read_timeout"`
+	ReadHeaderTimeout time.Duration   `koanf:"read_header_timeout"`
+	WriteTimeout      time.Duration   `koanf:"write_timeout"`
+	IdleTimeout       time.Duration   `koanf:"idle_timeout"`
+	RequestTimeout    time.Duration   `koanf:"request_timeout"`
+	MaxHeaderBytes    int             `koanf:"max_header_bytes" validate:"gte=0"`
+	MaxBodyBytes      int64           `koanf:"max_body_bytes" validate:"gte=0"`
+	ShutdownGrace     time.Duration   `koanf:"shutdown_grace"`
+	HTTP2             bool            `koanf:"http2"`
+	H2C               bool            `koanf:"h2c"`
+	TLS               TLSServerConfig `koanf:"tls"`
 }
 
 type TLSServerConfig struct {
-	Enabled    bool   `koanf:"enabled"`
-	CertFile   string `koanf:"cert_file"`
-	KeyFile    string `koanf:"key_file"`
-	MinVersion string `koanf:"min_version"`
-	// ClientAuth selects mTLS behavior. "require" was intentionally
-	// dropped because it accepts ANY client cert without verifying it
-	// against ClientCAs — almost certainly not what operators expect.
-	// Use "require-and-verify" for strict mTLS.
+	Enabled      bool   `koanf:"enabled"`
+	CertFile     string `koanf:"cert_file"`
+	KeyFile      string `koanf:"key_file"`
+	MinVersion   string `koanf:"min_version"`
 	ClientAuth   string `koanf:"client_auth" validate:"omitempty,oneof=none request verify require-and-verify"`
 	ClientCAFile string `koanf:"client_ca_file"`
 }
 
 type RoutingConfig struct {
-	DefaultCEEEngine string            `koanf:"default_cee_engine" validate:"required,oneof=docling tika kreuzberg"`
-	FacadePathPrefix string            `koanf:"facade_path_prefix" validate:"required,startswith=/"`
-	Passthrough      PassthroughConfig `koanf:"passthrough"`
+	// DefaultEngine references a key in Engines. The named engine MUST
+	// be enabled; cross-field validation in Validate() enforces this.
+	DefaultEngine string            `koanf:"default_engine" validate:"required"`
+	Facade        FacadeConfig      `koanf:"facade"`
+	Passthrough   PassthroughConfig `koanf:"passthrough"`
+}
+
+// FacadeConfig controls which client-facing protocols the proxy
+// exposes.
+type FacadeConfig struct {
+	Docling  DoclingFacadeConfig  `koanf:"docling"`
+	External ExternalFacadeConfig `koanf:"external"`
+}
+
+type DoclingFacadeConfig struct {
+	Enabled bool   `koanf:"enabled"`
+	Prefix  string `koanf:"prefix" validate:"omitempty,startswith=/"`
+}
+
+type ExternalFacadeConfig struct {
+	Enabled bool `koanf:"enabled"`
+	// Path is the route mounted to accept PUT raw-body requests, per
+	// OpenWebUI's external loader contract (default `/process`).
+	Path string `koanf:"path" validate:"omitempty,startswith=/"`
 }
 
 type PassthroughConfig struct {
-	DoclingPrefix   string `koanf:"docling_prefix" validate:"omitempty,startswith=/"`
-	TikaPrefix      string `koanf:"tika_prefix" validate:"omitempty,startswith=/"`
-	KreuzbergPrefix string `koanf:"kreuzberg_prefix" validate:"omitempty,startswith=/"`
+	Enabled bool `koanf:"enabled"`
 }
 
-type EnginesConfig struct {
-	Docling   EngineConfig `koanf:"docling"`
-	Tika      EngineConfig `koanf:"tika"`
-	Kreuzberg EngineConfig `koanf:"kreuzberg"`
-}
-
+// EngineConfig is the per-engine entry under the engines map. The map
+// key (e.g., "main-docling") is the engine's name; this struct holds
+// the rest.
 type EngineConfig struct {
 	Enable bool `koanf:"enable"`
-	// L2: required_if uses validator's cross-field check so an enabled
-	// engine must declare a URL. omitempty + url keeps the validation
-	// permissive when the engine is disabled.
-	URL            string        `koanf:"url" validate:"required_if=Enable true,omitempty,url"`
-	APIKeyEnv      string        `koanf:"api_key_env"`
-	APIKey         Secret        `koanf:"-"` // populated from env at startup
-	RequestTimeout time.Duration `koanf:"request_timeout"`
-	HealthPath     string        `koanf:"health_path"`
-	// MimeTypes lists the MIME types this engine claims. When a request
-	// is dispatched through the Docling-compatible facade, the first
-	// file's Content-Type is matched against the MimeTypes lists of
-	// every NON-DEFAULT enabled engine; the first match wins. Default
-	// engine handles anything that does not match. Patterns are exact
-	// (e.g. "application/pdf") or top-level wildcards ("image/*").
+	// CompatType selects the adapter wire-protocol family.
+	CompatType string `koanf:"compat_type" validate:"required_if=Enable true,omitempty,oneof=docling external docling-external tika"`
+	URL        string `koanf:"url" validate:"required_if=Enable true,omitempty,url"`
+	APIKeyEnv  string `koanf:"api_key_env"`
+	APIKey     Secret `koanf:"-"`
+	// AuthHeader is the outbound HTTP header name to stamp with the
+	// engine's API key. Defaults supplied per compat_type by Validate
+	// when empty.
+	AuthHeader string `koanf:"auth_header" validate:"omitempty"`
+	// AuthScheme adjusts how the API key is rendered. "raw" uses the
+	// key value as-is (e.g., "X-Api-Key: abc123"); "bearer" prepends
+	// "Bearer " (e.g., "Authorization: Bearer abc123").
+	AuthScheme     string            `koanf:"auth_scheme" validate:"omitempty,oneof=raw bearer"`
+	RequestTimeout time.Duration     `koanf:"request_timeout"`
+	HealthPath     string            `koanf:"health_path"`
 	MimeTypes      []string          `koanf:"mime_types"`
+	Paths          EnginePathsConfig `koanf:"paths"`
 	ForwardOptions map[string]string `koanf:"forward_options"`
 	HTTP           HTTPClientConfig  `koanf:"http"`
 	Breaker        BreakerConfig     `koanf:"breaker"`
 	RateLimit      RateLimitConfig   `koanf:"rate_limit"`
+}
+
+// EnginePathsConfig overrides per-compat default paths. When a field
+// is empty the adapter uses its built-in default.
+type EnginePathsConfig struct {
+	// docling-family
+	DoclingConvertFile   string `koanf:"docling_convert_file"`
+	DoclingConvertSource string `koanf:"docling_convert_source"`
+	// external-family
+	ExternalProcess string `koanf:"external_process"`
+	// tika-family
+	TikaText string `koanf:"tika_text"`
 }
 
 type HTTPClientConfig struct {
@@ -186,7 +212,7 @@ type RateLimitConfig struct {
 type SecurityConfig struct {
 	ProxyAPIKeysEnv   string     `koanf:"proxy_api_keys_env"`
 	ProxyAPIKeyHeader string     `koanf:"proxy_api_key_header"`
-	ProxyAPIKeys      []Secret   `koanf:"-"` // resolved from env
+	ProxyAPIKeys      []Secret   `koanf:"-"`
 	RequireAPIKey     bool       `koanf:"require_api_key"`
 	TrustedProxies    []string   `koanf:"trusted_proxies"`
 	CORS              CORSConfig `koanf:"cors"`
@@ -201,23 +227,17 @@ type CORSConfig struct {
 }
 
 type TasksConfig struct {
-	Enabled          bool          `koanf:"enabled"`
-	RedisURLEnv      string        `koanf:"redis_url_env"`
-	RedisURL         Secret        `koanf:"-"` // resolved from env
-	QueueConcurrency int           `koanf:"queue_concurrency"`
-	Retention        time.Duration `koanf:"retention"`
-	Retry            int           `koanf:"retry"`
-	ResultTTL        time.Duration `koanf:"result_ttl"`
-	// TaskTimeout caps a single task's execution wall time. Distinct
-	// from Retention, which is the lifetime of task state in Redis.
-	TaskTimeout time.Duration `koanf:"task_timeout"`
-	// MaxBlobBytes is the per-blob upper bound enforced at enqueue.
-	MaxBlobBytes int64 `koanf:"max_blob_bytes" validate:"gte=0"`
-	// MaxTotalBytes is the aggregate cap across all blobs in a task.
-	MaxTotalBytes int64 `koanf:"max_total_bytes" validate:"gte=0"`
-	// QueueWeights controls asynq's per-queue weighting; defaults to
-	// {default:6, low:3, critical:1}.
-	QueueWeights map[string]int `koanf:"queue_weights"`
+	Enabled          bool           `koanf:"enabled"`
+	RedisURLEnv      string         `koanf:"redis_url_env"`
+	RedisURL         Secret         `koanf:"-"`
+	QueueConcurrency int            `koanf:"queue_concurrency"`
+	Retention        time.Duration  `koanf:"retention"`
+	Retry            int            `koanf:"retry"`
+	ResultTTL        time.Duration  `koanf:"result_ttl"`
+	TaskTimeout      time.Duration  `koanf:"task_timeout"`
+	MaxBlobBytes     int64          `koanf:"max_blob_bytes" validate:"gte=0"`
+	MaxTotalBytes    int64          `koanf:"max_total_bytes" validate:"gte=0"`
+	QueueWeights     map[string]int `koanf:"queue_weights"`
 }
 
 type ObservabilityConfig struct {
@@ -254,38 +274,27 @@ func Default() *Config {
 			Listen:            "0.0.0.0:8080",
 			ReadTimeout:       30 * time.Second,
 			ReadHeaderTimeout: 10 * time.Second,
-			// WriteTimeout previously defaulted to 0 (unbounded), letting
-			// slow-loris-style response stalls hold sockets indefinitely.
-			// 5m matches RequestTimeout: a single request that legitimately
-			// takes that long will not be cut off mid-stream.
-			WriteTimeout: 5 * time.Minute,
-			IdleTimeout:  120 * time.Second,
-			// RequestTimeout governs the handler-level deadline applied
-			// by the Timeout middleware on the authenticated subtree.
-			RequestTimeout: 5 * time.Minute,
-			MaxHeaderBytes: 1 << 20,
-			MaxBodyBytes:   500 << 20,
-			ShutdownGrace:  30 * time.Second,
-			HTTP2:          true,
+			WriteTimeout:      5 * time.Minute,
+			IdleTimeout:       120 * time.Second,
+			RequestTimeout:    5 * time.Minute,
+			MaxHeaderBytes:    1 << 20,
+			MaxBodyBytes:      500 << 20,
+			ShutdownGrace:     30 * time.Second,
+			HTTP2:             true,
 			TLS: TLSServerConfig{
 				MinVersion: "1.3",
 				ClientAuth: "none",
 			},
 		},
 		Routing: RoutingConfig{
-			DefaultCEEEngine: defaultEngine,
-			FacadePathPrefix: "/v1",
-			Passthrough: PassthroughConfig{
-				DoclingPrefix:   "/docling",
-				TikaPrefix:      "/tika",
-				KreuzbergPrefix: "/kreuzberg",
+			DefaultEngine: "",
+			Facade: FacadeConfig{
+				Docling:  DoclingFacadeConfig{Enabled: true, Prefix: "/v1"},
+				External: ExternalFacadeConfig{Enabled: true, Path: "/process"},
 			},
+			Passthrough: PassthroughConfig{Enabled: true},
 		},
-		Engines: EnginesConfig{
-			Docling:   defaultEngineConfig(),
-			Tika:      defaultEngineConfig(),
-			Kreuzberg: defaultEngineConfig(),
-		},
+		Engines: map[string]EngineConfig{},
 		Security: SecurityConfig{
 			ProxyAPIKeysEnv:   "PROXY_API_KEYS",
 			ProxyAPIKeyHeader: "X-Proxy-Api-Key",
@@ -300,14 +309,11 @@ func Default() *Config {
 			Retry:            3,
 			ResultTTL:        time.Hour,
 			TaskTimeout:      5 * time.Minute,
-			MaxBlobBytes:     100 << 20, // 100 MiB
-			MaxTotalBytes:    500 << 20, // 500 MiB
+			MaxBlobBytes:     100 << 20,
+			MaxTotalBytes:    500 << 20,
 			QueueWeights:     map[string]int{"default": 6, "low": 3, "critical": 1},
 		},
 		Observability: ObservabilityConfig{
-			// AddCaller defaults to false: caller resolution is moderately
-			// expensive (per-line runtime.Caller) and operators should opt
-			// in only for debug investigations.
 			Log:     LogConfig{Level: "info", Format: "json", AddCaller: false},
 			Metrics: MetricsConfig{Enabled: true, Path: "/metrics"},
 			Tracing: TracingConfig{Enabled: false, SampleRatio: 0.1, ServiceName: "owui-cee-proxy"},
@@ -315,9 +321,12 @@ func Default() *Config {
 	}
 }
 
-func defaultEngineConfig() EngineConfig {
+// DefaultEngineConfig returns a baseline EngineConfig used as a
+// per-entry merge layer. Exported so the migration helper can reuse it.
+func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
 		Enable:         false,
+		AuthScheme:     "raw",
 		RequestTimeout: 120 * time.Second,
 		HealthPath:     "/health",
 		HTTP: HTTPClientConfig{
@@ -351,16 +360,11 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("load yaml %q: %w", path, err)
 		}
 	}
-	// M9: koanf merges env over YAML by overwriting scalar keys, but
-	// SLICE-typed YAML keys (e.g. engines.tika.mime_types,
-	// security.trusted_proxies, security.proxy_api_keys, tasks
-	// queue_weights map) cannot be appended to via env vars — there is
-	// no list-append semantics in the env provider. Operators wanting
-	// to override a slice MUST replace the entire YAML key, e.g. by
-	// shipping a new YAML file or by setting the JSON-encoded value
-	// through whatever runtime they use to launch the proxy. The
-	// scalar-only keys (URL, paths, header names, etc.) compose
-	// normally with OWUI_PROXY_* env vars.
+	// koanf merges env over YAML by overwriting scalar keys. SLICE/map
+	// YAML keys (engines.<n>.mime_types, security.trusted_proxies,
+	// security.proxy_api_keys, tasks.queue_weights, the engines map
+	// itself) cannot be appended to via env vars. Operators wanting to
+	// override a slice/map MUST replace the entire YAML key.
 	if err := k.Load(envprovider.Provider(envPrefix, keySeparator, envTransform), nil); err != nil {
 		return nil, fmt.Errorf("load env: %w", err)
 	}
@@ -368,6 +372,7 @@ func Load(path string) (*Config, error) {
 	if err := k.UnmarshalWithConf("", out, koanf.UnmarshalConf{Tag: "koanf"}); err != nil {
 		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
+	applyEngineDefaults(out)
 	resolveSecrets(out)
 	if err := Validate(out); err != nil {
 		return nil, err
@@ -382,10 +387,68 @@ func envTransform(s string) string {
 	return strings.ReplaceAll(s, envSeparator, keySeparator)
 }
 
+// applyEngineDefaults fills missing per-engine fields from
+// DefaultEngineConfig() so callers can write a concise YAML stanza
+// without repeating http/breaker/rate_limit subtrees.
+func applyEngineDefaults(c *Config) {
+	def := DefaultEngineConfig()
+	for name, ec := range c.Engines {
+		if ec.AuthScheme == "" {
+			ec.AuthScheme = def.AuthScheme
+		}
+		if ec.RequestTimeout == 0 {
+			ec.RequestTimeout = def.RequestTimeout
+		}
+		if ec.HealthPath == "" {
+			ec.HealthPath = def.HealthPath
+		}
+		if ec.HTTP.MaxIdleConns == 0 {
+			ec.HTTP.MaxIdleConns = def.HTTP.MaxIdleConns
+		}
+		if ec.HTTP.MaxIdleConnsPerHost == 0 {
+			ec.HTTP.MaxIdleConnsPerHost = def.HTTP.MaxIdleConnsPerHost
+		}
+		if ec.HTTP.IdleConnTimeout == 0 {
+			ec.HTTP.IdleConnTimeout = def.HTTP.IdleConnTimeout
+		}
+		if ec.HTTP.TLSHandshakeTimeout == 0 {
+			ec.HTTP.TLSHandshakeTimeout = def.HTTP.TLSHandshakeTimeout
+		}
+		if ec.HTTP.ResponseHeaderTimeout == 0 {
+			ec.HTTP.ResponseHeaderTimeout = def.HTTP.ResponseHeaderTimeout
+		}
+		if ec.HTTP.ExpectContinueTimeout == 0 {
+			ec.HTTP.ExpectContinueTimeout = def.HTTP.ExpectContinueTimeout
+		}
+		if ec.Breaker.MaxRequests == 0 {
+			ec.Breaker = def.Breaker
+		}
+		if ec.RateLimit.RPS == 0 && ec.RateLimit.Burst == 0 {
+			ec.RateLimit = def.RateLimit
+		}
+		// Default auth header by compat_type when unset.
+		if ec.AuthHeader == "" {
+			switch ec.CompatType {
+			case CompatExternal:
+				ec.AuthHeader = "Authorization"
+				if ec.AuthScheme == "raw" {
+					ec.AuthScheme = "bearer"
+				}
+			default:
+				ec.AuthHeader = "X-Api-Key"
+			}
+		}
+		c.Engines[name] = ec
+	}
+}
+
 func resolveSecrets(c *Config) {
-	resolveEngineSecret(&c.Engines.Docling)
-	resolveEngineSecret(&c.Engines.Tika)
-	resolveEngineSecret(&c.Engines.Kreuzberg)
+	for name, ec := range c.Engines {
+		if ec.APIKeyEnv != "" {
+			ec.APIKey = Secret(os.Getenv(ec.APIKeyEnv))
+		}
+		c.Engines[name] = ec
+	}
 	if c.Security.ProxyAPIKeysEnv != "" {
 		if v := os.Getenv(c.Security.ProxyAPIKeysEnv); v != "" {
 			parts := splitAndTrim(v)
@@ -399,13 +462,6 @@ func resolveSecrets(c *Config) {
 	if c.Tasks.RedisURLEnv != "" {
 		c.Tasks.RedisURL = Secret(os.Getenv(c.Tasks.RedisURLEnv))
 	}
-}
-
-func resolveEngineSecret(e *EngineConfig) {
-	if e.APIKeyEnv == "" {
-		return
-	}
-	e.APIKey = Secret(os.Getenv(e.APIKeyEnv))
 }
 
 func splitAndTrim(s string) []string {
@@ -426,7 +482,19 @@ func Validate(c *Config) error {
 	if err := v.Struct(c); err != nil {
 		return fmt.Errorf("config validation: %w", err)
 	}
-	if err := validateEngineSelected(c); err != nil {
+	if err := validateEngineNames(c); err != nil {
+		return err
+	}
+	if err := validateAuthHeaders(c); err != nil {
+		return err
+	}
+	if err := validateDefaultEngine(c); err != nil {
+		return err
+	}
+	if err := validateFacadeCoverage(c); err != nil {
+		return err
+	}
+	if err := validateEnginePaths(c); err != nil {
 		return err
 	}
 	if c.Tasks.Enabled && c.Tasks.RedisURL == "" {
@@ -451,29 +519,105 @@ func Validate(c *Config) error {
 	return nil
 }
 
-func validateEngineSelected(c *Config) error {
-	switch c.Routing.DefaultCEEEngine {
-	case "docling":
-		if !c.Engines.Docling.Enable {
-			return fmt.Errorf("default_cee_engine=docling but engines.docling.enable=false")
-		}
-		if c.Engines.Docling.URL == "" {
-			return fmt.Errorf("engines.docling.url is required when enabled")
-		}
-	case "tika":
-		if !c.Engines.Tika.Enable {
-			return fmt.Errorf("default_cee_engine=tika but engines.tika.enable=false")
-		}
-		if c.Engines.Tika.URL == "" {
-			return fmt.Errorf("engines.tika.url is required when enabled")
-		}
-	case "kreuzberg":
-		if !c.Engines.Kreuzberg.Enable {
-			return fmt.Errorf("default_cee_engine=kreuzberg but engines.kreuzberg.enable=false")
-		}
-		if c.Engines.Kreuzberg.URL == "" {
-			return fmt.Errorf("engines.kreuzberg.url is required when enabled")
+func validateEngineNames(c *Config) error {
+	for name := range c.Engines {
+		if !engineNameRE.MatchString(name) {
+			return fmt.Errorf("engines.%q: invalid name; must match %s", name, engineNameRE)
 		}
 	}
+	return nil
+}
+
+func validateAuthHeaders(c *Config) error {
+	for name, ec := range c.Engines {
+		if !ec.Enable {
+			continue
+		}
+		if ec.AuthHeader != "" && !authHeaderRE.MatchString(ec.AuthHeader) {
+			return fmt.Errorf("engines.%s.auth_header %q: invalid header name; must match %s", name, ec.AuthHeader, authHeaderRE)
+		}
+	}
+	return nil
+}
+
+func validateDefaultEngine(c *Config) error {
+	if c.Routing.DefaultEngine == "" {
+		return fmt.Errorf("routing.default_engine is required")
+	}
+	ec, ok := c.Engines[c.Routing.DefaultEngine]
+	if !ok {
+		return fmt.Errorf("routing.default_engine=%q not found in engines", c.Routing.DefaultEngine)
+	}
+	if !ec.Enable {
+		return fmt.Errorf("routing.default_engine=%q must be enabled", c.Routing.DefaultEngine)
+	}
+	if ec.URL == "" {
+		return fmt.Errorf("engines.%s.url is required when enabled", c.Routing.DefaultEngine)
+	}
+	return nil
+}
+
+// validateFacadeCoverage ensures that every enabled facade has at
+// least one enabled engine that answers it. AcceptedFacades returns
+// the set of facades a compat_type can answer.
+func validateFacadeCoverage(c *Config) error {
+	doclingCount, externalCount := 0, 0
+	for _, ec := range c.Engines {
+		if !ec.Enable {
+			continue
+		}
+		facades := acceptedFacades(ec.CompatType)
+		for _, f := range facades {
+			switch f {
+			case "docling":
+				doclingCount++
+			case "external":
+				externalCount++
+			}
+		}
+	}
+	if c.Routing.Facade.Docling.Enabled && doclingCount == 0 {
+		return fmt.Errorf("routing.facade.docling.enabled=true but no engine answers the docling facade")
+	}
+	if c.Routing.Facade.External.Enabled && externalCount == 0 {
+		return fmt.Errorf("routing.facade.external.enabled=true but no engine answers the external facade")
+	}
+	return nil
+}
+
+// acceptedFacades is the canonical mapping from compat_type to the
+// facades an engine of that compat_type answers. This is the single
+// source of truth used by config validation; the engine adapters'
+// Capabilities() method reads the same logic via the same lookup.
+func acceptedFacades(compat string) []string {
+	switch compat {
+	case CompatDocling:
+		return []string{"docling"}
+	case CompatExternal:
+		return []string{"external"}
+	case CompatDoclingExternal:
+		return []string{"docling", "external"}
+	case CompatTika:
+		// Tika's wire format is sui generis but the proxy adapts it for
+		// either inbound facade.
+		return []string{"docling", "external"}
+	default:
+		return nil
+	}
+}
+
+// AcceptedFacades is an exported wrapper used by the engine adapters
+// so the canonical compat_type → facade mapping lives in this package.
+func AcceptedFacades(compat string) []string { return acceptedFacades(compat) }
+
+// validateEnginePaths enforces that docling-external engines declare
+// both endpoint paths (or rely on built-in defaults — declared empty
+// means use the adapter default).
+func validateEnginePaths(c *Config) error {
+	// Currently the adapter defaults handle empty path overrides, so
+	// no per-compat path enforcement is required at validation time.
+	// Reserved for future use (e.g., when a compat_type lacks a
+	// canonical default path).
+	_ = c
 	return nil
 }

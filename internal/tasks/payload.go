@@ -26,6 +26,7 @@ const TypeConvert = "convert"
 // either a list of file blob references (Redis keys) or HTTPSources.
 type Payload struct {
 	Engine    string              `json:"engine"`
+	Facade    string              `json:"facade,omitempty"`
 	RequestID string              `json:"request_id"`
 	BlobKeys  []BlobRef           `json:"blob_keys,omitempty"`
 	Sources   []engine.HTTPSource `json:"sources,omitempty"`

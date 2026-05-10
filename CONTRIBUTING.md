@@ -57,9 +57,19 @@ release notes — sections, code snippets, migration guidance.
 
 ## Adding a new engine
 
-Use the slash command `/new-engine <name>`. It scaffolds the adapter,
-config block, registry wiring, contract test, and integration test
-stub in one go. See `CLAUDE.md` for the manual recipe.
+Two distinct paths:
+
+1. **Another instance of an existing compat_type** (e.g., a backup
+   Docling Serve) — **no code change required**. Add an entry to
+   `engines:` in your YAML config, set `compat_type` to one of
+   `docling | external | docling-external | tika`, and restart.
+2. **A brand-new compat_type** (e.g., for a backend with a wire
+   format that none of the existing adapters can speak) — use the
+   slash command `/new-engine <compat_type> <name>`. It scaffolds
+   the adapter package under `internal/engine/compat/<compat_type>/`,
+   wires the dispatcher case in `internal/app/app.go`, adds the
+   contract test, and updates the matrix in
+   `docs/ARCHITECTURE.md`. See `CLAUDE.md` for the manual recipe.
 
 ## Updating dependencies
 

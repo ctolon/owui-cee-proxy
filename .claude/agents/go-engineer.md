@@ -35,16 +35,32 @@ You are the Go engineer agent for the OpenWebUI CEE Proxy.
 
 # Workflow
 
-When asked to add a new engine:
+When asked to add a new engine, FIRST decide which path applies:
 
-1. Use `Glob` + `Read` to learn the Docling/Tika/Kreuzberg adapters.
-2. Mirror the structure: `internal/engine/<name>/{<name>.go,transform.go,<name>_test.go}`.
-3. Wire `enginetest.RunContractTests` in the test file.
-4. Add a config block.
-5. Update `app.buildRegistry`.
-6. Update `apiKeyHeaderFor` if needed.
-7. Add an integration test stub under `test/integration/`.
-8. Run `make test`.
+- **Another instance of an existing compat_type** (`docling`,
+  `external`, `docling-external`, `tika`) → no Go code change.
+  Update `configs/config.example.yaml` (and Helm `values.yaml`) with
+  a new `engines.<name>` block. Done.
+- **A brand-new compat_type** (e.g., `marker`, `mineru`, `paddle`):
+  1. Use `Glob` + `Read` to learn `internal/engine/compat/{docling,
+     tika,external,doclingexternal}` adapters.
+  2. Mirror the structure under
+     `internal/engine/compat/<compat_type>/{<compat_type>.go,
+     transform.go, <compat_type>_test.go}`.
+  3. Implement `Capabilities()` to declare which facades the adapter
+     answers. Use `req.Facade` inside `Convert` to shape the
+     response.
+  4. Wire `enginetest.RunContractTests` in the test file.
+  5. Add `Compat<Title>` constant in `internal/config/config.go` and
+     extend the compat_type enum validator.
+  6. Add a switch case in
+     `internal/app/app.go::newAdapterByCompat`.
+  7. Update the matrix in `docs/ARCHITECTURE.md` §4 and `CLAUDE.md`.
+  8. Add an integration test stub under `test/integration/`.
+  9. Run `make test`.
+
+Generic passthrough mounts at `/<engine-name>/*` are wired
+automatically — do **not** add per-engine route handlers.
 
 # Things you should never do
 

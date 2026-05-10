@@ -24,6 +24,13 @@ type recordingEngine struct {
 }
 
 func (r *recordingEngine) Name() engine.Name { return r.name }
+func (r *recordingEngine) Capabilities() engine.EngineCapabilities {
+	return engine.EngineCapabilities{
+		Facades:     []engine.Facade{engine.FacadeDocling},
+		HTTPSources: true,
+	}
+}
+
 func (r *recordingEngine) Convert(_ context.Context, _ *engine.ConvertRequest) (*engine.ConvertResponse, error) {
 	r.hits.Add(1)
 	h := http.Header{}
@@ -34,21 +41,22 @@ func (r *recordingEngine) Convert(_ context.Context, _ *engine.ConvertRequest) (
 		Body:       io.NopCloser(strings.NewReader(`{"status":"success"}`)),
 	}, nil
 }
+
 func (r *recordingEngine) Health(_ context.Context) error { return nil }
 
 func TestConvert_RoutesByMIME(t *testing.T) {
 	t.Parallel()
 
-	doclingHits, tikaHits, kbHits := &atomic.Int32{}, &atomic.Int32{}, &atomic.Int32{}
-	d := &recordingEngine{name: engine.Docling, hits: doclingHits}
-	tk := &recordingEngine{name: engine.Tika, hits: tikaHits}
-	kb := &recordingEngine{name: engine.Kreuzberg, hits: kbHits}
+	defaultHits, pdfHits, imgHits := &atomic.Int32{}, &atomic.Int32{}, &atomic.Int32{}
+	d := &recordingEngine{name: "default-eng", hits: defaultHits}
+	pdf := &recordingEngine{name: "pdf-eng", hits: pdfHits}
+	img := &recordingEngine{name: "img-eng", hits: imgHits}
 
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
-		engine.Docling:   {Engine: d},
-		engine.Tika:      {Engine: tk, MimeTypes: []string{"application/pdf"}},
-		engine.Kreuzberg: {Engine: kb, MimeTypes: []string{"image/*"}},
-	}, engine.Docling)
+		"default-eng": {Engine: d},
+		"pdf-eng":     {Engine: pdf, MimeTypes: []string{"application/pdf"}},
+		"img-eng":     {Engine: img, MimeTypes: []string{"image/*"}},
+	}, "default-eng")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry}
@@ -60,15 +68,18 @@ func TestConvert_RoutesByMIME(t *testing.T) {
 		want    *atomic.Int32
 		wantOne int32
 	}{
-		{"application/pdf", tikaHits, 1},
-		{"image/png", kbHits, 1},
-		{"application/octet-stream", doclingHits, 1},
-		{"text/plain", doclingHits, 2}, // catches second "no match" case
+		{"application/pdf", pdfHits, 1},
+		{"image/png", imgHits, 1},
+		{"application/octet-stream", defaultHits, 1},
+		{"text/plain", defaultHits, 2},
 	}
 
 	for _, c := range cases {
 		body, contentType := buildMultipart(t, "x", c.mime)
-		resp, err := http.Post(srv.URL, contentType, body)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, body)
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", contentType)
+		resp, err := srv.Client().Do(req)
 		require.NoError(t, err, "mime=%s", c.mime)
 		_ = resp.Body.Close()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -78,57 +89,60 @@ func TestConvert_RoutesByMIME(t *testing.T) {
 
 func TestConvert_SourceModeUsesDefault(t *testing.T) {
 	t.Parallel()
-	doclingHits, tikaHits := &atomic.Int32{}, &atomic.Int32{}
-	d := &recordingEngine{name: engine.Docling, hits: doclingHits}
-	tk := &recordingEngine{name: engine.Tika, hits: tikaHits}
+	defaultHits, otherHits := &atomic.Int32{}, &atomic.Int32{}
+	d := &recordingEngine{name: "default-eng", hits: defaultHits}
+	o := &recordingEngine{name: "other-eng", hits: otherHits}
 
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
-		engine.Docling: {Engine: d},
-		engine.Tika:    {Engine: tk, MimeTypes: []string{"application/pdf"}},
-	}, engine.Docling)
+		"default-eng": {Engine: d},
+		"other-eng":   {Engine: o, MimeTypes: []string{"application/pdf"}},
+	}, "default-eng")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry}
 	srv := httptest.NewServer(http.HandlerFunc(h.Source))
 	defer srv.Close()
 
-	resp, err := http.Post(srv.URL, "application/json", strings.NewReader(
-		`{"http_sources":[{"url":"https://1.1.1.1/x.pdf"}]}`,
-	))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL,
+		strings.NewReader(`{"http_sources":[{"url":"https://1.1.1.1/x.pdf"}]}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	_ = resp.Body.Close()
-	require.Zero(t, tikaHits.Load(), "source mode must NOT route by mime")
-	require.EqualValues(t, 1, doclingHits.Load())
+	require.Zero(t, otherHits.Load(), "source mode must NOT route by mime")
+	require.EqualValues(t, 1, defaultHits.Load())
 }
 
-// failingEngine returns a rich error that includes the backend URL —
-// this is what the M5 redaction test feeds the handler. The handler
-// must NOT echo that string into the caller-facing response body.
 type failingEngine struct {
 	name engine.Name
 	err  error
 }
 
 func (f *failingEngine) Name() engine.Name { return f.name }
+func (f *failingEngine) Capabilities() engine.EngineCapabilities {
+	return engine.EngineCapabilities{Facades: []engine.Facade{engine.FacadeDocling}, HTTPSources: true}
+}
+
 func (f *failingEngine) Convert(_ context.Context, _ *engine.ConvertRequest) (*engine.ConvertResponse, error) {
 	return nil, f.err
 }
+
 func (f *failingEngine) Health(_ context.Context) error { return nil }
 
 // TestConvert_EngineErrorIsRedacted (M5) — engine errors that contain
 // internal URLs / hostnames must not leak into the caller response.
-// The response body should reference the request_id only.
 func TestConvert_EngineErrorIsRedacted(t *testing.T) {
 	t.Parallel()
 
 	internal := "http://docling-serve.internal:8080/v1/convert/file"
 	fe := &failingEngine{
-		name: engine.Docling,
+		name: "primary",
 		err:  errors.New("post " + internal + ": connect: connection refused"),
 	}
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
-		engine.Docling: {Engine: fe},
-	}, engine.Docling)
+		"primary": {Engine: fe},
+	}, "primary")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry}
@@ -136,7 +150,10 @@ func TestConvert_EngineErrorIsRedacted(t *testing.T) {
 	defer srv.Close()
 
 	body, contentType := buildMultipart(t, "x", "application/pdf")
-	resp, err := http.Post(srv.URL, contentType, body)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", contentType)
+	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
@@ -156,41 +173,38 @@ func TestConvert_EngineErrorIsRedacted(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &parsed))
 	require.Equal(t, "failure", parsed.Status)
 	require.Len(t, parsed.Errors, 1)
-	require.Contains(t, parsed.Errors[0]["message"], "engine docling failed")
+	require.Contains(t, parsed.Errors[0]["message"], "engine primary failed")
 }
 
-// TestConvert_ResolveURLDefaultsWhenNil (L3) — Convert{ResolveURL:nil}
-// must fall back to the package-default policy. We verify by sending a
-// blocked URL to source mode and checking the handler rejects it.
 func TestConvert_ResolveURLDefaultsWhenNil(t *testing.T) {
 	t.Parallel()
-	d := &recordingEngine{name: engine.Docling, hits: &atomic.Int32{}}
+	d := &recordingEngine{name: "primary", hits: &atomic.Int32{}}
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
-		engine.Docling: {Engine: d},
-	}, engine.Docling)
+		"primary": {Engine: d},
+	}, "primary")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry, ResolveURL: nil}
 	srv := httptest.NewServer(http.HandlerFunc(h.Source))
 	defer srv.Close()
 
-	// 127.0.0.1 is loopback — the default policy must reject it.
-	resp, err := http.Post(srv.URL, "application/json",
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL,
 		strings.NewReader(`{"http_sources":[{"url":"http://127.0.0.1/x.pdf"}]}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	require.Zero(t, d.hits.Load(), "engine must not be called when SSRF policy rejects")
 }
 
-// TestConvert_ResolveURLOverride confirms a custom resolver replaces
-// the default — same Convert, different policy.
 func TestConvert_ResolveURLOverride(t *testing.T) {
 	t.Parallel()
-	d := &recordingEngine{name: engine.Docling, hits: &atomic.Int32{}}
+	d := &recordingEngine{name: "primary", hits: &atomic.Int32{}}
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
-		engine.Docling: {Engine: d},
-	}, engine.Docling)
+		"primary": {Engine: d},
+	}, "primary")
 	require.NoError(t, err)
 
 	calls := 0
@@ -204,9 +218,11 @@ func TestConvert_ResolveURLOverride(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(h.Source))
 	defer srv.Close()
 
-	// 10.0.0.1 would normally be blocked but the override permits it.
-	resp, err := http.Post(srv.URL, "application/json",
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL,
 		strings.NewReader(`{"http_sources":[{"url":"http://10.0.0.1/x.pdf"}]}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, 1, calls, "custom resolver must be invoked")
