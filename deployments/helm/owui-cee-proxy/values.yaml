@@ -1,0 +1,190 @@
+replicaCount: 2
+
+image:
+  repository: docker.io/ctolon17/owui-cee-proxy
+  tag: ""           # defaults to .Chart.AppVersion (0.0.1)
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsUser: 65532
+  runAsGroup: 65532
+  runAsNonRoot: true
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  hosts:
+    - host: owui-cee-proxy.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+gateway:
+  enabled: false
+  className: envoy
+  parentRef:
+    name: envoy-gateway
+    namespace: envoy-gateway-system
+  hostnames:
+    - owui-cee-proxy.local
+  timeouts:
+    request: "300s"
+    backendRequest: "300s"
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: false
+  ingressFrom: []
+  egressTo: []
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+# ── application configuration ────────────────────────────────────────
+config:
+  server:
+    listen: "0.0.0.0:8080"
+    read_timeout: 30s
+    read_header_timeout: 10s
+    write_timeout: 0
+    idle_timeout: 120s
+    max_header_bytes: 1048576
+    max_body_bytes: 524288000
+    shutdown_grace: 30s
+    http2: true
+    h2c: false
+    tls:
+      enabled: false
+      cert_file: ""
+      key_file: ""
+      min_version: "1.3"
+      client_auth: "none"
+      client_ca_file: ""
+  routing:
+    default_cee_engine: "docling"
+    facade_path_prefix: "/v1"
+    passthrough:
+      docling_prefix: "/docling"
+      tika_prefix: "/tika"
+      kreuzberg_prefix: "/kreuzberg"
+  engines:
+    docling:
+      enable: true
+      url: "http://docling-serve:5001"
+      api_key_env: "DOCLING_API_KEY"
+      request_timeout: 120s
+      health_path: "/health"
+      # ignored for default engine; catch-all wins.
+      mime_types: []
+    tika:
+      enable: true
+      url: "http://tika:9998"
+      api_key_env: "TIKA_API_KEY"
+      request_timeout: 90s
+      health_path: "/version"
+      mime_types:
+        - "application/pdf"
+        - "application/msword"
+        - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        - "application/vnd.ms-excel"
+        - "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        - "application/rtf"
+    kreuzberg:
+      enable: true
+      url: "http://kreuzberg:8000"
+      api_key_env: "KREUZBERG_API_KEY"
+      request_timeout: 90s
+      health_path: "/health"
+      mime_types:
+        - "image/*"
+        - "application/vnd.ms-powerpoint"
+        - "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        - "text/html"
+        - "text/markdown"
+  security:
+    proxy_api_keys_env: "PROXY_API_KEYS"
+    proxy_api_key_header: "X-Proxy-Api-Key"
+    require_api_key: false
+  ratelimit_global:
+    rps: 200
+    burst: 400
+  tasks:
+    enabled: false
+    redis_url_env: "REDIS_URL"
+    queue_concurrency: 16
+    retention: 24h
+    retry: 3
+    result_ttl: 1h
+  observability:
+    log:
+      level: "info"
+      format: "json"
+      add_caller: true
+    metrics:
+      enabled: true
+      path: "/metrics"
+    tracing:
+      enabled: false
+      otlp_endpoint: "http://otel-collector:4318"
+      sample_ratio: 0.1
+      service_name: "owui-cee-proxy"
+
+# Secrets are sourced from existing Secret(s); do NOT put values here.
+secrets:
+  existingSecretName: ""        # if set, mounted as envFrom
+  envFromKeys: []               # optional explicit list of env keys to import

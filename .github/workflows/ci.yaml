@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.0.0
+          args: --timeout=10m
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go mod download
+      - run: go test -race -count=1 -coverprofile=cov.out ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cov.out
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: |
+          mkdir -p bin
+          CGO_ENABLED=0 go build -trimpath -o bin/owui-cee-proxy ./cmd/proxy
+
+  helm-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - run: helm lint deployments/helm/owui-cee-proxy
+      - run: helm template owui-cee-proxy deployments/helm/owui-cee-proxy > /tmp/render.yaml
+      - uses: instrumenta/kubeval-action@v0.0.4
+        continue-on-error: true
+        with:
+          files: /tmp/render.yaml
+
+  manifests-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+      - run: kustomize build deployments/kubernetes/overlays/ingress-nginx > /tmp/ing.yaml
+      - run: kustomize build deployments/kubernetes/overlays/gateway-api-envoy > /tmp/gw.yaml

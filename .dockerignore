@@ -1,0 +1,16 @@
+.git
+.github
+.idea
+.vscode
+.claude
+test/integration/fixtures
+deployments/helm
+deployments/kubernetes
+deployments/systemd
+docs
+*.md
+!README.md
+bin
+dist
+coverage.txt
+cov.out

@@ -1,0 +1,75 @@
+version: 2
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: owui-cee-proxy
+    main: ./cmd/proxy
+    binary: owui-cee-proxy
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/ctolon/owui-cee-proxy/internal/version.Version={{.Version}}
+      - -X github.com/ctolon/owui-cee-proxy/internal/version.Commit={{.Commit}}
+      - -X github.com/ctolon/owui-cee-proxy/internal/version.Date={{.CommitDate}}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - Merge pull request
+
+dockers:
+  - image_templates:
+      - "ghcr.io/ctolon/owui-cee-proxy:{{ .Version }}-amd64"
+    use: buildx
+    dockerfile: deployments/docker/Dockerfile
+    goarch: amd64
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--build-arg=VERSION={{ .Version }}"
+      - "--build-arg=COMMIT={{ .ShortCommit }}"
+      - "--build-arg=DATE={{ .CommitDate }}"
+  - image_templates:
+      - "ghcr.io/ctolon/owui-cee-proxy:{{ .Version }}-arm64"
+    use: buildx
+    dockerfile: deployments/docker/Dockerfile
+    goarch: arm64
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--build-arg=VERSION={{ .Version }}"
+      - "--build-arg=COMMIT={{ .ShortCommit }}"
+      - "--build-arg=DATE={{ .CommitDate }}"
+
+docker_manifests:
+  - name_template: "ghcr.io/ctolon/owui-cee-proxy:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/ctolon/owui-cee-proxy:{{ .Version }}-amd64"
+      - "ghcr.io/ctolon/owui-cee-proxy:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/ctolon/owui-cee-proxy:latest"
+    image_templates:
+      - "ghcr.io/ctolon/owui-cee-proxy:{{ .Version }}-amd64"
+      - "ghcr.io/ctolon/owui-cee-proxy:{{ .Version }}-arm64"
+
+sboms:
+  - artifacts: archive

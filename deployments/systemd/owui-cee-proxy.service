@@ -1,0 +1,50 @@
+[Unit]
+Description=OpenWebUI CEE Proxy
+Documentation=https://github.com/ctolon/owui-cee-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=owui-cee
+Group=owui-cee
+EnvironmentFile=-/etc/owui-cee-proxy/owui-cee-proxy.env
+ExecStart=/usr/local/bin/owui-cee-proxy -config /etc/owui-cee-proxy/config.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# ── hardening ───────────────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/etc/owui-cee-proxy
+ReadWritePaths=
+
+# Resource limits
+LimitNOFILE=65535
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,98 @@
+# MIME-routing test config:
+# - Docling: catch-all NOT (it's a non-default engine here) — handles
+#   only types Docling natively supports.
+# - Kreuzberg: default — handles every other type the user uploads
+#   (e.g., .msg, .eml, .epub, .rtf, .odt).
+#
+# Why this layout: the user's intent is "Docling-supported → Docling,
+# everything else → Kreuzberg". Default is the catch-all in this proxy,
+# so Kreuzberg is the default and Docling carries the explicit
+# mime_types list.
+
+server:
+  listen: "0.0.0.0:8080"
+  read_timeout: 300s
+  read_header_timeout: 10s
+  max_body_bytes: 524288000
+  shutdown_grace: 15s
+
+routing:
+  default_cee_engine: "kreuzberg"
+  facade_path_prefix: "/v1"
+  passthrough:
+    docling_prefix: "/docling"
+    tika_prefix: "/tika"
+    kreuzberg_prefix: "/kreuzberg"
+
+engines:
+  docling:
+    enable: true
+    url: "http://docling:5001"
+    request_timeout: 300s
+    health_path: "/health"
+    mime_types:
+      # Documents
+      - "application/pdf"
+      - "application/msword"
+      - "application/vnd.ms-excel"
+      - "application/vnd.ms-powerpoint"
+      - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      - "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      - "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+      # Markup / plain
+      - "text/html"
+      - "application/xhtml+xml"
+      - "text/markdown"
+      - "text/csv"
+      - "text/plain"
+      - "text/asciidoc"
+      - "application/x-asciidoc"
+      - "application/x-tex"
+      - "text/x-tex"
+      # XML schema-specific (USPTO/JATS/XBRL/Docling JSON)
+      - "application/xml"
+      - "text/xml"
+      - "application/json"
+      - "text/vtt"
+      # Images
+      - "image/png"
+      - "image/jpeg"
+      - "image/tiff"
+      - "image/bmp"
+      - "image/webp"
+
+  tika:
+    enable: false
+
+  kreuzberg:
+    enable: true
+    url: "http://kreuzberg:8000"
+    request_timeout: 180s
+    health_path: "/health"
+    forward_options:
+      output_format: "markdown"
+    # mime_types is intentionally empty — Kreuzberg is the default
+    # (catch-all). The proxy ignores mime_types on the default engine.
+
+security:
+  proxy_api_keys_env: "PROXY_API_KEYS"
+  proxy_api_key_header: "X-Proxy-Api-Key"
+  require_api_key: false
+
+ratelimit_global:
+  rps: 0
+  burst: 0
+
+tasks:
+  enabled: false
+
+observability:
+  log:
+    level: "info"
+    format: "json"
+    add_caller: false
+  metrics:
+    enabled: true
+    path: "/metrics"
+  tracing:
+    enabled: false

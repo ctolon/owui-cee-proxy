@@ -1,0 +1,13 @@
+{{- if .Values.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "owui-cee-proxy.fullname" . }}
+  labels:
+    {{- include "owui-cee-proxy.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "owui-cee-proxy.selectorLabels" . | nindent 6 }}
+{{- end -}}

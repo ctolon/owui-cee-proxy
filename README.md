@@ -1,0 +1,323 @@
+# owui-cee-proxy
+
+OpenWebUI Content Extraction Engine proxy. Routes Docling Serve, Apache
+Tika, and Kreuzberg through a single Docling-compatible facade, plus
+per-engine native passthrough mounts.
+
+> Go 1.26.1 · stateless · streaming · cloud-native
+
+## Why
+
+OpenWebUI supports a single `CONTENT_EXTRACTION_ENGINE` at a
+time. This proxy lets operators centralise multiple engines behind one
+URL, route per-MIME automatically, swap defaults via YAML, and access
+each engine's native API without patching OpenWebUI.
+
+## Quick start
+
+```sh
+make build
+docker compose -f deployments/docker/docker-compose.yaml up -d --build
+curl -F files=@README.md http://localhost:8080/v1/convert/file | jq
+```
+
+Point OpenWebUI's `DOCLING_SERVER_URL` at `http://owui-cee-proxy:8080`.
+
+For an OpenWebUI + Docling + Kreuzberg + proxy test stack with offset
+ports (no conflicts) see `deployments/docker/docker-compose.test.yaml`
+plus the matching `test-proxy-config.yaml`.
+
+## Project docs
+
+- [`CLAUDE.md`](./CLAUDE.md) — load-bearing invariants and the engine-extension recipe
+- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — system architecture, request lifecycle, decision log
+- [`docs/REVIEW.md`](./docs/REVIEW.md) — security + performance review, known issues, future work
+- [`docs/HOT_RELOAD_ROADMAP.md`](./docs/HOT_RELOAD_ROADMAP.md) — plan for nginx-style zero-downtime config reload
+- [`SECURITY.md`](./SECURITY.md) — threat model and vulnerability disclosure
+- [`AGENTS.md`](./AGENTS.md) — Claude subagent charter
+
+## Endpoints
+
+| Path                              | Notes                                                |
+|-----------------------------------|------------------------------------------------------|
+| `POST /v1/convert/file`           | Docling-compatible multipart upload (MIME-routed)    |
+| `POST /v1/convert/source`         | Docling-compatible JSON `http_sources` (default eng) |
+| `POST /v1/convert/file/async`     | Async submit (Redis-backed)                          |
+| `POST /v1/convert/source/async`   | Async submit for source mode                         |
+| `GET  /v1/status/poll/{id}`       | Async status                                         |
+| `GET  /v1/result/{id}`            | Async result                                         |
+| `*    /docling/*`                 | Native Docling passthrough                           |
+| `*    /tika/*`                    | Native Tika passthrough                              |
+| `*    /kreuzberg/*`               | Native Kreuzberg passthrough                         |
+| `GET  /healthz`, `/readyz`        | Probes                                               |
+| `GET  /metrics`                   | Prometheus exposition                                |
+| `GET  /version`                   | Build info                                           |
+
+## How engine selection works
+
+For `/v1/convert/file` requests, the **first uploaded file's
+`Content-Type`** is matched against each non-default enabled engine's
+`mime_types` list. The first match wins. If no list matches (or the
+file has no Content-Type), the `routing.default_cee_engine` engine
+handles the request.
+
+Patterns may be exact (`application/pdf`) or top-level wildcards
+(`image/*`). Matching is case-insensitive and ignores params (e.g.
+`; charset=utf-8`).
+
+`/v1/convert/source` JSON requests have no MIME hint at dispatch time
+(the proxy never dereferences URLs server-side), so they always use
+the default engine.
+
+## Configuration
+
+Two layers, merged in this precedence order (lowest → highest):
+
+1. Built-in defaults (`config.Default`).
+2. YAML at the path passed via `-config` or `OWUI_PROXY_CONFIG` env.
+3. Environment variables prefixed with `OWUI_PROXY_` using `__` as
+   the path separator. Example:
+   ```sh
+   OWUI_PROXY_ENGINES__TIKA__URL=http://tika.svc:9998
+   OWUI_PROXY_ROUTING__DEFAULT_CEE_ENGINE=tika
+   OWUI_PROXY_OBSERVABILITY__LOG__LEVEL=debug
+   ```
+
+> **Secrets are NEVER read from YAML.** The YAML names the env var
+> (`api_key_env`); the loader resolves the value at startup.
+
+### Process-level env vars
+
+| Env var                 | Type   | Required | Default                      | Description                                                         |
+|-------------------------|--------|----------|------------------------------|---------------------------------------------------------------------|
+| `OWUI_PROXY_CONFIG`     | string | no       | `configs/config.example.yaml`| Path to the YAML config file (or pass `-config <path>`).            |
+| `DOCLING_API_KEY`       | string | no       | empty                        | Sent as `X-Api-Key` to Docling. Skipped when empty.                 |
+| `TIKA_API_KEY`          | string | no       | empty                        | Sent as `X-Api-Key` to Tika (only meaningful behind a Tika auth proxy). |
+| `KREUZBERG_API_KEY`     | string | no       | empty                        | Sent as `Authorization: Bearer …` to Kreuzberg. Skipped when empty. |
+| `PROXY_API_KEYS`        | string | no       | empty                        | Comma-separated list of accepted proxy API keys. Required only when `security.require_api_key=true`. |
+| `REDIS_URL`             | string | conditional | empty                     | Required when `tasks.enabled=true`. Format: `redis://[:pass@]host:port/db`. |
+
+The env-var **names** above are configurable; the strings shown are
+the defaults named by the YAML keys `*_api_key_env`, `proxy_api_keys_env`,
+and `redis_url_env`.
+
+### `server.*`
+
+| Key                      | Type     | Required | Default      | Description                                                                                  |
+|--------------------------|----------|----------|--------------|----------------------------------------------------------------------------------------------|
+| `listen`                 | string   | yes      | `0.0.0.0:8080`| `host:port` to bind. Validated as `hostname_port`.                                          |
+| `read_timeout`           | duration | no       | `30s`        | Max time to read entire request (incl. body).                                                |
+| `read_header_timeout`    | duration | no       | `10s`        | Max time to read request headers (mitigates Slowloris).                                      |
+| `write_timeout`          | duration | no       | `0` (none)   | Max time to write the response. Zero means rely on per-route deadlines (recommended for streaming). |
+| `idle_timeout`           | duration | no       | `120s`       | Max keep-alive idle time.                                                                    |
+| `max_header_bytes`       | int      | no       | `1048576`    | Max bytes of HTTP request headers (1 MiB).                                                   |
+| `max_body_bytes`         | int64    | no       | `524288000`  | Hard cap on request body size, 0 disables. Default 500 MiB.                                  |
+| `shutdown_grace`         | duration | no       | `30s`        | Graceful shutdown deadline before forced close.                                              |
+| `http2`                  | bool     | no       | `true`       | Enable HTTP/2 (negotiated via ALPN under TLS).                                               |
+| `h2c`                    | bool     | no       | `false`      | Enable cleartext HTTP/2. Only safe behind a trusted ingress.                                 |
+| `tls.enabled`            | bool     | no       | `false`      | Terminate TLS at the proxy itself.                                                           |
+| `tls.cert_file`          | path     | conditional | empty     | Required when `tls.enabled=true`.                                                            |
+| `tls.key_file`           | path     | conditional | empty     | Required when `tls.enabled=true`.                                                            |
+| `tls.min_version`        | string   | no       | `1.3`        | `1.2` or `1.3`.                                                                              |
+| `tls.client_auth`        | enum     | no       | `none`       | `none` / `request` / `require` / `verify` / `require-and-verify` (mTLS).                     |
+| `tls.client_ca_file`     | path     | no       | empty        | PEM trust bundle for client certs.                                                           |
+
+### `routing.*`
+
+| Key                            | Type     | Required | Default     | Description                                                                  |
+|--------------------------------|----------|----------|-------------|------------------------------------------------------------------------------|
+| `default_cee_engine`           | enum     | yes      | `docling`   | One of `docling`/`tika`/`kreuzberg`. Catch-all when no MIME match.            |
+| `facade_path_prefix`           | string   | yes      | `/v1`       | Mount path for the Docling-compatible facade. Must start with `/`.            |
+| `passthrough.docling_prefix`   | string   | no       | `/docling`  | Native Docling reverse-proxy mount. Empty disables.                          |
+| `passthrough.tika_prefix`      | string   | no       | `/tika`     | Native Tika mount.                                                           |
+| `passthrough.kreuzberg_prefix` | string   | no       | `/kreuzberg`| Native Kreuzberg mount.                                                      |
+
+### `engines.<docling|tika|kreuzberg>.*`
+
+Repeated for each of the three blocks. At least the engine selected as
+`default_cee_engine` MUST be `enable: true` and have a valid `url`.
+
+| Key                                       | Type      | Required | Default        | Description                                                                                      |
+|-------------------------------------------|-----------|----------|----------------|--------------------------------------------------------------------------------------------------|
+| `enable`                                  | bool      | yes      | `false`        | Whether the engine participates in routing and passthrough.                                      |
+| `url`                                     | url       | conditional | empty       | Backend base URL. Required when `enable: true`.                                                  |
+| `api_key_env`                             | string    | no       | empty          | Name of env var containing the backend API key.                                                  |
+| `request_timeout`                         | duration  | no       | `120s`         | Per-request deadline applied via context.                                                        |
+| `health_path`                             | string    | no       | `/health` (Tika: `/version`)| Path used by `/readyz` to probe the backend.                                          |
+| `mime_types`                              | []string  | no       | `[]`           | MIME patterns this engine claims. Ignored for the default engine. Exact or `type/*`. |
+| `forward_options`                         | map[s]s   | no       | `{}`           | Extra form fields/headers to inject. See per-engine notes below.                                 |
+| `http.max_idle_conns`                     | int       | no       | `256`          | Connection pool: idle connections kept across all hosts.                                         |
+| `http.max_idle_conns_per_host`            | int       | no       | `64`           | Connection pool: idle connections kept per backend host.                                         |
+| `http.max_conns_per_host`                 | int       | no       | `0` (no limit) | Connection pool: total concurrent connections per host.                                          |
+| `http.idle_conn_timeout`                  | duration  | no       | `90s`          | Time before an idle connection is closed.                                                        |
+| `http.tls_handshake_timeout`              | duration  | no       | `10s`          | Max time for the TLS handshake.                                                                  |
+| `http.response_header_timeout`            | duration  | no       | `30s`          | Max time waiting for response headers after sending the request.                                 |
+| `http.expect_continue_timeout`            | duration  | no       | `1s`           | Wait for `100-continue` before sending the request body.                                         |
+| `http.disable_compression`                | bool      | no       | `false`        | If `true`, disables automatic gzip handling.                                                     |
+| `http.tls.insecure_skip_verify`           | bool      | no       | `false`        | **DANGEROUS**. Bypasses certificate verification on the backend connection.                      |
+| `http.tls.ca_file`                        | path      | no       | empty          | PEM CA bundle to trust for the backend.                                                          |
+| `http.tls.cert_file`                      | path      | no       | empty          | Client cert for mTLS to the backend (paired with `key_file`).                                    |
+| `http.tls.key_file`                       | path      | no       | empty          | Client key for mTLS to the backend.                                                              |
+| `http.tls.server_name`                    | string    | no       | empty          | SNI override for the backend connection.                                                         |
+| `breaker.max_requests`                    | uint32    | no       | `100`          | Half-open probe budget (gobreaker).                                                              |
+| `breaker.interval`                        | duration  | no       | `60s`          | Closed-state cyclic counter reset interval.                                                      |
+| `breaker.timeout`                         | duration  | no       | `30s`          | Time the circuit stays open before transitioning to half-open.                                   |
+| `breaker.consecutive_failures_threshold`  | uint32    | no       | `5`            | Trip threshold.                                                                                  |
+| `rate_limit.rps`                          | float     | no       | `50`           | Per-engine token-bucket refill rate. `0` disables.                                               |
+| `rate_limit.burst`                        | int       | no       | `100`          | Per-engine token-bucket burst.                                                                   |
+
+#### Per-engine `forward_options`
+
+| Engine    | Key                                | Effect                                                                              |
+|-----------|------------------------------------|--------------------------------------------------------------------------------------|
+| Docling   | any                                | Each entry is sent as a multipart form field on `/v1/convert/file`.                  |
+| Tika      | `x_tika_pdf_extract_inline_images` | When `"true"`, sets `X-Tika-PDFextractInlineImages: true`.                           |
+| Kreuzberg | any                                | Each entry is sent as a multipart form field. Common: `output_format` ∈ `{plain,markdown,djot,html}`. The Kreuzberg adapter forwards to Kreuzberg's own `/v1/convert/file` (Docling-compat) endpoint, no response shaping needed. |
+
+### `security.*`
+
+| Key                          | Type     | Required | Default            | Description                                                                                    |
+|------------------------------|----------|----------|--------------------|------------------------------------------------------------------------------------------------|
+| `proxy_api_keys_env`         | string   | no       | `PROXY_API_KEYS`   | Name of env var with comma-separated allowed proxy keys.                                       |
+| `proxy_api_key_header`       | string   | no       | `X-Proxy-Api-Key`  | Header name clients must send.                                                                 |
+| `require_api_key`            | bool     | no       | `false`            | Enforce API-key auth on the facade + passthrough subtree (probes/metrics excluded).            |
+| `trusted_proxies`            | []cidr   | no       | `["10.0.0.0/8","127.0.0.1/32"]` | CIDRs allowed to set `X-Forwarded-For`. (Currently advisory; reserved for the next iteration.) |
+| `cors.enabled`               | bool     | no       | `false`            | Enable CORS responses.                                                                         |
+| `cors.allowed_origins`       | []string | no       | `[]`               | Allow-list of origins.                                                                         |
+| `cors.allowed_methods`       | []string | no       | `["POST","GET","OPTIONS"]` | Allow-list of methods.                                                                  |
+| `cors.allowed_headers`       | []string | no       | `["Content-Type","Authorization"]` | Allow-list of headers.                                                          |
+| `cors.max_age`               | int      | no       | `600`              | Preflight cache TTL in seconds.                                                                |
+
+### `ratelimit_global.*`
+
+| Key      | Type  | Required | Default | Description                                  |
+|----------|-------|----------|---------|----------------------------------------------|
+| `rps`    | float | no       | `200`   | Global token-bucket refill rate. `0` disables. |
+| `burst`  | int   | no       | `400`   | Global token-bucket burst.                   |
+
+### `tasks.*` (async + Redis)
+
+| Key                  | Type     | Required | Default      | Description                                                                                           |
+|----------------------|----------|----------|--------------|-------------------------------------------------------------------------------------------------------|
+| `enabled`            | bool     | no       | `false`      | When `true`, the async endpoints (`/v1/convert/{file,source}/async`, `/v1/status/poll/{id}`, `/v1/result/{id}`) are wired and a Redis-backed worker runs in-process. |
+| `redis_url_env`      | string   | no       | `REDIS_URL`  | Name of env var with the Redis connection URL. Required when `enabled: true`.                         |
+| `queue_concurrency`  | int      | no       | `16`         | Worker concurrency.                                                                                   |
+| `retention`          | duration | no       | `24h`        | How long completed tasks stay queryable (and how long blob bodies persist in Redis).                  |
+| `retry`              | int      | no       | `3`          | Max retries before a task is marked failed.                                                           |
+| `result_ttl`         | duration | no       | `1h`         | TTL applied to the result blob in Redis after success.                                                |
+
+### `observability.*`
+
+| Key                              | Type     | Required | Default                              | Description                                                                                                  |
+|----------------------------------|----------|----------|--------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `log.level`                      | enum     | no       | `info`                               | `trace` / `debug` / `info` / `warn` / `error` / `fatal` / `panic`.                                           |
+| `log.format`                     | enum     | no       | `json`                               | `json` (production) or `console` (local dev).                                                                |
+| `log.sampling`                   | bool     | no       | `false`                              | Reserved for zerolog sampling.                                                                               |
+| `log.add_caller`                 | bool     | no       | `true`                               | Include source file:line on each log line.                                                                   |
+| `metrics.enabled`                | bool     | no       | `true`                               | Mounts the Prometheus exposition.                                                                            |
+| `metrics.path`                   | string   | no       | `/metrics`                           | Endpoint path.                                                                                               |
+| `metrics.listen`                 | string   | no       | empty (= main listener)              | Reserved for the optional split metrics listener.                                                            |
+| `tracing.enabled`                | bool     | no       | `false`                              | Enable OpenTelemetry HTTP server instrumentation + OTLP HTTP exporter.                                       |
+| `tracing.otlp_endpoint`          | url      | conditional | `http://otel-collector:4318`      | Required when `tracing.enabled=true`.                                                                        |
+| `tracing.sample_ratio`           | float    | no       | `0.1`                                | TraceIDRatioBased sampler ratio (`0`–`1`).                                                                   |
+| `tracing.service_name`           | string   | no       | `owui-cee-proxy`                     | OTel `service.name`.                                                                                         |
+
+### Duration format
+
+Anything typed `duration` accepts Go's `time.ParseDuration` syntax:
+`300ms`, `5s`, `2m`, `1h`, `24h`. Negative or zero values disable the
+guard for that key (per the table notes).
+
+## Logging
+
+All logs go to stdout as JSON (configurable). Every completed request
+emits a `request_completed` line including:
+
+```json
+{
+  "ts": "2026-05-10T12:34:56.789Z",
+  "level": "info",
+  "request_id": "01HM2…",
+  "method": "POST",
+  "path": "/v1/convert/file",
+  "status": 200,
+  "duration": 1234567000,
+  "engine": "tika",                  // routed engine
+  "engine_url": "http://tika:9998",
+  "filename": "report.pdf",          // first file in multipart
+  "file_count": 1,
+  "bytes_out": 128456
+}
+```
+
+## Metrics
+
+Series exposed at `/metrics` (Prometheus):
+
+| Metric                                              | Type      | Labels                            |
+|-----------------------------------------------------|-----------|-----------------------------------|
+| `owui_cee_proxy_requests_total`                     | counter   | `engine,route,method,status`      |
+| `owui_cee_proxy_request_duration_seconds`           | histogram | `engine,route,method`             |
+| `owui_cee_proxy_inflight_requests`                  | gauge     | `engine`                          |
+| `owui_cee_proxy_upstream_errors_total`              | counter   | `engine,reason`                   |
+| `owui_cee_proxy_breaker_state`                      | gauge     | `engine` (0 closed, 1 half, 2 open) |
+| `owui_cee_proxy_body_bytes`                         | histogram | `engine,direction`                |
+
+Plus the standard `process_*` and `go_*` collectors.
+
+## Deployment
+
+| Target            | Path                                                      |
+|-------------------|-----------------------------------------------------------|
+| Docker Compose    | `deployments/docker/docker-compose.yaml`                  |
+| Helm chart        | `deployments/helm/owui-cee-proxy/`                        |
+| Kustomize base    | `deployments/kubernetes/base/`                            |
+| Ingress overlay   | `deployments/kubernetes/overlays/ingress-nginx/`          |
+| Gateway-API overlay | `deployments/kubernetes/overlays/gateway-api-envoy/`    |
+| systemd           | `deployments/systemd/install.sh`                          |
+
+The Helm chart `values.yaml` exposes every config key under `config.*`
+mirroring the YAML schema 1:1, plus `secrets.existingSecretName` so
+credentials come from a SealedSecret/ExternalSecret rather than the
+chart values.
+
+## Development
+
+```sh
+make build               # CGO_ENABLED=0 binary into bin/
+make test                # unit tests with race detector + coverage
+make test-integration    # testcontainers-go E2E suite (requires Docker)
+make lint                # golangci-lint v2
+make fmt                 # gofumpt + goimports
+make vuln                # govulncheck
+make sec                 # gosec local
+make compose-up          # docker compose up -d (full local stack)
+make helm-lint           # helm lint + template
+make kustomize-build     # kustomize overlays build
+```
+
+### Test fixtures
+
+`test/integration/fixtures/` ships 17 ready-made files (PDF, HTML,
+Markdown, CSV, JSON, XML, PNG, JPEG, DOCX, XLSX, PPTX, RTF, EML, ODT,
+EPUB, MSG, plain TXT) — all under 132 KB total. They are produced
+deterministically by `scripts/gen-fixtures.py` (Python with
+`openpyxl` / `python-docx` / `python-pptx` / `pillow` / `olefile`).
+The hand-crafted PDF, MSG and OOXML fixtures avoid system tooling
+like LibreOffice.
+
+Regenerate any time with:
+
+```sh
+python3 -m pip install --user openpyxl python-docx python-pptx \
+    ebooklib pillow olefile
+python3 scripts/gen-fixtures.py
+```
+
+See `CLAUDE.md` for architectural invariants and the engine-extension
+recipe. See `docs/ARCHITECTURE.md` for the system-level design and
+decision log. See `SECURITY.md` for the threat model.
+
+## License
+
+MIT — see `LICENSE`.

@@ -1,0 +1,37 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.txt
+cov.out
+*.cover
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config / secrets
+configs/config.local.yaml
+configs/config.dev.yaml
+*.env
+.env
+.env.*
+
+# Build artifacts
+/vendor/
+
+# Logs
+*.log
+
+# Goreleaser
+/dist

@@ -1,0 +1,16 @@
+server:
+  listen: "0.0.0.0:8080"
+
+routing:
+  default_cee_engine: "docling"
+  facade_path_prefix: "/v1"
+
+engines:
+  docling:
+    enable: true
+    url: "http://docling-serve:5001"
+    api_key_env: "DOCLING_API_KEY"
+  tika:
+    enable: false
+  kreuzberg:
+    enable: false

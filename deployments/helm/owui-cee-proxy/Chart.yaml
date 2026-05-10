@@ -1,0 +1,23 @@
+apiVersion: v2
+name: owui-cee-proxy
+description: |
+  OpenWebUI Content Extraction Engine proxy. Routes Docling/Tika/Kreuzberg
+  traffic with a single Docling-compatible facade, plus per-engine
+  passthrough mounts.
+type: application
+version: 0.0.1
+appVersion: "0.0.1"
+home: https://github.com/ctolon/owui-cee-proxy
+sources:
+  - https://github.com/ctolon/owui-cee-proxy
+maintainers:
+  - name: Cevat Batuhan Tolon
+keywords:
+  - openwebui
+  - docling
+  - tika
+  - kreuzberg
+  - rag
+  - extraction
+  - proxy
+kubeVersion: ">=1.28.0"

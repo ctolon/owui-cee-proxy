@@ -1,0 +1,7 @@
+* @ctolon
+
+/.github/                          @ctolon
+/deployments/                      @ctolon
+/internal/transport/http/middleware/  @ctolon
+/internal/engine/                  @ctolon
+/SECURITY.md                       @ctolon

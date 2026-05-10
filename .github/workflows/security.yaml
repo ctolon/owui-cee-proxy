@@ -1,0 +1,126 @@
+name: security
+
+# Manual-trigger only. Runs the full security scanner suite and uploads
+# their reports as artifacts. Fails on HIGH/CRITICAL findings.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref to scan (defaults to default branch)"
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+
+env:
+  GO_VERSION: "1.26.1"
+
+jobs:
+  gosec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: gosec
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck -show=verbose ./...
+
+  trivy-fs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  trivy-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: docker build -t scan-target:local -f deployments/docker/Dockerfile .
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: scan-target:local
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  semgrep:
+    runs-on: ubuntu-latest
+    container: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - run: semgrep --config "p/owasp-top-ten" --config "p/golang" --error --severity ERROR --severity WARNING
+
+  syft-grype:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Install syft + grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+      - run: syft dir:. -o cyclonedx-json=sbom.cdx.json
+      - run: grype sbom:sbom.cdx.json --fail-on high
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+  dockle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - run: docker build -t scan-target:local -f deployments/docker/Dockerfile .
+      - uses: erzz/dockle-action@v1
+        with:
+          image: scan-target:local
+          failure-threshold: WARN
+
+  checkov:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: bridgecrewio/checkov-action@master
+        with:
+          directory: deployments
+          framework: helm,kubernetes
+          quiet: true
+          soft_fail: false

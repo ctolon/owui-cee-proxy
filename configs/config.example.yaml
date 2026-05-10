@@ -1,0 +1,176 @@
+# OpenWebUI CEE Proxy — example configuration
+#
+# Override any nested key via environment using OWUI_PROXY_ prefix and "__" as
+# separator. Example: OWUI_PROXY_ENGINES__TIKA__URL=http://tika.svc:9998
+#
+# Secrets MUST come from environment. YAML names the env var only.
+
+server:
+  listen: "0.0.0.0:8080"
+  read_timeout: 30s
+  read_header_timeout: 10s
+  write_timeout: 0
+  idle_timeout: 120s
+  max_header_bytes: 1048576
+  max_body_bytes: 524288000   # 500 MiB
+  shutdown_grace: 30s
+  http2: true
+  h2c: false
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+    min_version: "1.3"
+    client_auth: "none"        # none|request|require|verify|require-and-verify
+    client_ca_file: ""
+
+routing:
+  # default_cee_engine handles requests whose first file Content-Type
+  # does not match any non-default engine's mime_types list. Per-engine
+  # mime_types are declared inside engines.<name>.mime_types below.
+  # Patterns may be exact ("application/pdf") or top-level wildcards
+  # ("image/*"). Matching is case-insensitive and ignores params.
+  default_cee_engine: "docling"   # docling | tika | kreuzberg
+  facade_path_prefix: "/v1"
+  passthrough:
+    docling_prefix: "/docling"
+    tika_prefix: "/tika"
+    kreuzberg_prefix: "/kreuzberg"
+
+engines:
+  docling:
+    enable: true
+    url: "http://docling-serve:5001"
+    api_key_env: "DOCLING_API_KEY"
+    request_timeout: 120s
+    health_path: "/health"
+    # mime_types is ignored for the engine selected as default_cee_engine
+    # (the default is the catch-all). It is honored for non-default
+    # enabled engines.
+    mime_types: []
+    forward_options: {}
+    http:
+      max_idle_conns: 256
+      max_idle_conns_per_host: 64
+      idle_conn_timeout: 90s
+      tls_handshake_timeout: 10s
+      response_header_timeout: 30s
+      expect_continue_timeout: 1s
+      disable_compression: false
+      tls:
+        insecure_skip_verify: false
+        ca_file: ""
+        cert_file: ""
+        key_file: ""
+        server_name: ""
+    breaker:
+      max_requests: 100
+      interval: 60s
+      timeout: 30s
+      consecutive_failures_threshold: 5
+    rate_limit:
+      rps: 50
+      burst: 100
+
+  tika:
+    enable: true
+    url: "http://tika:9998"
+    api_key_env: "TIKA_API_KEY"
+    request_timeout: 90s
+    health_path: "/version"
+    mime_types:
+      - "application/pdf"
+      - "application/msword"
+      - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      - "application/vnd.ms-excel"
+      - "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      - "application/rtf"
+    forward_options:
+      x_tika_pdf_extract_inline_images: "false"
+    http:
+      max_idle_conns: 256
+      max_idle_conns_per_host: 64
+      idle_conn_timeout: 90s
+      tls_handshake_timeout: 10s
+      response_header_timeout: 30s
+      expect_continue_timeout: 1s
+    breaker:
+      max_requests: 100
+      interval: 60s
+      timeout: 30s
+      consecutive_failures_threshold: 5
+    rate_limit:
+      rps: 50
+      burst: 100
+
+  kreuzberg:
+    enable: true
+    url: "http://kreuzberg:8000"
+    api_key_env: "KREUZBERG_API_KEY"
+    request_timeout: 90s
+    health_path: "/health"
+    mime_types:
+      - "image/*"
+      - "application/vnd.ms-powerpoint"
+      - "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+      - "text/html"
+      - "text/markdown"
+    forward_options:
+      output_format: "markdown"
+    http:
+      max_idle_conns: 256
+      max_idle_conns_per_host: 64
+      idle_conn_timeout: 90s
+      tls_handshake_timeout: 10s
+      response_header_timeout: 30s
+      expect_continue_timeout: 1s
+    breaker:
+      max_requests: 100
+      interval: 60s
+      timeout: 30s
+      consecutive_failures_threshold: 5
+    rate_limit:
+      rps: 50
+      burst: 100
+
+security:
+  proxy_api_keys_env: "PROXY_API_KEYS"
+  proxy_api_key_header: "X-Proxy-Api-Key"
+  require_api_key: false
+  trusted_proxies:
+    - "10.0.0.0/8"
+    - "127.0.0.1/32"
+  cors:
+    enabled: false
+    allowed_origins: []
+    allowed_methods: ["POST", "GET", "OPTIONS"]
+    allowed_headers: ["Content-Type", "Authorization"]
+    max_age: 600
+
+ratelimit_global:
+  rps: 200
+  burst: 400
+
+tasks:
+  enabled: true
+  redis_url_env: "REDIS_URL"
+  queue_concurrency: 16
+  retention: 24h
+  retry: 3
+  result_ttl: 1h
+
+observability:
+  log:
+    level: "info"
+    format: "json"
+    sampling: false
+    add_caller: true
+  metrics:
+    enabled: true
+    path: "/metrics"
+    listen: ""
+  tracing:
+    enabled: false
+    otlp_endpoint: "http://otel-collector:4318"
+    sample_ratio: 0.1
+    service_name: "owui-cee-proxy"

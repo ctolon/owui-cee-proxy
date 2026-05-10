@@ -1,0 +1,9 @@
+Subject: owui-cee-proxy routing fixture
+From: alice@example.com
+To: bob@example.com
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+This is a real RFC 822 email body.
+It exercises message/rfc822 routing.
