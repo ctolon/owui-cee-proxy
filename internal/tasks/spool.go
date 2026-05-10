@@ -43,7 +43,9 @@ func (s *spoolReader) Close() error {
 	}
 	closeErr := s.file.Close()
 	if s.path != "" {
-		if rmErr := os.Remove(s.path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) && closeErr == nil {
+		// s.path is server-controlled (built by os.CreateTemp inside
+		// this package); not a tainted user input.
+		if rmErr := os.Remove(s.path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) && closeErr == nil { //nolint:gosec
 			closeErr = rmErr
 		}
 	}
