@@ -24,9 +24,15 @@ jobs:
       # golangci-lint v2 requires the v7 action; the v6 action explicitly
       # rejects v2.x with "golangci-lint v2 is not supported by
       # golangci-lint-action v6".
+      #
+      # install-mode: goinstall compiles golangci-lint from source with
+      # the workflow's setup-go toolchain (Go 1.26.1), avoiding the
+      # "binary built with go1.24 is lower than targeted 1.26.1"
+      # rejection that the pre-built binary mode triggers.
       - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.0.2
+          install-mode: goinstall
           args: --timeout=10m
 
   test:
