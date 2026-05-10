@@ -98,6 +98,18 @@ jobs:
           # Only consider the merge commit itself, not the whole history
           # (squash-merge already collapses the dev branch's commits).
           tag_prefix: v
+          # IMPORTANT: dry_run=true tells the action to compute new_tag
+          # WITHOUT creating or pushing it. The "Commit CHANGELOG.md +
+          # Chart.yaml bump" step below is the single place that creates
+          # the tag and points it at the chore-release commit, so users
+          # who `git checkout v<X.Y.Z>` get both the source AND the
+          # CHANGELOG entry for that release. Without dry_run the action
+          # tags the merge SHA, then the explicit `git push origin
+          # ${VERSION}` later fails ("tag already exists") and the
+          # GitHub Release step is skipped. (Bug observed in v0.2.0
+          # release; tag had to be moved by hand and the Release was
+          # created manually.)
+          dry_run: true
 
       - name: Skip if no version bump warranted
         if: steps.semver.outputs.new_tag == ''
