@@ -24,6 +24,18 @@ func RunContractTests(t *testing.T, e engine.Engine) {
 		require.NotEmpty(t, string(e.Name()))
 	})
 
+	t.Run("capabilities_declares_at_least_one_facade", func(t *testing.T) {
+		t.Parallel()
+		caps := e.Capabilities()
+		require.NotEmpty(t, caps.Facades, "engine must answer at least one facade")
+		// Every advertised facade must be a known value so the
+		// transport layer can dispatch deterministically.
+		for _, f := range caps.Facades {
+			require.True(t, f == engine.FacadeDocling || f == engine.FacadeExternal,
+				"unknown facade %q advertised by engine %s", f, e.Name())
+		}
+	})
+
 	t.Run("health_honors_cancelled_ctx", func(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())
@@ -41,7 +53,12 @@ func RunContractTests(t *testing.T, e engine.Engine) {
 	t.Run("convert_returns_response_or_error", func(t *testing.T) {
 		t.Parallel()
 		ctx := context.Background()
-		req := &engine.ConvertRequest{}
+		caps := e.Capabilities()
+		facade := engine.FacadeDocling
+		if len(caps.Facades) > 0 {
+			facade = caps.Facades[0]
+		}
+		req := &engine.ConvertRequest{Facade: facade}
 		resp, err := e.Convert(ctx, req)
 		if err == nil {
 			require.NotNil(t, resp)

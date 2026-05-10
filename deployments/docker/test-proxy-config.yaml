@@ -17,17 +17,24 @@ server:
   shutdown_grace: 15s
 
 routing:
-  default_cee_engine: "kreuzberg"
-  facade_path_prefix: "/v1"
+  default_engine: "kreuzberg"
+  facade:
+    docling:
+      enabled: true
+      prefix: "/v1"
+    external:
+      enabled: true
+      path: "/process"
   passthrough:
-    docling_prefix: "/docling"
-    tika_prefix: "/tika"
-    kreuzberg_prefix: "/kreuzberg"
+    enabled: true
 
 engines:
   docling:
     enable: true
+    compat_type: "docling"
     url: "http://docling:5001"
+    auth_header: "X-Api-Key"
+    auth_scheme: "raw"
     request_timeout: 300s
     health_path: "/health"
     mime_types:
@@ -39,12 +46,11 @@ engines:
       - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
       - "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       - "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-      # Markup / plain
+      # Markup / plain (text/plain handled by tika, see below)
       - "text/html"
       - "application/xhtml+xml"
       - "text/markdown"
       - "text/csv"
-      - "text/plain"
       - "text/asciidoc"
       - "application/x-asciidoc"
       - "application/x-tex"
@@ -62,11 +68,22 @@ engines:
       - "image/webp"
 
   tika:
-    enable: false
+    enable: true
+    compat_type: "tika"
+    url: "http://tika:9998"
+    auth_header: "X-Api-Key"
+    auth_scheme: "raw"
+    request_timeout: 90s
+    health_path: "/version"
+    mime_types:
+      - "text/plain"
 
   kreuzberg:
     enable: true
+    compat_type: "docling"          # Kreuzberg's /v1/convert/file is docling-shape.
     url: "http://kreuzberg:8000"
+    auth_header: "Authorization"
+    auth_scheme: "bearer"
     request_timeout: 180s
     health_path: "/health"
     forward_options:

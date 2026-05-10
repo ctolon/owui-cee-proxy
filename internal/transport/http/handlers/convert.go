@@ -67,9 +67,10 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	// M13: this fallback is INTENTIONAL — source mode skips MIME-based
 	// dispatch and always uses the default engine. Operators rely on the
 	// log line below to debug "why didn't my Tika rule fire?".
+	req.Facade = engine.FacadeDocling
 	eng := c.Registry.Default()
 	if !source && len(req.Files) > 0 {
-		eng = c.Registry.Pick(req.Files[0].ContentType)
+		eng = c.Registry.Pick(engine.FacadeDocling, req.Files[0].ContentType)
 	} else if source {
 		c.Logger.Info().
 			Str("event", "source_mode_default_engine").

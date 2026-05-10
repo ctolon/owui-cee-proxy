@@ -18,12 +18,23 @@ import (
 // stubEngine is a minimal Engine usable as a registry default. It is
 // never actually invoked in these tests because the request is rejected
 // or short-circuited before any engine.Convert call is made.
-type stubEngine struct{ name engine.Name }
+type stubEngine struct {
+	name        engine.Name
+	httpSources bool
+}
 
 func (s *stubEngine) Name() engine.Name { return s.name }
+func (s *stubEngine) Capabilities() engine.EngineCapabilities {
+	return engine.EngineCapabilities{
+		Facades:     []engine.Facade{engine.FacadeDocling},
+		HTTPSources: s.httpSources,
+	}
+}
+
 func (s *stubEngine) Convert(_ context.Context, _ *engine.ConvertRequest) (*engine.ConvertResponse, error) {
 	return nil, nil
 }
+
 func (s *stubEngine) Health(_ context.Context) error { return nil }
 
 func newRegistry(t *testing.T, def engine.Name, names ...engine.Name) engine.Registry {
@@ -64,11 +75,12 @@ func newOrchestratorOrSkip(t *testing.T) *tasks.Orchestrator {
 	return orch
 }
 
-func TestAsync_SubmitSource_RejectsNonDoclingDefault(t *testing.T) {
+func TestAsync_SubmitSource_RejectsEngineWithoutHTTPSources(t *testing.T) {
 	t.Parallel()
 
-	// Default engine is Tika — does not support http_sources.
-	reg := newRegistry(t, engine.Tika, engine.Docling)
+	// Default engine has Capabilities().HTTPSources=false (the stub
+	// default) — so http_sources requests should be rejected with 400.
+	reg := newRegistry(t, "default-no-sources", "secondary")
 	orch := newOrchestratorOrSkip(t)
 
 	a := &Async{Registry: reg, Orchestrator: orch}
