@@ -66,7 +66,7 @@ func (a *Adapter) Health(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 500 {
 		return fmt.Errorf("docling health: status %d", resp.StatusCode)
 	}
@@ -85,8 +85,8 @@ func (a *Adapter) convertFile(ctx context.Context, req *engine.ConvertRequest) (
 	// Write multipart in the background so the request body is streamed
 	// rather than buffered in memory.
 	go func() {
-		defer pw.Close()
-		defer mw.Close()
+		defer func() { _ = pw.Close() }()
+		defer func() { _ = mw.Close() }()
 		for _, f := range req.Files {
 			fw, werr := createFilePart(mw, "files", f.Filename, f.ContentType)
 			if werr != nil {

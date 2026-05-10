@@ -138,5 +138,7 @@ func TestWriteResultResponse_DisallowedCTForcedDownload(t *testing.T) {
 
 // referenced helpers that would otherwise be flagged unused in this
 // file's narrow test surface.
-var _ = io.Copy
-var _ = json.Marshal
+var (
+	_ = io.Copy
+	_ = json.Marshal
+)

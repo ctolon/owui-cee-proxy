@@ -62,8 +62,8 @@ func (a *Adapter) Convert(ctx context.Context, req *engine.ConvertRequest) (*eng
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
-		defer pw.Close()
-		defer mw.Close()
+		defer func() { _ = pw.Close() }()
+		defer func() { _ = mw.Close() }()
 		for _, f := range req.Files {
 			fw, werr := createFilePart(mw, "files", f.Filename, f.ContentType)
 			if werr != nil {
@@ -127,7 +127,7 @@ func (a *Adapter) Health(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 500 {
 		return fmt.Errorf("kreuzberg health: status %d", resp.StatusCode)
 	}

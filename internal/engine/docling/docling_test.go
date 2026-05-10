@@ -2,6 +2,7 @@ package docling
 
 import (
 	"context"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -33,7 +34,7 @@ func TestConvertFile_StreamsMultipartAndForwardsAPIKey(t *testing.T) {
 		got := map[string]string{}
 		for {
 			part, err := mr.NextPart()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			require.NoError(t, err)

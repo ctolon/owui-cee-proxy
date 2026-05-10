@@ -18,10 +18,10 @@ import (
 // replicas can run workers concurrently; asynq's Redis-backed lease
 // guarantees a task is processed by exactly one consumer at a time.
 type Worker struct {
-	srv          *asynq.Server
-	orch         *Orchestrator
-	registry     engine.Registry
-	logger       zerolog.Logger
+	srv      *asynq.Server
+	orch     *Orchestrator
+	registry engine.Registry
+	logger   zerolog.Logger
 }
 
 func NewWorker(cfg config.TasksConfig, orch *Orchestrator, registry engine.Registry, logger zerolog.Logger) (*Worker, error) {
@@ -96,7 +96,7 @@ func (w *Worker) handleConvert(ctx context.Context, t *asynq.Task) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -33,8 +33,8 @@ func TestNormalizeNullContent(t *testing.T) {
 			name: "string contains the literal sequence — must NOT match",
 			// Field name appears inside a value; JSON disallows literal null
 			// inside strings (would be quoted), so our byte-replace is safe.
-			in:   `{"document":{"md_content":"see \"md_content\":null in text"}}`,
-			out:  `{"document":{"md_content":"see \"md_content\":null in text"}}`,
+			in:  `{"document":{"md_content":"see \"md_content\":null in text"}}`,
+			out: `{"document":{"md_content":"see \"md_content\":null in text"}}`,
 			// NOTE: Above is technically a false positive scenario for the
 			// naive replace, but real Docling responses never produce this
 			// nested sequence with `null` outside a string. We accept the
@@ -53,4 +53,3 @@ func TestNormalizeNullContent(t *testing.T) {
 		})
 	}
 }
-

@@ -25,8 +25,8 @@ func TestDocling_FacadeIsTransparent(t *testing.T) {
 		Image:        "ghcr.io/docling-project/docling-serve:latest",
 		ExposedPorts: []string{"5001/tcp"},
 		Env: map[string]string{
-			"UVICORN_WORKERS":                       "1",
-			"DOCLING_SERVE_ENABLE_REMOTE_SERVICES":  "true",
+			"UVICORN_WORKERS":                      "1",
+			"DOCLING_SERVE_ENABLE_REMOTE_SERVICES": "true",
 		},
 		WaitingFor: wait.ForHTTP("/health").WithPort("5001/tcp").WithStartupTimeout(8 * time.Minute),
 	}

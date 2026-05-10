@@ -127,8 +127,8 @@ func validateBlobLimits(p *Payload, maxBlob, maxTotal int64) error {
 // caller-visible token to the internal asynq task ID. Bound to the
 // caller's API-key fingerprint when provided.
 type tokenBinding struct {
-	TaskID         string `json:"task_id"`
-	APIKeyFinger   string `json:"key_fp,omitempty"`
+	TaskID       string `json:"task_id"`
+	APIKeyFinger string `json:"key_fp,omitempty"`
 }
 
 // Enqueue persists blob buffers to Redis and submits the task. The

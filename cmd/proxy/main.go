@@ -17,6 +17,13 @@ import (
 )
 
 func main() {
+	// Delegate to run so deferred cleanups (signal stop, etc.) actually
+	// fire — calling os.Exit directly from main would skip them, which
+	// is what the gocritic exitAfterDefer lint flags.
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		cfgPath     string
 		showVersion bool
@@ -28,13 +35,13 @@ func main() {
 	if showVersion {
 		v := version.Current()
 		fmt.Printf("owui-cee-proxy %s (%s, %s)\n", v.Version, v.Commit, v.Date)
-		return
+		return 0
 	}
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
-		os.Exit(2)
+		return 2
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -43,13 +50,14 @@ func main() {
 	a, err := app.Build(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build: %v\n", err)
-		os.Exit(2)
+		return 2
 	}
 
 	if err := a.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "run: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func envOr(k, def string) string {

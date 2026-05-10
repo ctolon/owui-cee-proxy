@@ -2,6 +2,7 @@ package observability
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
@@ -9,13 +10,13 @@ import (
 // carry an `engine` label so dashboards can split RED metrics per
 // extraction backend.
 type Metrics struct {
-	Registry         *prometheus.Registry
-	RequestsTotal    *prometheus.CounterVec
-	RequestDuration  *prometheus.HistogramVec
-	InFlight         *prometheus.GaugeVec
-	UpstreamErrors   *prometheus.CounterVec
+	Registry          *prometheus.Registry
+	RequestsTotal     *prometheus.CounterVec
+	RequestDuration   *prometheus.HistogramVec
+	InFlight          *prometheus.GaugeVec
+	UpstreamErrors    *prometheus.CounterVec
 	BreakerStateGauge *prometheus.GaugeVec
-	BodyBytes        *prometheus.HistogramVec
+	BodyBytes         *prometheus.HistogramVec
 }
 
 func NewMetrics() *Metrics {
@@ -23,8 +24,8 @@ func NewMetrics() *Metrics {
 	factory := promauto.With(reg)
 
 	reg.MustRegister(
-		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
-		prometheus.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewGoCollector(),
 	)
 
 	return &Metrics{

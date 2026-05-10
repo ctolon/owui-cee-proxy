@@ -123,7 +123,7 @@ func spoolPart(r io.Reader, threshold, maxBytes int64) (*spoolReader, error) {
 	total := int64(written)
 	// Cap the rest of the copy at maxBytes (if set) so a malicious
 	// streaming source cannot fill the disk past the configured limit.
-	var rest io.Reader = r
+	rest := r
 	if maxBytes > 0 {
 		// +1 so we can detect overflow.
 		rest = &io.LimitedReader{R: r, N: maxBytes - total + 1}

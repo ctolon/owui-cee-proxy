@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ResolvedURL is the result of resolving a user-supplied URL through
@@ -53,10 +54,18 @@ func defaultResolveExternalURL(raw string) (*ResolvedURL, error) {
 		return nil, fmt.Errorf("port %s not allowed", port)
 	}
 
-	addrs, err := net.LookupIP(host)
+	// 5s ceiling on DNS resolution. Use the resolver's ctx-aware lookup
+	// so the call honours cancellation (and so the noctx linter passes).
+	dnsCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ipAddrs, err := net.DefaultResolver.LookupIPAddr(dnsCtx, host)
 	if err != nil {
 		// DNS failures are treated as untrusted (deny by default).
 		return nil, fmt.Errorf("dns lookup: %w", err)
+	}
+	addrs := make([]net.IP, len(ipAddrs))
+	for i := range ipAddrs {
+		addrs[i] = ipAddrs[i].IP
 	}
 	if len(addrs) == 0 {
 		return nil, errors.New("dns lookup: no addresses")
@@ -90,15 +99,6 @@ func (r *ResolvedURL) Dialer() func(ctx context.Context, network, addr string) (
 	return func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return d.DialContext(ctx, network, pinned)
 	}
-}
-
-// defaultIsExternalURL is the legacy entry point kept for backwards
-// compatibility with callers that only need the boolean check. Prefer
-// defaultResolveExternalURL when you intend to issue an outbound
-// request: only the resolve+pin path closes the TOCTOU gap.
-func defaultIsExternalURL(raw string) error {
-	_, err := defaultResolveExternalURL(raw)
-	return err
 }
 
 // blockedCIDRs is the list of network ranges we never dial into.

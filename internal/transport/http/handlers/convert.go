@@ -106,7 +106,7 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 		})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	for k, v := range resp.Headers {
 		for _, vv := range v {
@@ -241,4 +241,3 @@ func (c *Convert) validateSources(srcs []engine.HTTPSource) error {
 	}
 	return nil
 }
-

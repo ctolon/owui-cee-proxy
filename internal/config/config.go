@@ -69,13 +69,13 @@ const (
 )
 
 type Config struct {
-	Server          ServerConfig          `koanf:"server" validate:"required"`
-	Routing         RoutingConfig         `koanf:"routing" validate:"required"`
-	Engines         EnginesConfig         `koanf:"engines" validate:"required"`
-	Security        SecurityConfig        `koanf:"security"`
-	RateLimitGlobal RateLimitConfig       `koanf:"ratelimit_global"`
-	Tasks           TasksConfig           `koanf:"tasks"`
-	Observability   ObservabilityConfig   `koanf:"observability"`
+	Server          ServerConfig        `koanf:"server" validate:"required"`
+	Routing         RoutingConfig       `koanf:"routing" validate:"required"`
+	Engines         EnginesConfig       `koanf:"engines" validate:"required"`
+	Security        SecurityConfig      `koanf:"security"`
+	RateLimitGlobal RateLimitConfig     `koanf:"ratelimit_global"`
+	Tasks           TasksConfig         `koanf:"tasks"`
+	Observability   ObservabilityConfig `koanf:"observability"`
 }
 
 type ServerConfig struct {
@@ -88,20 +88,20 @@ type ServerConfig struct {
 	// authenticated subtree by the Timeout middleware. Distinct from the
 	// transport-level Read/Write timeouts because we want streaming
 	// uploads/downloads to be governed by handler context, not the socket.
-	RequestTimeout    time.Duration `koanf:"request_timeout"`
-	MaxHeaderBytes    int           `koanf:"max_header_bytes" validate:"gte=0"`
-	MaxBodyBytes      int64         `koanf:"max_body_bytes" validate:"gte=0"`
-	ShutdownGrace     time.Duration `koanf:"shutdown_grace"`
-	HTTP2             bool          `koanf:"http2"`
-	H2C               bool          `koanf:"h2c"`
-	TLS               TLSServerConfig `koanf:"tls"`
+	RequestTimeout time.Duration   `koanf:"request_timeout"`
+	MaxHeaderBytes int             `koanf:"max_header_bytes" validate:"gte=0"`
+	MaxBodyBytes   int64           `koanf:"max_body_bytes" validate:"gte=0"`
+	ShutdownGrace  time.Duration   `koanf:"shutdown_grace"`
+	HTTP2          bool            `koanf:"http2"`
+	H2C            bool            `koanf:"h2c"`
+	TLS            TLSServerConfig `koanf:"tls"`
 }
 
 type TLSServerConfig struct {
-	Enabled       bool   `koanf:"enabled"`
-	CertFile      string `koanf:"cert_file"`
-	KeyFile       string `koanf:"key_file"`
-	MinVersion    string `koanf:"min_version"`
+	Enabled    bool   `koanf:"enabled"`
+	CertFile   string `koanf:"cert_file"`
+	KeyFile    string `koanf:"key_file"`
+	MinVersion string `koanf:"min_version"`
 	// ClientAuth selects mTLS behavior. "require" was intentionally
 	// dropped because it accepts ANY client cert without verifying it
 	// against ClientCAs — almost certainly not what operators expect.
@@ -111,9 +111,9 @@ type TLSServerConfig struct {
 }
 
 type RoutingConfig struct {
-	DefaultCEEEngine    string `koanf:"default_cee_engine" validate:"required,oneof=docling tika kreuzberg"`
-	FacadePathPrefix    string `koanf:"facade_path_prefix" validate:"required,startswith=/"`
-	Passthrough         PassthroughConfig `koanf:"passthrough"`
+	DefaultCEEEngine string            `koanf:"default_cee_engine" validate:"required,oneof=docling tika kreuzberg"`
+	FacadePathPrefix string            `koanf:"facade_path_prefix" validate:"required,startswith=/"`
+	Passthrough      PassthroughConfig `koanf:"passthrough"`
 }
 
 type PassthroughConfig struct {
@@ -133,33 +133,33 @@ type EngineConfig struct {
 	// L2: required_if uses validator's cross-field check so an enabled
 	// engine must declare a URL. omitempty + url keeps the validation
 	// permissive when the engine is disabled.
-	URL string `koanf:"url" validate:"required_if=Enable true,omitempty,url"`
-	APIKeyEnv       string            `koanf:"api_key_env"`
-	APIKey          Secret            `koanf:"-"` // populated from env at startup
-	RequestTimeout  time.Duration     `koanf:"request_timeout"`
-	HealthPath      string            `koanf:"health_path"`
+	URL            string        `koanf:"url" validate:"required_if=Enable true,omitempty,url"`
+	APIKeyEnv      string        `koanf:"api_key_env"`
+	APIKey         Secret        `koanf:"-"` // populated from env at startup
+	RequestTimeout time.Duration `koanf:"request_timeout"`
+	HealthPath     string        `koanf:"health_path"`
 	// MimeTypes lists the MIME types this engine claims. When a request
 	// is dispatched through the Docling-compatible facade, the first
 	// file's Content-Type is matched against the MimeTypes lists of
 	// every NON-DEFAULT enabled engine; the first match wins. Default
 	// engine handles anything that does not match. Patterns are exact
 	// (e.g. "application/pdf") or top-level wildcards ("image/*").
-	MimeTypes       []string          `koanf:"mime_types"`
-	ForwardOptions  map[string]string `koanf:"forward_options"`
-	HTTP            HTTPClientConfig  `koanf:"http"`
-	Breaker         BreakerConfig     `koanf:"breaker"`
-	RateLimit       RateLimitConfig   `koanf:"rate_limit"`
+	MimeTypes      []string          `koanf:"mime_types"`
+	ForwardOptions map[string]string `koanf:"forward_options"`
+	HTTP           HTTPClientConfig  `koanf:"http"`
+	Breaker        BreakerConfig     `koanf:"breaker"`
+	RateLimit      RateLimitConfig   `koanf:"rate_limit"`
 }
 
 type HTTPClientConfig struct {
-	MaxIdleConns          int           `koanf:"max_idle_conns"`
-	MaxIdleConnsPerHost   int           `koanf:"max_idle_conns_per_host"`
-	MaxConnsPerHost       int           `koanf:"max_conns_per_host"`
-	IdleConnTimeout       time.Duration `koanf:"idle_conn_timeout"`
-	TLSHandshakeTimeout   time.Duration `koanf:"tls_handshake_timeout"`
-	ResponseHeaderTimeout time.Duration `koanf:"response_header_timeout"`
-	ExpectContinueTimeout time.Duration `koanf:"expect_continue_timeout"`
-	DisableCompression    bool          `koanf:"disable_compression"`
+	MaxIdleConns          int             `koanf:"max_idle_conns"`
+	MaxIdleConnsPerHost   int             `koanf:"max_idle_conns_per_host"`
+	MaxConnsPerHost       int             `koanf:"max_conns_per_host"`
+	IdleConnTimeout       time.Duration   `koanf:"idle_conn_timeout"`
+	TLSHandshakeTimeout   time.Duration   `koanf:"tls_handshake_timeout"`
+	ResponseHeaderTimeout time.Duration   `koanf:"response_header_timeout"`
+	ExpectContinueTimeout time.Duration   `koanf:"expect_continue_timeout"`
+	DisableCompression    bool            `koanf:"disable_compression"`
 	TLS                   TLSClientConfig `koanf:"tls"`
 }
 
@@ -184,11 +184,11 @@ type RateLimitConfig struct {
 }
 
 type SecurityConfig struct {
-	ProxyAPIKeysEnv   string   `koanf:"proxy_api_keys_env"`
-	ProxyAPIKeyHeader string   `koanf:"proxy_api_key_header"`
-	ProxyAPIKeys      []Secret `koanf:"-"` // resolved from env
-	RequireAPIKey     bool     `koanf:"require_api_key"`
-	TrustedProxies    []string `koanf:"trusted_proxies"`
+	ProxyAPIKeysEnv   string     `koanf:"proxy_api_keys_env"`
+	ProxyAPIKeyHeader string     `koanf:"proxy_api_key_header"`
+	ProxyAPIKeys      []Secret   `koanf:"-"` // resolved from env
+	RequireAPIKey     bool       `koanf:"require_api_key"`
+	TrustedProxies    []string   `koanf:"trusted_proxies"`
 	CORS              CORSConfig `koanf:"cors"`
 }
 
@@ -258,15 +258,15 @@ func Default() *Config {
 			// slow-loris-style response stalls hold sockets indefinitely.
 			// 5m matches RequestTimeout: a single request that legitimately
 			// takes that long will not be cut off mid-stream.
-			WriteTimeout:      5 * time.Minute,
-			IdleTimeout:       120 * time.Second,
+			WriteTimeout: 5 * time.Minute,
+			IdleTimeout:  120 * time.Second,
 			// RequestTimeout governs the handler-level deadline applied
 			// by the Timeout middleware on the authenticated subtree.
-			RequestTimeout:    5 * time.Minute,
-			MaxHeaderBytes:    1 << 20,
-			MaxBodyBytes:      500 << 20,
-			ShutdownGrace:     30 * time.Second,
-			HTTP2:             true,
+			RequestTimeout: 5 * time.Minute,
+			MaxHeaderBytes: 1 << 20,
+			MaxBodyBytes:   500 << 20,
+			ShutdownGrace:  30 * time.Second,
+			HTTP2:          true,
 			TLS: TLSServerConfig{
 				MinVersion: "1.3",
 				ClientAuth: "none",

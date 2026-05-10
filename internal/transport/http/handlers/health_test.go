@@ -26,6 +26,7 @@ func (s *healthStubEngine) Name() engine.Name { return s.name }
 func (s *healthStubEngine) Convert(ctx context.Context, _ *engine.ConvertRequest) (*engine.ConvertResponse, error) {
 	return nil, nil
 }
+
 func (s *healthStubEngine) Health(ctx context.Context) error {
 	select {
 	case <-time.After(s.delay):

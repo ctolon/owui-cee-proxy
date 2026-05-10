@@ -12,12 +12,12 @@ func TestSafeMultipartFilename(t *testing.T) {
 		want string
 	}{
 		{"ok.pdf", "ok.pdf"},
-		{"a\r\nb.pdf", ""},                  // CRLF injection
-		{"a\nb.pdf", ""},                    // LF
-		{"a\rb.pdf", ""},                    // CR
-		{"a\tb.pdf", ""},                    // tab is < 0x20
-		{"a\x00b.pdf", ""},                  // NUL
-		{"naïve.pdf", ""},                   // non-ASCII rejected
+		{"a\r\nb.pdf", ""}, // CRLF injection
+		{"a\nb.pdf", ""},   // LF
+		{"a\rb.pdf", ""},   // CR
+		{"a\tb.pdf", ""},   // tab is < 0x20
+		{"a\x00b.pdf", ""}, // NUL
+		{"naïve.pdf", ""},  // non-ASCII rejected
 		{`with "quote".pdf`, `with \"quote\".pdf`},
 		{`back\slash.pdf`, `back\\slash.pdf`},
 		{"", ""},

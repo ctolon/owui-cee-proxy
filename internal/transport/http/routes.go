@@ -20,12 +20,12 @@ import (
 )
 
 type RouterDeps struct {
-	Config        *config.Config
-	Logger        zerolog.Logger
-	Metrics       *observability.Metrics
-	Registry      engine.Registry
-	Orchestrator  *tasks.Orchestrator
-	RedisHealth   func(context.Context) error
+	Config       *config.Config
+	Logger       zerolog.Logger
+	Metrics      *observability.Metrics
+	Registry     engine.Registry
+	Orchestrator *tasks.Orchestrator
+	RedisHealth  func(context.Context) error
 }
 
 func NewRouter(d RouterDeps) (http.Handler, error) {

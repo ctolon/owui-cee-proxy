@@ -24,11 +24,11 @@ import (
 )
 
 type Application struct {
-	cfg          *config.Config
-	logger       zerolog.Logger
-	server       *httptransport.Server
-	worker       *tasks.Worker
-	orchestrator *tasks.Orchestrator
+	cfg           *config.Config
+	logger        zerolog.Logger
+	server        *httptransport.Server
+	worker        *tasks.Worker
+	orchestrator  *tasks.Orchestrator
 	traceShutdown func(context.Context) error
 }
 
@@ -138,7 +138,7 @@ func buildRegistry(cfg *config.Config) (engine.Registry, error) {
 func (a *Application) Run(ctx context.Context) error {
 	errCh := make(chan error, 2)
 	go func() {
-		if err := a.server.ListenAndServe(); err != nil && !errors.Is(err, contextDone) {
+		if err := a.server.ListenAndServe(); err != nil && !errors.Is(err, errContextDone) {
 			errCh <- fmt.Errorf("server: %w", err)
 		}
 	}()
@@ -182,6 +182,6 @@ func (a *Application) shutdown() error {
 	return nil
 }
 
-// contextDone is a sentinel matching http.ErrServerClosed semantics.
+// errContextDone is a sentinel matching http.ErrServerClosed semantics.
 // Captured at runtime via errors.Is.
-var contextDone = errors.New("context done")
+var errContextDone = errors.New("context done")

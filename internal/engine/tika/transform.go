@@ -18,10 +18,10 @@ import (
 type tikaItem map[string]any
 
 type doclingDocument struct {
-	Filename   string         `json:"filename,omitempty"`
-	MdContent  string         `json:"md_content"`
-	TextContent string        `json:"text_content,omitempty"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
+	Filename    string         `json:"filename,omitempty"`
+	MdContent   string         `json:"md_content"`
+	TextContent string         `json:"text_content,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
 }
 
 type doclingEnvelope struct {

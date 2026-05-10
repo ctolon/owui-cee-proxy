@@ -38,13 +38,16 @@ func NewServer(cfg config.ServerConfig, handler http.Handler, logger zerolog.Log
 		IdleTimeout:       cfg.IdleTimeout,
 		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 		TLSConfig:         tlsCfg,
-		ErrorLog: nil,
+		ErrorLog:          nil,
 	}
 	return &Server{httpServer: srv, tlsCfg: tlsCfg, logger: logger, cfg: cfg}, nil
 }
 
 func (s *Server) ListenAndServe() error {
-	ln, err := net.Listen("tcp", s.cfg.Listen)
+	// Use net.ListenConfig so the call satisfies the noctx lint (and
+	// allows future hot-reload code to cancel a pending bind).
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", s.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.cfg.Listen, err)
 	}

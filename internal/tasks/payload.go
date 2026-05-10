@@ -151,8 +151,6 @@ func noop() {}
 // upload buffered blob bodies after parsing. We deliberately keep this
 // off Payload (which is JSON-serialised onto Redis) so blob bytes do
 // not double-encode.
-type localBlobsKey struct{}
-
 type localBlobs struct {
 	Buffers []*bytes.Buffer
 }

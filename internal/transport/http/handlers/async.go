@@ -154,7 +154,7 @@ func (a *Async) Result(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "lookup failed", http.StatusInternalServerError)
 		return
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	writeResultResponse(w, body, contentType)
 }
 
@@ -203,4 +203,3 @@ func isClientError(err error) bool {
 	return strings.Contains(msg, "exceeds max_blob_bytes") ||
 		strings.Contains(msg, "exceeds max_total_bytes")
 }
-

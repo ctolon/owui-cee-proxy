@@ -87,7 +87,7 @@ func spoolPart(r io.Reader, threshold, maxBytes int64) (*spoolReader, error) {
 		return nil, err
 	}
 	total := int64(n)
-	var rest io.Reader = r
+	rest := r
 	if maxBytes > 0 {
 		rest = &io.LimitedReader{R: r, N: maxBytes - total + 1}
 	}

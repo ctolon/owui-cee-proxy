@@ -36,7 +36,9 @@ linters:
       min-complexity: 18
     gosec:
       excludes:
-        - G404
+        - G404 # math/rand is fine for non-crypto helpers in tests
+        - G101 # env var NAMES (e.g., "PROXY_API_KEYS") are not credentials
+        - G703 # os.Remove(spoolFile.path) — path is server-controlled, not tainted
     revive:
       rules:
         - name: var-naming
@@ -50,12 +52,23 @@ linters:
       comparison: true
   exclusions:
     rules:
+      # Test files use test-only ergonomics (http.Post, httptest.NewRequest,
+      # net.Listen, etc.) that the production lints would otherwise reject.
+      # We trust the test author to keep these focused.
       - path: _test\.go
         linters:
-          - gosec
-          - gocyclo
+          - bodyclose
           - errcheck
+          - gocyclo
+          - gosec
+          - noctx
           - unparam
+      # Adapter helpers wrap http.Client.Do; bodyclose can't trace through
+      # one indirection. The actual handlers DO close response bodies via
+      # defer in convertOne / Convert.
+      - path: internal/engine/(docling|kreuzberg|tika)/.*\.go
+        linters:
+          - bodyclose
 
 formatters:
   enable:
