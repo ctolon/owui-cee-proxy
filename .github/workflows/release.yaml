@@ -1,53 +1,234 @@
 name: release
 
+# Triggered by every push to main. Branch protection guarantees a push
+# only happens via squash-merge of an approved PR; the squash-merge
+# commit's title is the conventional-commit input that drives semver.
+#
+# Pipeline:
+#   1. Compute next semver from the squash-merge commit title.
+#   2. Build multi-arch image, push to Docker Hub + GHCR.
+#   3. Package Helm chart with the new version, push to GHCR OCI.
+#   4. Regenerate CHANGELOG.md via git-cliff.
+#   5. Tag v<new>; commit CHANGELOG.md back via the bypass actor.
+#   6. Create GitHub Release whose notes = the merged PR's body.
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [main]
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
+  contents: write       # tag + commit CHANGELOG back
+  packages: write       # push image + chart to GHCR
+  pull-requests: read   # read PR body for release notes
+  id-token: write       # for cosign / OIDC if added later
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   GO_VERSION: "1.26.1"
+  IMAGE_DOCKERHUB: docker.io/ctolon17/owui-cee-proxy
+  IMAGE_GHCR: ghcr.io/${{ github.repository_owner }}/owui-cee-proxy
+  CHART_OCI: oci://ghcr.io/${{ github.repository_owner }}/charts
 
 jobs:
-  goreleaser:
+  release:
+    if: "!contains(github.event.head_commit.message, '[skip release]') && github.event.head_commit.author.username != 'github-actions[bot]'"
     runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.semver.outputs.new_tag }}
+      previous_tag: ${{ steps.semver.outputs.previous_tag }}
+      bump: ${{ steps.semver.outputs.release_type }}
+      pr_body: ${{ steps.pr.outputs.body }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      pr_title: ${{ steps.pr.outputs.title }}
     steps:
+      # RELEASE_PAT is a fine-grained PAT with `contents: write` whose
+      # owner has admin bypass on the main ruleset. Required so the
+      # workflow can push CHANGELOG.md + Chart.yaml bump back to main
+      # plus the tag. Falls back to GITHUB_TOKEN when unset (the
+      # commit-back will fail under the ruleset, but image+chart push
+      # to registries still succeeds).
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      # Find the PR that produced this squash-merge commit so we can
+      # use its title (for semver) and body (for release notes).
+      - id: pr
+        name: Resolve merged PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          PR_JSON=$(gh api "/repos/${{ github.repository }}/commits/${SHA}/pulls" --jq '.[0]')
+          if [ -z "$PR_JSON" ] || [ "$PR_JSON" = "null" ]; then
+            echo "::warning::no PR associated with $SHA — using head commit message"
+            PR_NUMBER=""
+            PR_TITLE=$(git log -1 --pretty=%s "$SHA")
+            PR_BODY=$(git log -1 --pretty=%b "$SHA")
+          else
+            PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
+            PR_TITLE=$(echo "$PR_JSON"  | jq -r '.title')
+            PR_BODY=$(echo "$PR_JSON"   | jq -r '.body // ""')
+          fi
+          {
+            echo "number=$PR_NUMBER"
+            echo "title=$PR_TITLE"
+            echo "body<<__BODY_EOF__"
+            echo "$PR_BODY"
+            echo "__BODY_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: semver
+        name: Compute next semver from squash-merge title
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Drive the bump from the squash-merge commit's TITLE
+          # (which is the merged PR title under our flow). Conventional:
+          #   feat: ..       → minor
+          #   fix: ..        → patch
+          #   feat!: / BREAKING CHANGE: → major
+          #   docs:/chore:/etc → no-op (skip release)
+          custom_release_rules: feat:minor:Features,fix:patch:Bug Fixes,perf:patch:Performance,refactor:patch:Refactor,docs:patch:Documentation
+          default_bump: false
+          # Only consider the merge commit itself, not the whole history
+          # (squash-merge already collapses the dev branch's commits).
+          tag_prefix: v
+
+      - name: Skip if no version bump warranted
+        if: steps.semver.outputs.new_tag == ''
+        run: |
+          echo "::notice::PR title '${{ steps.pr.outputs.title }}' produces no semver bump — skipping release."
+          exit 0
+
       - uses: actions/setup-go@v5
+        if: steps.semver.outputs.new_tag != ''
         with:
           go-version: ${{ env.GO_VERSION }}
-      - uses: docker/login-action@v3
+          cache: true
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.semver.outputs.new_tag != ''
+      - uses: docker/setup-buildx-action@v3
+        if: steps.semver.outputs.new_tag != ''
+
+      - name: Login to Docker Hub
+        if: steps.semver.outputs.new_tag != ''
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        if: steps.semver.outputs.new_tag != ''
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          version: latest
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  helm-release:
-    runs-on: ubuntu-latest
-    needs: goreleaser
-    steps:
-      - uses: actions/checkout@v4
+      - name: Build + push multi-arch image
+        if: steps.semver.outputs.new_tag != ''
+        env:
+          VERSION: ${{ steps.semver.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          V="${VERSION#v}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="$V" \
+            --build-arg COMMIT="$(git rev-parse --short HEAD)" \
+            --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "${{ env.IMAGE_DOCKERHUB }}:${V}" \
+            -t "${{ env.IMAGE_DOCKERHUB }}:latest" \
+            -t "${{ env.IMAGE_GHCR }}:${V}" \
+            -t "${{ env.IMAGE_GHCR }}:latest" \
+            -f deployments/docker/Dockerfile \
+            --push \
+            .
+
       - uses: azure/setup-helm@v4
+        if: steps.semver.outputs.new_tag != ''
         with:
           version: v3.16.2
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
-      - name: Package and push chart
+
+      - name: Package + push Helm chart
+        if: steps.semver.outputs.new_tag != ''
+        env:
+          VERSION: ${{ steps.semver.outputs.new_tag }}
         run: |
-          helm package deployments/helm/owui-cee-proxy
-          helm push owui-cee-proxy-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          set -euo pipefail
+          V="${VERSION#v}"
+          # Bump Chart.yaml in-place for this build only; the change is
+          # committed back below by the changelog step.
+          sed -i -E "s/^(version): .*/\1: ${V}/" deployments/helm/owui-cee-proxy/Chart.yaml
+          sed -i -E "s/^(appVersion): .*/\1: \"${V}\"/" deployments/helm/owui-cee-proxy/Chart.yaml
+          mkdir -p dist
+          helm package deployments/helm/owui-cee-proxy --destination dist/
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          helm push "dist/owui-cee-proxy-${V}.tgz" "${{ env.CHART_OCI }}"
+
+      - name: Generate CHANGELOG.md (git-cliff)
+        if: steps.semver.outputs.new_tag != ''
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ steps.semver.outputs.new_tag }}
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Commit CHANGELOG.md + Chart.yaml bump
+        if: steps.semver.outputs.new_tag != ''
+        env:
+          VERSION: ${{ steps.semver.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md deployments/helm/owui-cee-proxy/Chart.yaml
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "chore(release): ${VERSION} [skip release]"
+          fi
+          git tag -a "${VERSION}" -m "${VERSION}"
+          git push origin HEAD:main
+          git push origin "${VERSION}"
+
+      - name: Create GitHub Release
+        if: steps.semver.outputs.new_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.semver.outputs.new_tag }}
+          name: ${{ steps.semver.outputs.new_tag }} — ${{ steps.pr.outputs.title }}
+          body: |
+            ${{ steps.pr.outputs.body }}
+
+            ---
+
+            **Distribution**
+
+            | Artifact          | Reference                                                       |
+            |-------------------|------------------------------------------------------------------|
+            | Image (Docker Hub)| `${{ env.IMAGE_DOCKERHUB }}:${{ steps.semver.outputs.new_tag }}` (also `:latest`) |
+            | Image (GHCR)      | `${{ env.IMAGE_GHCR }}:${{ steps.semver.outputs.new_tag }}` (also `:latest`)     |
+            | Helm chart (OCI)  | `${{ env.CHART_OCI }}/owui-cee-proxy:${{ steps.semver.outputs.new_tag }}`        |
+
+            ```sh
+            docker pull ${{ env.IMAGE_DOCKERHUB }}:${{ steps.semver.outputs.new_tag }}
+            helm install owui-cee-proxy \
+              ${{ env.CHART_OCI }}/owui-cee-proxy --version ${{ steps.semver.outputs.new_tag }}
+            ```
+
+            Bump type: `${{ steps.semver.outputs.release_type }}` (previous: `${{ steps.semver.outputs.previous_tag }}`)
+
+            See [`CHANGELOG.md`](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for the full history.
+          files: dist/owui-cee-proxy-*.tgz
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
