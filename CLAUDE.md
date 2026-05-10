@@ -11,7 +11,7 @@
 
 ## What this is
 
-A Go 1.26.1 reverse proxy that sits between OpenWebUI 0.9.2 and three
+A Go 1.26.3 reverse proxy that sits between OpenWebUI 0.9.2 and three
 content extraction backends:
 
 | Engine    | Default URL                  | Endpoint hit by adapter                              | Notes |

@@ -57,9 +57,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - uses: securego/gosec@master
-        with:
-          args: -severity medium -confidence medium ./...
+      # Install gosec via `go install` so it builds with the workflow's
+      # toolchain. The Docker-based securego/gosec action ships its own
+      # Go runtime with GOTOOLCHAIN=local, which trips when go.mod's
+      # `go` directive (1.26.3) is newer than its baked-in Go (1.26.2).
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+      - name: Run gosec
+        run: gosec -severity medium -confidence medium ./...
 
   govulncheck:
     runs-on: ubuntu-latest

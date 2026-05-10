@@ -4,7 +4,7 @@ OpenWebUI Content Extraction Engine proxy. Routes Docling Serve, Apache
 Tika, and Kreuzberg through a single Docling-compatible facade, plus
 per-engine native passthrough mounts.
 
-> Go 1.26.1 · stateless · streaming · cloud-native
+> Go 1.26.3 · stateless · streaming · cloud-native
 
 ## Why
 

@@ -1,8 +1,6 @@
 module github.com/ctolon/owui-cee-proxy
 
-go 1.26.1
-
-toolchain go1.26.3
+go 1.26.3
 
 require (
 	github.com/go-chi/chi/v5 v5.2.5
