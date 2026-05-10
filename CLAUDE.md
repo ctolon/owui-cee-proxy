@@ -5,6 +5,7 @@
 
 > Companion docs:
 > - [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — system architecture, request lifecycle, decision log
+> - [`docs/BRANCHING.md`](./docs/BRANCHING.md) — `dev` ↔ `main` flow, semver, release contract
 > - [`docs/REVIEW.md`](./docs/REVIEW.md) — security/perf review, prioritised follow-ups
 > - [`docs/HOT_RELOAD_ROADMAP.md`](./docs/HOT_RELOAD_ROADMAP.md) — nginx-style reload plan
 

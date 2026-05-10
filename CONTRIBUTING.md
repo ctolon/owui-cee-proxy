@@ -1,6 +1,40 @@
 # Contributing
 
-Thanks for your interest! A few ground rules to make reviews smooth:
+Thanks for your interest! A few ground rules to make reviews smooth.
+
+## Branching
+
+This repo uses a two-branch model — see [`docs/BRANCHING.md`](./docs/BRANCHING.md)
+for the full reference.
+
+- **Branch from `dev`** for any feature/fix work
+  (`git switch -c feat/my-thing dev`).
+- Open the feature PR against `dev`. CI runs on every push to your
+  branch and on the PR.
+- Periodically a maintainer opens a PR `dev → main`. **Merging that
+  PR is the release event** — `release.yaml` builds and publishes
+  the artifacts.
+- `main` accepts squash-merges only and the squash-merge title is
+  the conventional-commit message that drives the next semver bump.
+
+## PR title (the release contract)
+
+Squash-merge of `dev → main` produces one commit; its title must
+follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+feat(engine): add MinerU adapter
+fix(ssrf): close DNS rebind window
+feat!: drop deprecated /v0/extract        # major bump (BREAKING CHANGE)
+chore: bump golangci                       # no release
+```
+
+Allowed types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`,
+`build`, `ci`, `chore`, `revert`. The PR title is enforced by
+`pr-checks.yaml` on every PR-to-main; a malformed title blocks merge.
+
+The PR **body** becomes the GitHub Release notes, so write it like
+release notes — sections, code snippets, migration guidance.
 
 ## Before opening a PR
 
@@ -14,9 +48,12 @@ Thanks for your interest! A few ground rules to make reviews smooth:
 
 ## Commit hygiene
 
-- Use imperative mood: "add Tika passthrough", not "added Tika passthrough".
-- One concern per commit. PRs may bundle multiple commits.
-- No mixing of refactor + behaviour change in the same commit.
+- Use imperative mood: "add Tika passthrough", not "added Tika
+  passthrough". (The squash-merge title — see above — is the one
+  commit message that ships to `main`; intermediate commits on your
+  feature branch can be informal.)
+- One concern per PR.
+- No mixing of refactor + behaviour change in the same PR.
 
 ## Adding a new engine
 
