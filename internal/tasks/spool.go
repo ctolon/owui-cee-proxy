@@ -45,7 +45,7 @@ func (s *spoolReader) Close() error {
 	if s.path != "" {
 		// s.path is server-controlled (built by os.CreateTemp inside
 		// this package); not a tainted user input.
-		if rmErr := os.Remove(s.path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) && closeErr == nil { //nolint:gosec
+		if rmErr := os.Remove(s.path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) && closeErr == nil { // #nosec G304 G703 -- s.path is server-controlled (os.CreateTemp output), not user-tainted
 			closeErr = rmErr
 		}
 	}

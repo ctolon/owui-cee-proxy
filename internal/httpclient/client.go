@@ -83,7 +83,7 @@ func (c *Client) WithDeadline(ctx context.Context) (context.Context, context.Can
 func buildTLS(c config.TLSClientConfig) (*tls.Config, error) {
 	tc := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: c.InsecureSkipVerify, //nolint:gosec // explicit opt-in via config
+		InsecureSkipVerify: c.InsecureSkipVerify, // #nosec G402 -- explicit opt-in via config; documented as DANGEROUS
 		ServerName:         c.ServerName,
 	}
 	if c.CAFile != "" {
@@ -107,7 +107,7 @@ func buildTLS(c config.TLSClientConfig) (*tls.Config, error) {
 }
 
 func loadCAPool(path string) (*x509.CertPool, error) {
-	pem, err := os.ReadFile(path) //nolint:gosec // operator-supplied trust path
+	pem, err := os.ReadFile(path) // #nosec G304 -- path is operator-supplied trust bundle path from validated config
 	if err != nil {
 		return nil, fmt.Errorf("httpclient: read CA: %w", err)
 	}

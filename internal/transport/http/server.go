@@ -93,7 +93,7 @@ func buildTLS(cfg config.TLSServerConfig) (*tls.Config, error) {
 		return nil, fmt.Errorf("unknown client_auth %q", cfg.ClientAuth)
 	}
 	if cfg.ClientCAFile != "" {
-		pem, err := os.ReadFile(cfg.ClientCAFile) //nolint:gosec
+		pem, err := os.ReadFile(cfg.ClientCAFile) // #nosec G304 -- operator-supplied client CA path from validated config
 		if err != nil {
 			return nil, fmt.Errorf("read client CA: %w", err)
 		}
