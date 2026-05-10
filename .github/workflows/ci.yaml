@@ -21,9 +21,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # golangci-lint v2 requires the v7 action; the v6 action explicitly
+      # rejects v2.x with "golangci-lint v2 is not supported by
+      # golangci-lint-action v6".
+      - uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.0.0
+          version: v2.0.2
           args: --timeout=10m
 
   test:
@@ -62,10 +65,23 @@ jobs:
           version: v3.16.2
       - run: helm lint deployments/helm/owui-cee-proxy
       - run: helm template owui-cee-proxy deployments/helm/owui-cee-proxy > /tmp/render.yaml
-      - uses: instrumenta/kubeval-action@v0.0.4
-        continue-on-error: true
-        with:
-          files: /tmp/render.yaml
+      # instrumenta/kubeval-action is gone; kubeval itself is
+      # unmaintained. Use kubeconform (its modern successor). We
+      # tolerate "schema not found" so Gateway API HTTPRoute and
+      # ServiceMonitor CRDs do not gate the lint.
+      - name: Install kubeconform
+        run: |
+          curl -sSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+      - name: kubeconform on rendered chart
+        run: |
+          kubeconform \
+            -strict \
+            -ignore-missing-schemas \
+            -summary \
+            /tmp/render.yaml
 
   manifests-validate:
     runs-on: ubuntu-latest
@@ -76,5 +92,17 @@ jobs:
         run: |
           curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
           sudo mv kustomize /usr/local/bin/
-      - run: kustomize build deployments/kubernetes/overlays/ingress-nginx > /tmp/ing.yaml
-      - run: kustomize build deployments/kubernetes/overlays/gateway-api-envoy > /tmp/gw.yaml
+      - name: Install kubeconform
+        run: |
+          curl -sSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+      - name: Build + validate ingress-nginx overlay
+        run: |
+          kustomize build deployments/kubernetes/overlays/ingress-nginx > /tmp/ing.yaml
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/ing.yaml
+      - name: Build + validate gateway-api-envoy overlay
+        run: |
+          kustomize build deployments/kubernetes/overlays/gateway-api-envoy > /tmp/gw.yaml
+          kubeconform -strict -ignore-missing-schemas -summary /tmp/gw.yaml
