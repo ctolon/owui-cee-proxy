@@ -54,7 +54,9 @@ func main() {
 		err error
 	)
 	if len(os.Args) > 1 {
-		raw, err = os.ReadFile(os.Args[1]) //nolint:gosec // CLI tool: caller controls the path on purpose.
+		// #nosec G304 G703 -- migrate-config is a developer CLI; the
+		// caller deliberately points it at a YAML file on disk.
+		raw, err = os.ReadFile(os.Args[1])
 	} else {
 		raw, err = io.ReadAll(os.Stdin)
 	}
