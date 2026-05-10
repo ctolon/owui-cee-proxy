@@ -25,13 +25,17 @@ type Worker struct {
 }
 
 func NewWorker(cfg config.TasksConfig, orch *Orchestrator, registry engine.Registry, logger zerolog.Logger) (*Worker, error) {
-	opt, err := asynq.ParseRedisURI(cfg.RedisURL)
+	opt, err := asynq.ParseRedisURI(string(cfg.RedisURL))
 	if err != nil {
 		return nil, fmt.Errorf("parse redis url: %w", err)
 	}
+	weights := cfg.QueueWeights
+	if len(weights) == 0 {
+		weights = map[string]int{"default": 6, "low": 3, "critical": 1}
+	}
 	srv := asynq.NewServer(opt, asynq.Config{
 		Concurrency: cfg.QueueConcurrency,
-		Queues:      map[string]int{"default": 6, "low": 3, "critical": 1},
+		Queues:      weights,
 		ErrorHandler: asynq.ErrorHandlerFunc(func(ctx context.Context, t *asynq.Task, err error) {
 			logger.Error().Err(err).Str("task_type", t.Type()).Msg("task_failed")
 		}),

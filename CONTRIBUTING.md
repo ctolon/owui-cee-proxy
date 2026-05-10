@@ -41,3 +41,10 @@ Use GitHub Issues. Include:
 - proxy version (`owui-cee-proxy -version`)
 - relevant log lines (with `request_id`)
 - minimal reproduction (`docker compose up` snippet preferred)
+
+## Licensing of contributions
+
+By submitting a pull request you agree to license your contribution
+under the project's license — Apache License 2.0. See the
+[`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE) files for details.
+No CLA is required.

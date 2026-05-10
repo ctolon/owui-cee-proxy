@@ -12,6 +12,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -23,6 +24,42 @@ import (
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 )
+
+// Secret wraps a string value that must never be printed or marshaled
+// in cleartext. It exists so accidental inclusion in logs / debug
+// dumps / JSON status endpoints redacts to "***" instead of leaking the
+// secret. The underlying type is `string` so that:
+//   - YAML/env deserialisation still works (koanf assigns plain strings),
+//   - existing call sites can convert with `string(s)` when they need
+//     the actual value (e.g. setting an Authorization header).
+type Secret string
+
+// String implements fmt.Stringer. Always returns "***" for non-empty
+// secrets; empty secrets render as "" so callers can still detect
+// "is the secret unset?" by comparing the Stringer output for empty —
+// but the canonical empty check is `s == ""` against the typed value.
+func (s Secret) String() string {
+	if s == "" {
+		return ""
+	}
+	return "***"
+}
+
+// MarshalJSON ensures Secret values never bleed into JSON-formatted
+// logs or status responses. Empty secrets serialise to "" so consumers
+// can distinguish "unset" from "redacted set value".
+func (s Secret) MarshalJSON() ([]byte, error) {
+	if s == "" {
+		return json.Marshal("")
+	}
+	return json.Marshal("***")
+}
+
+// MarshalText mirrors MarshalJSON for text-encoders (zerolog console,
+// fmt %v with stringer, etc).
+func (s Secret) MarshalText() ([]byte, error) {
+	return []byte(s.String()), nil
+}
 
 const (
 	envPrefix     = "OWUI_PROXY_"
@@ -47,6 +84,11 @@ type ServerConfig struct {
 	ReadHeaderTimeout time.Duration `koanf:"read_header_timeout"`
 	WriteTimeout      time.Duration `koanf:"write_timeout"`
 	IdleTimeout       time.Duration `koanf:"idle_timeout"`
+	// RequestTimeout caps the per-request handler deadline applied to the
+	// authenticated subtree by the Timeout middleware. Distinct from the
+	// transport-level Read/Write timeouts because we want streaming
+	// uploads/downloads to be governed by handler context, not the socket.
+	RequestTimeout    time.Duration `koanf:"request_timeout"`
 	MaxHeaderBytes    int           `koanf:"max_header_bytes" validate:"gte=0"`
 	MaxBodyBytes      int64         `koanf:"max_body_bytes" validate:"gte=0"`
 	ShutdownGrace     time.Duration `koanf:"shutdown_grace"`
@@ -60,8 +102,12 @@ type TLSServerConfig struct {
 	CertFile      string `koanf:"cert_file"`
 	KeyFile       string `koanf:"key_file"`
 	MinVersion    string `koanf:"min_version"`
-	ClientAuth    string `koanf:"client_auth" validate:"omitempty,oneof=none request require verify require-and-verify"`
-	ClientCAFile  string `koanf:"client_ca_file"`
+	// ClientAuth selects mTLS behavior. "require" was intentionally
+	// dropped because it accepts ANY client cert without verifying it
+	// against ClientCAs — almost certainly not what operators expect.
+	// Use "require-and-verify" for strict mTLS.
+	ClientAuth   string `koanf:"client_auth" validate:"omitempty,oneof=none request verify require-and-verify"`
+	ClientCAFile string `koanf:"client_ca_file"`
 }
 
 type RoutingConfig struct {
@@ -83,10 +129,13 @@ type EnginesConfig struct {
 }
 
 type EngineConfig struct {
-	Enable          bool              `koanf:"enable"`
-	URL             string            `koanf:"url" validate:"omitempty,url"`
+	Enable bool `koanf:"enable"`
+	// L2: required_if uses validator's cross-field check so an enabled
+	// engine must declare a URL. omitempty + url keeps the validation
+	// permissive when the engine is disabled.
+	URL string `koanf:"url" validate:"required_if=Enable true,omitempty,url"`
 	APIKeyEnv       string            `koanf:"api_key_env"`
-	APIKey          string            `koanf:"-"` // populated from env at startup
+	APIKey          Secret            `koanf:"-"` // populated from env at startup
 	RequestTimeout  time.Duration     `koanf:"request_timeout"`
 	HealthPath      string            `koanf:"health_path"`
 	// MimeTypes lists the MIME types this engine claims. When a request
@@ -137,7 +186,7 @@ type RateLimitConfig struct {
 type SecurityConfig struct {
 	ProxyAPIKeysEnv   string   `koanf:"proxy_api_keys_env"`
 	ProxyAPIKeyHeader string   `koanf:"proxy_api_key_header"`
-	ProxyAPIKeys      []string `koanf:"-"` // resolved from env
+	ProxyAPIKeys      []Secret `koanf:"-"` // resolved from env
 	RequireAPIKey     bool     `koanf:"require_api_key"`
 	TrustedProxies    []string `koanf:"trusted_proxies"`
 	CORS              CORSConfig `koanf:"cors"`
@@ -154,11 +203,21 @@ type CORSConfig struct {
 type TasksConfig struct {
 	Enabled          bool          `koanf:"enabled"`
 	RedisURLEnv      string        `koanf:"redis_url_env"`
-	RedisURL         string        `koanf:"-"` // resolved from env
+	RedisURL         Secret        `koanf:"-"` // resolved from env
 	QueueConcurrency int           `koanf:"queue_concurrency"`
 	Retention        time.Duration `koanf:"retention"`
 	Retry            int           `koanf:"retry"`
 	ResultTTL        time.Duration `koanf:"result_ttl"`
+	// TaskTimeout caps a single task's execution wall time. Distinct
+	// from Retention, which is the lifetime of task state in Redis.
+	TaskTimeout time.Duration `koanf:"task_timeout"`
+	// MaxBlobBytes is the per-blob upper bound enforced at enqueue.
+	MaxBlobBytes int64 `koanf:"max_blob_bytes" validate:"gte=0"`
+	// MaxTotalBytes is the aggregate cap across all blobs in a task.
+	MaxTotalBytes int64 `koanf:"max_total_bytes" validate:"gte=0"`
+	// QueueWeights controls asynq's per-queue weighting; defaults to
+	// {default:6, low:3, critical:1}.
+	QueueWeights map[string]int `koanf:"queue_weights"`
 }
 
 type ObservabilityConfig struct {
@@ -195,8 +254,15 @@ func Default() *Config {
 			Listen:            "0.0.0.0:8080",
 			ReadTimeout:       30 * time.Second,
 			ReadHeaderTimeout: 10 * time.Second,
-			WriteTimeout:      0,
+			// WriteTimeout previously defaulted to 0 (unbounded), letting
+			// slow-loris-style response stalls hold sockets indefinitely.
+			// 5m matches RequestTimeout: a single request that legitimately
+			// takes that long will not be cut off mid-stream.
+			WriteTimeout:      5 * time.Minute,
 			IdleTimeout:       120 * time.Second,
+			// RequestTimeout governs the handler-level deadline applied
+			// by the Timeout middleware on the authenticated subtree.
+			RequestTimeout:    5 * time.Minute,
 			MaxHeaderBytes:    1 << 20,
 			MaxBodyBytes:      500 << 20,
 			ShutdownGrace:     30 * time.Second,
@@ -233,9 +299,16 @@ func Default() *Config {
 			Retention:        24 * time.Hour,
 			Retry:            3,
 			ResultTTL:        time.Hour,
+			TaskTimeout:      5 * time.Minute,
+			MaxBlobBytes:     100 << 20, // 100 MiB
+			MaxTotalBytes:    500 << 20, // 500 MiB
+			QueueWeights:     map[string]int{"default": 6, "low": 3, "critical": 1},
 		},
 		Observability: ObservabilityConfig{
-			Log:     LogConfig{Level: "info", Format: "json", AddCaller: true},
+			// AddCaller defaults to false: caller resolution is moderately
+			// expensive (per-line runtime.Caller) and operators should opt
+			// in only for debug investigations.
+			Log:     LogConfig{Level: "info", Format: "json", AddCaller: false},
 			Metrics: MetricsConfig{Enabled: true, Path: "/metrics"},
 			Tracing: TracingConfig{Enabled: false, SampleRatio: 0.1, ServiceName: "owui-cee-proxy"},
 		},
@@ -278,6 +351,16 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("load yaml %q: %w", path, err)
 		}
 	}
+	// M9: koanf merges env over YAML by overwriting scalar keys, but
+	// SLICE-typed YAML keys (e.g. engines.tika.mime_types,
+	// security.trusted_proxies, security.proxy_api_keys, tasks
+	// queue_weights map) cannot be appended to via env vars — there is
+	// no list-append semantics in the env provider. Operators wanting
+	// to override a slice MUST replace the entire YAML key, e.g. by
+	// shipping a new YAML file or by setting the JSON-encoded value
+	// through whatever runtime they use to launch the proxy. The
+	// scalar-only keys (URL, paths, header names, etc.) compose
+	// normally with OWUI_PROXY_* env vars.
 	if err := k.Load(envprovider.Provider(envPrefix, keySeparator, envTransform), nil); err != nil {
 		return nil, fmt.Errorf("load env: %w", err)
 	}
@@ -305,11 +388,16 @@ func resolveSecrets(c *Config) {
 	resolveEngineSecret(&c.Engines.Kreuzberg)
 	if c.Security.ProxyAPIKeysEnv != "" {
 		if v := os.Getenv(c.Security.ProxyAPIKeysEnv); v != "" {
-			c.Security.ProxyAPIKeys = splitAndTrim(v)
+			parts := splitAndTrim(v)
+			out := make([]Secret, len(parts))
+			for i, p := range parts {
+				out[i] = Secret(p)
+			}
+			c.Security.ProxyAPIKeys = out
 		}
 	}
 	if c.Tasks.RedisURLEnv != "" {
-		c.Tasks.RedisURL = os.Getenv(c.Tasks.RedisURLEnv)
+		c.Tasks.RedisURL = Secret(os.Getenv(c.Tasks.RedisURLEnv))
 	}
 }
 
@@ -317,7 +405,7 @@ func resolveEngineSecret(e *EngineConfig) {
 	if e.APIKeyEnv == "" {
 		return
 	}
-	e.APIKey = os.Getenv(e.APIKeyEnv)
+	e.APIKey = Secret(os.Getenv(e.APIKeyEnv))
 }
 
 func splitAndTrim(s string) []string {
@@ -343,6 +431,19 @@ func Validate(c *Config) error {
 	}
 	if c.Tasks.Enabled && c.Tasks.RedisURL == "" {
 		return fmt.Errorf("tasks.enabled=true but %s env is empty", c.Tasks.RedisURLEnv)
+	}
+	if c.Tasks.Enabled {
+		if c.Tasks.MaxTotalBytes > 0 && c.Tasks.MaxBlobBytes > c.Tasks.MaxTotalBytes {
+			return fmt.Errorf("tasks.max_blob_bytes (%d) must be <= max_total_bytes (%d)", c.Tasks.MaxBlobBytes, c.Tasks.MaxTotalBytes)
+		}
+		if c.Tasks.TaskTimeout < 0 {
+			return fmt.Errorf("tasks.task_timeout must be non-negative")
+		}
+		for q, w := range c.Tasks.QueueWeights {
+			if w < 0 {
+				return fmt.Errorf("tasks.queue_weights[%q] must be non-negative", q)
+			}
+		}
 	}
 	if c.Server.TLS.Enabled && (c.Server.TLS.CertFile == "" || c.Server.TLS.KeyFile == "") {
 		return fmt.Errorf("server.tls.enabled=true requires cert_file and key_file")

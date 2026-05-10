@@ -320,4 +320,4 @@ decision log. See `SECURITY.md` for the threat model.
 
 ## License
 
-MIT — see `LICENSE`.
+Apache License 2.0 — see [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).

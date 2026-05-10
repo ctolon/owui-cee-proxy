@@ -2,7 +2,7 @@ replicaCount: 2
 
 image:
   repository: docker.io/ctolon17/owui-cee-proxy
-  tag: ""           # defaults to .Chart.AppVersion (0.0.1)
+  tag: ""           # defaults to .Chart.AppVersion (0.0.2)
   pullPolicy: IfNotPresent
   pullSecrets: []
 

@@ -30,18 +30,33 @@ type RouterDeps struct {
 
 func NewRouter(d RouterDeps) (http.Handler, error) {
 	r := chi.NewRouter()
+	// L4: passthrough mount failures bubble out as a NewRouter error
+	// rather than panic. Captured in mountErr by the authenticated
+	// subtree closure and returned below.
+	var mountErr error
 
 	// Global middleware (order matters).
-	r.Use(mw.RequestID())
+	//
+	// Layering rationale:
+	//   - Recover first: a panic anywhere downstream — including in
+	//     RequestID's UUID generator on a broken /dev/urandom — must
+	//     not bring down the process. Recover is cheap so cost is
+	//     negligible (M12).
+	//   - RequestID next: every later middleware (logs, metrics,
+	//     traces) wants a stable correlation ID.
+	//   - BodyLimit before AccessLog/Metrics: oversize requests
+	//     should fail fast and NOT pollute access logs / RED counters
+	//     with traffic we never intended to serve (M10).
 	r.Use(mw.Recover(d.Logger))
+	r.Use(mw.RequestID())
 	r.Use(mw.OTel(d.Config.Observability.Tracing.ServiceName))
 	r.Use(mw.GlobalRateLimit(d.Config.RateLimitGlobal.RPS, d.Config.RateLimitGlobal.Burst))
+	r.Use(mw.BodyLimit(d.Config.Server.MaxBodyBytes))
 	r.Use(mw.AccessLog(d.Logger))
 	r.Use(mw.Metrics(d.Metrics))
-	r.Use(mw.BodyLimit(d.Config.Server.MaxBodyBytes))
 
 	// Operational endpoints (always unauthenticated for kubelet probes).
-	health := &handlers.Health{Registry: d.Registry, Redis: d.RedisHealth}
+	health := &handlers.Health{Registry: d.Registry, Redis: d.RedisHealth, Logger: d.Logger}
 	r.Get("/healthz", health.Liveness)
 	r.Get("/readyz", health.Readiness)
 
@@ -55,9 +70,13 @@ func NewRouter(d RouterDeps) (http.Handler, error) {
 
 	// Authenticated subtree (facade + passthrough).
 	r.Group(func(r chi.Router) {
+		// M1: every authenticated handler runs under a request-scoped
+		// deadline. Streaming convert / passthrough handlers honor
+		// r.Context() and abort cleanly on deadline expiry.
+		r.Use(mw.Timeout(d.Config.Server.RequestTimeout))
 		r.Use(mw.APIKey(
 			d.Config.Security.ProxyAPIKeyHeader,
-			d.Config.Security.ProxyAPIKeys,
+			secretsToStrings(d.Config.Security.ProxyAPIKeys),
 			d.Config.Security.RequireAPIKey,
 		))
 
@@ -77,17 +96,20 @@ func NewRouter(d RouterDeps) (http.Handler, error) {
 		r.Get(facade+"/result/{id}", async.Result)
 
 		// Native passthrough mounts.
-		if err := mountPassthrough(r, d, engine.Docling, d.Config.Routing.Passthrough.DoclingPrefix, d.Config.Engines.Docling); err != nil {
-			panic(err)
+		mountErr = mountPassthrough(r, d, engine.Docling, d.Config.Routing.Passthrough.DoclingPrefix, d.Config.Engines.Docling)
+		if mountErr != nil {
+			return
 		}
-		if err := mountPassthrough(r, d, engine.Tika, d.Config.Routing.Passthrough.TikaPrefix, d.Config.Engines.Tika); err != nil {
-			panic(err)
+		mountErr = mountPassthrough(r, d, engine.Tika, d.Config.Routing.Passthrough.TikaPrefix, d.Config.Engines.Tika)
+		if mountErr != nil {
+			return
 		}
-		if err := mountPassthrough(r, d, engine.Kreuzberg, d.Config.Routing.Passthrough.KreuzbergPrefix, d.Config.Engines.Kreuzberg); err != nil {
-			panic(err)
-		}
+		mountErr = mountPassthrough(r, d, engine.Kreuzberg, d.Config.Routing.Passthrough.KreuzbergPrefix, d.Config.Engines.Kreuzberg)
 	})
 
+	if mountErr != nil {
+		return nil, mountErr
+	}
 	return r, nil
 }
 
@@ -96,13 +118,27 @@ func mountPassthrough(r chi.Router, d RouterDeps, name engine.Name, prefix strin
 		return nil
 	}
 	apiKeyHeader := apiKeyHeaderFor(name)
-	rp, err := reverseproxy.New(ec.URL, prefix, apiKeyHeader, ec.APIKey, nil)
+	rp, err := reverseproxy.New(ec.URL, prefix, apiKeyHeader, string(ec.APIKey), nil, d.Config.Security.TrustedProxies)
 	if err != nil {
 		return err
 	}
 	pt := &handlers.Passthrough{Engine: name, Proxy: rp, URL: ec.URL}
-	r.Handle(path.Clean(prefix)+"/*", pt)
+	// M3 defence-in-depth: wrap with RejectTraversal so a request whose
+	// raw path contains "../" is 400'd before reaching the proxy.
+	r.Handle(path.Clean(prefix)+"/*", reverseproxy.RejectTraversal(pt))
 	return nil
+}
+
+// secretsToStrings widens a []config.Secret into a []string for callers
+// that want the raw values (e.g. constant-time compares against an
+// inbound header). Casts are explicit so it's obvious the redaction
+// guarantee of Secret is intentionally bypassed at the call site.
+func secretsToStrings(in []config.Secret) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = string(s)
+	}
+	return out
 }
 
 func apiKeyHeaderFor(name engine.Name) string {

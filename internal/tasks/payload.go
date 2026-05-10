@@ -46,15 +46,25 @@ type BlobRef struct {
 
 // PayloadFromRequest parses the inbound HTTP request into a Payload
 // without persisting blob bodies; the orchestrator persists them when
-// Enqueue is called. cleanup MUST be invoked by the caller.
-func PayloadFromRequest(r *http.Request, source bool) (*Payload, func(), error) {
+// Enqueue is called. cleanup MUST be invoked by the caller. maxBlob
+// caps any single file part (0 disables); validateBlobLimits in the
+// orchestrator additionally enforces an aggregate cap.
+func PayloadFromRequest(r *http.Request, source bool, maxBlob int64) (*Payload, func(), error) {
 	if source {
 		return payloadFromJSON(r)
 	}
-	return payloadFromMultipart(r)
+	return payloadFromMultipart(r, maxBlob)
 }
 
-func payloadFromMultipart(r *http.Request) (*Payload, func(), error) {
+// asyncSpoolThreshold mirrors the sync-path threshold (8 MiB) and is
+// the in-memory cap before a multipart part is spilled to a temp file.
+// Beyond the threshold the orchestrator will still need the bytes
+// in-memory at Enqueue time (Redis SET takes []byte), so the savings
+// here are bounded by the request's residency window — but we still
+// avoid holding multiple 500 MiB slabs concurrently while parsing.
+const asyncSpoolThreshold = 8 << 20
+
+func payloadFromMultipart(r *http.Request, maxBlob int64) (*Payload, func(), error) {
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
 		return nil, noop, fmt.Errorf("parse content-type: %w", err)
@@ -75,16 +85,34 @@ func payloadFromMultipart(r *http.Request) (*Payload, func(), error) {
 			return nil, noop, fmt.Errorf("read part: %w", err)
 		}
 		if part.FileName() != "" {
-			buf := &bytes.Buffer{}
-			if _, err := io.Copy(buf, part); err != nil {
-				_ = part.Close()
+			// Spool to memory (small) or temp file (large). H1 + H2:
+			// the per-blob cap is enforced BEFORE the bytes are written
+			// past the threshold — fail fast.
+			sr, err := spoolPart(part, asyncSpoolThreshold, maxBlob)
+			fname := part.FileName()
+			ctype := part.Header.Get("Content-Type")
+			_ = part.Close()
+			if err != nil {
+				if errors.Is(err, errSpoolTooLarge) {
+					return nil, noop, fmt.Errorf("blob %q exceeds max_blob_bytes %d", fname, maxBlob)
+				}
 				return nil, noop, fmt.Errorf("copy part: %w", err)
 			}
-			_ = part.Close()
+			// Drain the spool into a *bytes.Buffer; the orchestrator's
+			// Redis SET requires a contiguous []byte. Spilling first to
+			// disk still buys us peace from holding multiple 500-MiB
+			// slabs in heap simultaneously while parsing concurrent
+			// parts (and the disk file is unlinked on Close).
+			buf := &bytes.Buffer{}
+			if _, err := io.Copy(buf, sr); err != nil {
+				_ = sr.Close()
+				return nil, noop, fmt.Errorf("drain spool: %w", err)
+			}
+			_ = sr.Close()
 			bufs = append(bufs, buf)
 			p.BlobKeys = append(p.BlobKeys, BlobRef{
-				Filename:    part.FileName(),
-				ContentType: part.Header.Get("Content-Type"),
+				Filename:    fname,
+				ContentType: ctype,
 				Size:        int64(buf.Len()),
 			})
 			continue

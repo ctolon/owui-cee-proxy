@@ -9,8 +9,16 @@ server:
   listen: "0.0.0.0:8080"
   read_timeout: 30s
   read_header_timeout: 10s
-  write_timeout: 0
+  # write_timeout caps the duration of writing the full response.
+  # Defaulted to 5m so a stalled client cannot pin a connection
+  # indefinitely (M2). Streaming convert responses up to ~5m are safe.
+  write_timeout: 5m
   idle_timeout: 120s
+  # request_timeout is the per-handler deadline applied by the
+  # Timeout middleware on the authenticated subtree (M1). Streaming
+  # convert / passthrough handlers honor r.Context() and abort cleanly
+  # when this fires.
+  request_timeout: 5m
   max_header_bytes: 1048576
   max_body_bytes: 524288000   # 500 MiB
   shutdown_grace: 30s
@@ -21,7 +29,16 @@ server:
     cert_file: ""
     key_file: ""
     min_version: "1.3"
-    client_auth: "none"        # none|request|require|verify|require-and-verify
+    # client_auth values:
+    #   none                  – no mTLS (default)
+    #   request               – ask for a cert, accept missing
+    #   verify                – verify-if-given against client_ca_file
+    #   require-and-verify    – strict mTLS
+    # NOTE: "require" was removed (H8) because Go's RequireAnyClientCert
+    # accepts ANY client certificate without validating it against
+    # ClientCAs, which is almost certainly a misconfiguration. Use
+    # "require-and-verify" for strict mTLS.
+    client_auth: "none"        # none|request|verify|require-and-verify
     client_ca_file: ""
 
 routing:
@@ -158,13 +175,30 @@ tasks:
   retention: 24h
   retry: 3
   result_ttl: 1h
+  # task_timeout caps a single task's execution wall time. The asynq
+  # task is killed if Convert() exceeds this. Retention covers state
+  # lifetime independently.
+  task_timeout: 5m
+  # max_blob_bytes rejects any individual file blob that exceeds this
+  # size at enqueue time (prevents Redis memory blowups).
+  max_blob_bytes: 104857600   # 100 MiB
+  # max_total_bytes caps the aggregate of all blobs in one task.
+  max_total_bytes: 524288000  # 500 MiB
+  # queue_weights controls asynq's per-queue priority weighting.
+  queue_weights:
+    default: 6
+    low: 3
+    critical: 1
 
 observability:
   log:
     level: "info"
     format: "json"
     sampling: false
-    add_caller: true
+    # add_caller defaults to false (M11). Enabling caller resolution
+    # adds a runtime.Caller per log line; useful for debug, but cost
+    # accumulates on hot request paths. Flip on demand.
+    add_caller: false
   metrics:
     enabled: true
     path: "/metrics"

@@ -93,7 +93,7 @@ func (a *Adapter) Convert(ctx context.Context, req *engine.ConvertRequest) (*eng
 	hreq.Header.Set("Content-Type", mw.FormDataContentType())
 	hreq.Header.Set("Accept", "application/json")
 	if a.cfg.APIKey != "" {
-		hreq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
+		hreq.Header.Set("Authorization", "Bearer "+string(a.cfg.APIKey))
 	}
 	if req.RequestID != "" {
 		hreq.Header.Set("X-Request-ID", req.RequestID)
@@ -150,9 +150,13 @@ func (a *Adapter) do(r *http.Request) (*http.Response, error) {
 }
 
 func createFilePart(mw *multipart.Writer, field, filename, contentType string) (io.Writer, error) {
+	safe := safeMultipartFilename(filename)
+	if safe == "" {
+		safe = "upload"
+	}
 	h := make(map[string][]string)
 	h["Content-Disposition"] = []string{
-		fmt.Sprintf(`form-data; name=%q; filename=%q`, field, escapeQuotes(filename)),
+		fmt.Sprintf(`form-data; name=%q; filename=%q`, field, safe),
 	}
 	if contentType != "" {
 		h["Content-Type"] = []string{contentType}
@@ -160,8 +164,19 @@ func createFilePart(mw *multipart.Writer, field, filename, contentType string) (
 	return mw.CreatePart(h)
 }
 
-func escapeQuotes(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
+// safeMultipartFilename sanitises a user-supplied filename for use in
+// a multipart Content-Disposition header. CR/LF (or any byte outside
+// printable ASCII) would let an attacker inject fake multipart headers
+// (H5). We reject the input outright rather than try to escape it; a
+// "" return signals the caller to substitute "upload".
+func safeMultipartFilename(name string) string {
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b < 0x20 || b > 0x7E {
+			return ""
+		}
+	}
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(name)
 }
 
 // jsonError synthesises a Docling-shaped error envelope for cases the

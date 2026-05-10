@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/rs/zerolog"
 
@@ -186,6 +185,3 @@ func (a *Application) shutdown() error {
 // contextDone is a sentinel matching http.ErrServerClosed semantics.
 // Captured at runtime via errors.Is.
 var contextDone = errors.New("context done")
-
-// silence unused import in some environments
-var _ = time.Second

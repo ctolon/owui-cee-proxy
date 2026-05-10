@@ -99,11 +99,25 @@ var ErrEngineDisabled = errors.New("engine: engine is disabled")
 
 // staticRegistry is an immutable Registry. Use NewRegistry to construct.
 type staticRegistry struct {
-	engines  map[Name]Engine
-	def      Engine
-	defName  Name
-	order    []Name // registration order, used for deterministic Pick
-	mimeMap  map[Name][]mimePattern
+	engines map[Name]Engine
+	def     Engine
+	defName Name
+	// order lists every engine alphabetically; used by Names() so the
+	// public registration order is stable (default last).
+	order []Name
+	// pickOrder pre-computes the non-default engines in the order Pick()
+	// must scan them — alphabetical, default omitted. Iterating this
+	// slice lets Pick() skip the per-iteration "is this the default?"
+	// branch, which N4 in docs/REVIEW.md flagged as dead work on the
+	// hot path.
+	pickOrder []namedPattern
+}
+
+// namedPattern bundles an engine with its compiled MIME rules so Pick
+// avoids a second map lookup per candidate.
+type namedPattern struct {
+	engine   Engine
+	patterns []mimePattern
 }
 
 // NewRegistry returns a Registry whose contents are fixed at construction
@@ -119,7 +133,7 @@ func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name) (Registry, 
 
 	engines := make(map[Name]Engine, len(entries))
 	mimeMap := make(map[Name][]mimePattern, len(entries))
-	order := make([]Name, 0, len(entries))
+	nonDefault := make([]Name, 0, len(entries))
 
 	// Deterministic registration order: alphabetical, with default last
 	// so non-default engines are checked first by Pick.
@@ -129,16 +143,25 @@ func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name) (Registry, 
 		if n == defaultEngine {
 			continue
 		}
-		order = append(order, n)
+		nonDefault = append(nonDefault, n)
 	}
-	order = append(stringSort(order), defaultEngine)
+	stringSort(nonDefault)
+	order := append(append([]Name{}, nonDefault...), defaultEngine)
+
+	pickOrder := make([]namedPattern, 0, len(nonDefault))
+	for _, n := range nonDefault {
+		pickOrder = append(pickOrder, namedPattern{
+			engine:   engines[n],
+			patterns: mimeMap[n],
+		})
+	}
 
 	return &staticRegistry{
-		engines: engines,
-		def:     defEntry.Engine,
-		defName: defaultEngine,
-		order:   order,
-		mimeMap: mimeMap,
+		engines:   engines,
+		def:       defEntry.Engine,
+		defName:   defaultEngine,
+		order:     order,
+		pickOrder: pickOrder,
 	}, nil
 }
 
@@ -157,13 +180,11 @@ func (s *staticRegistry) Pick(mime string) Engine {
 	if mime == "" {
 		return s.def
 	}
-	for _, n := range s.order {
-		if n == s.defName {
-			continue
-		}
-		for _, p := range s.mimeMap[n] {
-			if p.matches(mime) {
-				return s.engines[n]
+	for i := range s.pickOrder {
+		np := &s.pickOrder[i]
+		for j := range np.patterns {
+			if np.patterns[j].matches(mime) {
+				return np.engine
 			}
 		}
 	}

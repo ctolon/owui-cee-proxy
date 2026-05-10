@@ -1,8 +1,10 @@
 package tika
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
@@ -28,6 +30,57 @@ type doclingEnvelope struct {
 	Status         string            `json:"status"`
 	ProcessingTime float64           `json:"processing_time"`
 	Errors         []string          `json:"errors"`
+}
+
+// decodeTikaResponse streams the upstream Tika body into the
+// doclingDocument shape without materialising the whole response into a
+// []byte first (L6). Tika /tika/text emits either a JSON array, a
+// single JSON object, or plain text. We peek the first non-whitespace
+// byte to dispatch, then either feed json.Decoder or fall back to
+// io.Copy for the plain-text case.
+func decodeTikaResponse(r io.Reader, filename string) (doclingDocument, error) {
+	br := bufio.NewReader(r)
+	// Skip any leading whitespace before the first significant byte.
+	for {
+		b, err := br.ReadByte()
+		if errors.Is(err, io.EOF) {
+			return doclingDocument{Filename: filename, MdContent: ""}, nil
+		}
+		if err != nil {
+			return doclingDocument{}, err
+		}
+		if b == ' ' || b == '\t' || b == '\r' || b == '\n' {
+			continue
+		}
+		if err := br.UnreadByte(); err != nil {
+			return doclingDocument{}, err
+		}
+		switch b {
+		case '[':
+			var items []tikaItem
+			if err := json.NewDecoder(br).Decode(&items); err != nil {
+				return doclingDocument{}, err
+			}
+			return mergeTikaItems(items, filename), nil
+		case '{':
+			var item tikaItem
+			if err := json.NewDecoder(br).Decode(&item); err != nil {
+				return doclingDocument{}, err
+			}
+			return mergeTikaItems([]tikaItem{item}, filename), nil
+		default:
+			// Plain-text fallback: drain the rest into a string. This
+			// path is taken only for non-JSON Tika responses, so the
+			// streaming win does not apply but the existing behaviour
+			// is preserved.
+			rest, err := io.ReadAll(br)
+			if err != nil {
+				return doclingDocument{}, err
+			}
+			s := string(rest)
+			return doclingDocument{Filename: filename, MdContent: s, TextContent: s}, nil
+		}
+	}
 }
 
 func parseTikaResponse(body []byte, filename string) (doclingDocument, error) {

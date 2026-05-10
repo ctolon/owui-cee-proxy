@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/ctolon/owui-cee-proxy/internal/breaker"
@@ -121,10 +122,7 @@ func (a *Adapter) convertFile(ctx context.Context, req *engine.ConvertRequest) (
 	}
 	hreq.Header.Set("Content-Type", mw.FormDataContentType())
 	a.applyAuth(hreq.Header)
-	a.applyForwardHeaders(hreq.Header, req.Headers)
-	if req.RequestID != "" {
-		hreq.Header.Set("X-Request-ID", req.RequestID)
-	}
+	a.applyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 
 	return a.do(hreq)
 }
@@ -144,10 +142,7 @@ func (a *Adapter) convertSource(ctx context.Context, req *engine.ConvertRequest)
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	a.applyAuth(hreq.Header)
-	a.applyForwardHeaders(hreq.Header, req.Headers)
-	if req.RequestID != "" {
-		hreq.Header.Set("X-Request-ID", req.RequestID)
-	}
+	a.applyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 	return a.do(hreq)
 }
 
@@ -201,7 +196,7 @@ func maybeNormalize(resp *http.Response) (io.ReadCloser, http.Header, error) {
 	}
 	patched := normalizeNullContent(raw)
 	if len(patched) != len(raw) {
-		headers.Set("Content-Length", strconvItoa(len(patched)))
+		headers.Set("Content-Length", strconv.Itoa(len(patched)))
 	}
 	return io.NopCloser(bytes.NewReader(patched)), headers, nil
 }
@@ -227,32 +222,9 @@ func normalizeNullContent(raw []byte) []byte {
 	return out
 }
 
-// avoid pulling strconv into the call site; tiny inlined itoa.
-func strconvItoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
-}
-
 func (a *Adapter) applyAuth(h http.Header) {
 	if a.cfg.APIKey != "" {
-		h.Set("X-Api-Key", a.cfg.APIKey)
+		h.Set("X-Api-Key", string(a.cfg.APIKey))
 	}
 }
 
@@ -260,18 +232,40 @@ func (a *Adapter) applyAuth(h http.Header) {
 // headers onto the outbound request. Hop-by-hop headers and auth
 // headers are intentionally NOT forwarded — backend auth is the
 // adapter's responsibility.
-func (a *Adapter) applyForwardHeaders(dst, src http.Header) {
-	allowlist := []string{"Accept", "Accept-Encoding", "User-Agent", "X-Request-ID"}
-	for _, k := range allowlist {
+//
+// H9: X-Request-ID is intentionally NOT in the allowlist. The caller
+// must not be able to override the server-generated ULID; instead we
+// always set it from the requestID argument (which the handler sourced
+// from the RequestID middleware). If requestID is empty we still drop
+// any inbound X-Request-ID rather than forwarding it.
+func (a *Adapter) applyForwardHeaders(dst, src http.Header, requestID string) {
+	for k := range fwdHeaderAllowlist {
 		if v := src.Get(k); v != "" {
 			dst.Set(k, v)
 		}
 	}
+	dst.Del("X-Request-ID")
+	if requestID != "" {
+		dst.Set("X-Request-ID", requestID)
+	}
+}
+
+// fwdHeaderAllowlist enumerates the request headers we forward upstream.
+// Map for O(1) membership tests; the canonicalised header names match
+// http.Header.Get's MIME canonicalisation.
+var fwdHeaderAllowlist = map[string]struct{}{
+	"Accept":          {},
+	"Accept-Encoding": {},
+	"User-Agent":      {},
 }
 
 func createFilePart(mw *multipart.Writer, field, filename, contentType string) (io.Writer, error) {
+	safe := safeMultipartFilename(filename)
+	if safe == "" {
+		safe = "upload"
+	}
 	h := make(map[string][]string)
-	disp := fmt.Sprintf(`form-data; name=%q; filename=%q`, field, escapeQuotes(filename))
+	disp := fmt.Sprintf(`form-data; name=%q; filename=%q`, field, safe)
 	h["Content-Disposition"] = []string{disp}
 	if contentType != "" {
 		h["Content-Type"] = []string{contentType}
@@ -279,8 +273,19 @@ func createFilePart(mw *multipart.Writer, field, filename, contentType string) (
 	return mw.CreatePart(h)
 }
 
-func escapeQuotes(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
+// safeMultipartFilename sanitises a user-supplied filename for use in
+// a multipart Content-Disposition header. CR/LF (or any byte outside
+// printable ASCII) would let an attacker inject fake multipart headers
+// (H5). We reject the input outright rather than try to escape it; a
+// "" return signals the caller to substitute "upload".
+func safeMultipartFilename(name string) string {
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b < 0x20 || b > 0x7E {
+			return ""
+		}
+	}
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(name)
 }
 
 func joinURL(base, p string) (string, error) {

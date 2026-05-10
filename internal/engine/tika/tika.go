@@ -107,7 +107,7 @@ func (a *Adapter) convertOne(ctx context.Context, f engine.FileBlob) (doclingDoc
 	}
 	r.Header.Set("Accept", "application/json")
 	if a.cfg.APIKey != "" {
-		r.Header.Set("X-Api-Key", a.cfg.APIKey)
+		r.Header.Set("X-Api-Key", string(a.cfg.APIKey))
 	}
 	if v := a.cfg.ForwardOptions["x_tika_pdf_extract_inline_images"]; v == "true" {
 		r.Header.Set("X-Tika-PDFextractInlineImages", "true")
@@ -122,12 +122,7 @@ func (a *Adapter) convertOne(ctx context.Context, f engine.FileBlob) (doclingDoc
 		return doclingDocument{}, resp.StatusCode, nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return doclingDocument{}, 0, err
-	}
-
-	doc, err := parseTikaResponse(body, f.Filename)
+	doc, err := decodeTikaResponse(resp.Body, f.Filename)
 	if err != nil {
 		return doclingDocument{}, 0, err
 	}

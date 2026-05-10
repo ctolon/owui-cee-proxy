@@ -1,7 +1,10 @@
 package middleware
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -115,34 +118,67 @@ func AccessLog(logger zerolog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
+// responseWriter wraps the underlying http.ResponseWriter so the
+// middleware stack can observe status code and response byte count.
+//
+// Concurrency: in normal handlers Write/WriteHeader are called
+// sequentially from one goroutine, but a misbehaving handler (or one
+// using net/http's panic-recover semantics) may invoke WriteHeader
+// twice. We use sync.Once to guarantee the underlying writer's
+// WriteHeader is called exactly once even under that race; subsequent
+// calls are silently dropped (matching http.ResponseWriter contract).
 type responseWriter struct {
 	http.ResponseWriter
-	status int
-	bytes  int64
-	wrote  bool
+	status    int
+	bytes     int64
+	writeOnce sync.Once
 }
 
 func (r *responseWriter) WriteHeader(status int) {
-	if r.wrote {
-		return
-	}
-	r.status = status
-	r.wrote = true
-	r.ResponseWriter.WriteHeader(status)
+	r.writeOnce.Do(func() {
+		r.status = status
+		r.ResponseWriter.WriteHeader(status)
+	})
 }
 
 func (r *responseWriter) Write(b []byte) (int, error) {
-	if !r.wrote {
-		r.wrote = true
-	}
+	// http.ResponseWriter contract: implicit 200 if Write is called
+	// before WriteHeader. Mark the header as committed so a later
+	// (incorrect) WriteHeader call doesn't try to overwrite it.
+	r.writeOnce.Do(func() {
+		// Status stays at the default (200) set in the constructor.
+	})
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += int64(n)
 	return n, err
 }
 
-// Hijacker / Flusher passthroughs for streaming + websocket.
+// Flush passthrough for streaming responses.
 func (r *responseWriter) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack passthrough for websockets and other connection-takeover
+// patterns. If the wrapped writer doesn't implement http.Hijacker we
+// return a clear error rather than letting the type assertion panic
+// inside the caller — net/http's default ResponseWriter implementation
+// implements Hijacker, but TimeoutHandler / mock writers may not.
+func (r *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("middleware: underlying ResponseWriter does not support Hijacker")
+	}
+	return hj.Hijack()
+}
+
+// Push passthrough so HTTP/2 server-push handlers can reach the
+// underlying writer. Returns http.ErrNotSupported when unsupported,
+// matching the http.Pusher contract.
+func (r *responseWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := r.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
 }

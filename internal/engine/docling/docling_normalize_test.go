@@ -54,10 +54,3 @@ func TestNormalizeNullContent(t *testing.T) {
 	}
 }
 
-func TestStrconvItoa(t *testing.T) {
-	t.Parallel()
-	require.Equal(t, "0", strconvItoa(0))
-	require.Equal(t, "1", strconvItoa(1))
-	require.Equal(t, "12345", strconvItoa(12345))
-	require.Equal(t, "-7", strconvItoa(-7))
-}

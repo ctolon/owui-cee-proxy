@@ -76,12 +76,16 @@ func buildTLS(cfg config.TLSServerConfig) (*tls.Config, error) {
 		tc.ClientAuth = tls.NoClientCert
 	case "request":
 		tc.ClientAuth = tls.RequestClientCert
-	case "require":
-		tc.ClientAuth = tls.RequireAnyClientCert
 	case "verify":
 		tc.ClientAuth = tls.VerifyClientCertIfGiven
 	case "require-and-verify":
 		tc.ClientAuth = tls.RequireAndVerifyClientCert
+	case "require":
+		// H8: tls.RequireAnyClientCert accepts ANY client certificate
+		// without validating it against ClientCAs — that is almost
+		// always a misconfiguration. Force operators onto
+		// "require-and-verify" or one of the verify variants.
+		return nil, fmt.Errorf("server.tls.client_auth=%q is not supported (it accepts any cert without verification); use \"require-and-verify\"", cfg.ClientAuth)
 	default:
 		return nil, fmt.Errorf("unknown client_auth %q", cfg.ClientAuth)
 	}

@@ -31,6 +31,19 @@ func New(cfg config.EngineConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// M7: ResponseHeaderTimeout previously hard-defaulted to 30s,
+	// which trips on legitimate large-PDF jobs that take longer than
+	// that to emit response headers (e.g. Docling running OCR before
+	// it returns the JSON envelope). Default to RequestTimeout so the
+	// transport-level header timeout aligns with the per-engine
+	// budget; operators who actually want a tighter header timeout
+	// can still set http.response_header_timeout explicitly.
+	requestTimeout := orDuration(cfg.RequestTimeout, 120*time.Second)
+	responseHeaderTimeout := cfg.HTTP.ResponseHeaderTimeout
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = requestTimeout
+	}
+
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -43,7 +56,7 @@ func New(cfg config.EngineConfig) (*Client, error) {
 		MaxConnsPerHost:       cfg.HTTP.MaxConnsPerHost,
 		IdleConnTimeout:       orDuration(cfg.HTTP.IdleConnTimeout, 90*time.Second),
 		TLSHandshakeTimeout:   orDuration(cfg.HTTP.TLSHandshakeTimeout, 10*time.Second),
-		ResponseHeaderTimeout: orDuration(cfg.HTTP.ResponseHeaderTimeout, 30*time.Second),
+		ResponseHeaderTimeout: responseHeaderTimeout,
 		ExpectContinueTimeout: orDuration(cfg.HTTP.ExpectContinueTimeout, time.Second),
 		DisableCompression:    cfg.HTTP.DisableCompression,
 		TLSClientConfig:       tlsConf,
@@ -53,7 +66,7 @@ func New(cfg config.EngineConfig) (*Client, error) {
 			Transport: transport,
 			Timeout:   0, // we use per-request context deadlines instead
 		},
-		RequestTimeout: orDuration(cfg.RequestTimeout, 120*time.Second),
+		RequestTimeout: requestTimeout,
 		BaseURL:        cfg.URL,
 	}, nil
 }

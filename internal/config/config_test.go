@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,30 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestSecret_RedactsInJSON(t *testing.T) {
+	t.Parallel()
+	// L10: a Secret value MUST never appear in JSON output. Empty
+	// secrets serialise to "" so consumers can still tell unset
+	// from set; non-empty secrets serialise to "***".
+	type wrapper struct {
+		Token Secret `json:"token"`
+	}
+
+	out, err := json.Marshal(wrapper{Token: "real-secret-value"})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"token":"***"}`, string(out))
+
+	out, err = json.Marshal(wrapper{Token: ""})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"token":""}`, string(out))
+}
+
+func TestSecret_StringerRedacts(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "***", Secret("hunter2").String())
+	require.Equal(t, "", Secret("").String())
+}
 
 func TestDefaults(t *testing.T) {
 	t.Parallel()
@@ -32,8 +57,8 @@ func TestLoad_ValidYAML(t *testing.T) {
 	require.Equal(t, "tika", c.Routing.DefaultCEEEngine)
 	require.True(t, c.Engines.Tika.Enable)
 	require.Equal(t, "http://tika.local:9998", c.Engines.Tika.URL)
-	require.Equal(t, "docling-secret", c.Engines.Docling.APIKey, "API key resolved from env")
-	require.ElementsMatch(t, []string{"k1", "k2", "k3"}, c.Security.ProxyAPIKeys)
+	require.Equal(t, Secret("docling-secret"), c.Engines.Docling.APIKey, "API key resolved from env")
+	require.ElementsMatch(t, []Secret{"k1", "k2", "k3"}, c.Security.ProxyAPIKeys)
 }
 
 func TestLoad_EnvOverridesYAML(t *testing.T) {

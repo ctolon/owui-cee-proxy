@@ -5,8 +5,6 @@
 package handlers
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,16 +14,31 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/rs/zerolog"
+
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
+
+// maxFilePartBytes caps a single multipart file part. 0 disables.
+// Distinct from the global BodyLimit: that bounds the entire request,
+// this bounds any single part, which protects the spool tempfile from
+// a single malicious upload.
+const maxFilePartBytes = 0
 
 // Convert handles the Docling-compatible facade endpoints
 // (/v1/convert/file and /v1/convert/source) by parsing the request,
 // dispatching to the configured default engine, and streaming the
 // adapter's response back to the caller.
+//
+// ResolveURL implements the SSRF policy for /v1/convert/source. It is
+// a struct field rather than a package-level var so tests (and future
+// per-instance overrides) don't have to mutate global state. Nil
+// falls back to the default policy (defaultResolveExternalURL).
 type Convert struct {
-	Registry engine.Registry
+	Registry   engine.Registry
+	Logger     zerolog.Logger
+	ResolveURL func(raw string) (*ResolvedURL, error)
 }
 
 func (c *Convert) File(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +50,7 @@ func (c *Convert) Source(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
-	req, cleanup, err := buildRequest(r, source)
+	req, cleanup, err := c.buildRequest(r, source)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"status": "failure",
@@ -50,9 +63,19 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	// MIME-based engine routing: the first file's Content-Type drives the
 	// pick. Source-mode requests fall back to the default engine because
 	// no MIME hint is available without dereferencing the URL.
+	//
+	// M13: this fallback is INTENTIONAL — source mode skips MIME-based
+	// dispatch and always uses the default engine. Operators rely on the
+	// log line below to debug "why didn't my Tika rule fire?".
 	eng := c.Registry.Default()
 	if !source && len(req.Files) > 0 {
 		eng = c.Registry.Pick(req.Files[0].ContentType)
+	} else if source {
+		c.Logger.Info().
+			Str("event", "source_mode_default_engine").
+			Str("request_id", mw.IDFrom(r.Context())).
+			Str("engine", string(eng.Name())).
+			Msg("source mode invoked; routing to default engine (MIME-based dispatch unavailable)")
 	}
 	ctx := mw.WithEngine(r.Context(), string(eng.Name()), "")
 
@@ -64,9 +87,22 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 
 	resp, err := eng.Convert(ctx, req)
 	if err != nil {
+		// M5: never echo the engine's verbose error string back to the
+		// caller — it can leak the backend URL, internal hostnames, or
+		// the fact that a circuit breaker is open. Log the full error
+		// at error level (with request_id for correlation) and return
+		// a stable redacted message keyed by request_id.
+		c.Logger.Error().
+			Err(err).
+			Str("event", "engine_convert_failed").
+			Str("request_id", req.RequestID).
+			Str("engine", string(eng.Name())).
+			Msg("engine convert failed")
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"status": "failure",
-			"errors": []map[string]string{{"message": fmt.Sprintf("engine %s: %v", eng.Name(), err)}},
+			"errors": []map[string]string{{
+				"message": fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID),
+			}},
 		})
 		return
 	}
@@ -81,9 +117,9 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func buildRequest(r *http.Request, source bool) (*engine.ConvertRequest, func(), error) {
+func (c *Convert) buildRequest(r *http.Request, source bool) (*engine.ConvertRequest, func(), error) {
 	if source {
-		return buildSourceRequest(r)
+		return c.buildSourceRequest(r)
 	}
 	return buildFileRequest(r)
 }
@@ -102,8 +138,14 @@ func buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 		Headers: r.Header.Clone(),
 		Options: map[string]string{},
 	}
-	// Parts are buffered into memory below, so no Closers to track.
-	cleanup := func() {}
+	// closers tracks every spool reader / temp file that the cleanup
+	// callback must release after the engine response is written.
+	var closers []io.Closer
+	cleanup := func() {
+		for _, c := range closers {
+			_ = c.Close()
+		}
+	}
 
 	for {
 		part, err := mr.NextPart()
@@ -114,25 +156,34 @@ func buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 			cleanup()
 			return nil, noop, fmt.Errorf("read part: %w", err)
 		}
-		// IMPORTANT: multipart.Reader drains a part when NextPart() is
-		// invoked again, so we must read each part's body BEFORE moving
-		// on. Otherwise the engine adapter receives empty file bodies.
-		// The body cap is enforced by the BodyLimit middleware before
-		// we even reach this function, so io.ReadAll is bounded.
+		if part.FileName() != "" {
+			// File part: spool to memory (small) or disk (large). The
+			// global BodyLimit middleware already bounds the request
+			// stream, so this only adds the per-part overflow guard.
+			sr, err := spoolPart(part, spoolThresholdDefault, maxFilePartBytes)
+			_ = part.Close()
+			if err != nil {
+				cleanup()
+				if errors.Is(err, ErrSpoolTooLarge) {
+					return nil, noop, fmt.Errorf("file %q too large", part.FileName())
+				}
+				return nil, noop, fmt.Errorf("read part %q: %w", part.FormName(), err)
+			}
+			closers = append(closers, sr)
+			req.Files = append(req.Files, engine.FileBlob{
+				Filename:    part.FileName(),
+				ContentType: part.Header.Get("Content-Type"),
+				Size:        sr.Size(),
+				Body:        sr,
+			})
+			continue
+		}
+		// Form-field part: assume small, read into memory.
 		buf, err := io.ReadAll(part)
 		_ = part.Close()
 		if err != nil {
 			cleanup()
 			return nil, noop, fmt.Errorf("read part %q: %w", part.FormName(), err)
-		}
-		if part.FileName() != "" {
-			req.Files = append(req.Files, engine.FileBlob{
-				Filename:    part.FileName(),
-				ContentType: part.Header.Get("Content-Type"),
-				Size:        int64(len(buf)),
-				Body:        bytes.NewReader(buf),
-			})
-			continue
 		}
 		req.Options[part.FormName()] = string(buf)
 	}
@@ -145,7 +196,7 @@ type sourceBody struct {
 	Options     map[string]string   `json:"options"`
 }
 
-func buildSourceRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
+func (c *Convert) buildSourceRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 	var body sourceBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		return nil, noop, fmt.Errorf("decode json: %w", err)
@@ -153,7 +204,7 @@ func buildSourceRequest(r *http.Request) (*engine.ConvertRequest, func(), error)
 	if len(body.HTTPSources) == 0 {
 		return nil, noop, errors.New("http_sources required")
 	}
-	if err := validateSources(body.HTTPSources); err != nil {
+	if err := c.validateSources(body.HTTPSources); err != nil {
 		return nil, noop, err
 	}
 	return &engine.ConvertRequest{
@@ -165,20 +216,29 @@ func buildSourceRequest(r *http.Request) (*engine.ConvertRequest, func(), error)
 
 func noop() {}
 
+// resolveURL returns the configured resolver, defaulting to the
+// package's standard policy when c.ResolveURL is nil. L3.
+func (c *Convert) resolveURL() func(string) (*ResolvedURL, error) {
+	if c.ResolveURL != nil {
+		return c.ResolveURL
+	}
+	return defaultResolveExternalURL
+}
+
 // validateSources blocks SSRF-prone targets unless the operator has
 // explicitly whitelisted them. The default allowlist is "external
 // only", i.e. not RFC1918, not loopback, not link-local, not the
-// cloud metadata IP.
-func validateSources(srcs []engine.HTTPSource) error {
+// cloud metadata IP. The resolved IP is recorded on the source URL
+// (as part of validation) but the actual outbound dial happens later
+// inside the engine adapter; B1's fix ships in a follow-up wave that
+// threads the *http.Transport through this layer.
+func (c *Convert) validateSources(srcs []engine.HTTPSource) error {
+	resolve := c.resolveURL()
 	for _, s := range srcs {
-		if err := isExternalURL(s.URL); err != nil {
+		if _, err := resolve(s.URL); err != nil {
 			return fmt.Errorf("source %q rejected: %w", s.URL, err)
 		}
 	}
 	return nil
 }
 
-// configurable hook to swap policy in tests.
-var isExternalURL = defaultIsExternalURL
-
-func _ctxValue(ctx context.Context, key any) any { return ctx.Value(key) }
