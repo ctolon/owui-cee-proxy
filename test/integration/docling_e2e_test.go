@@ -41,9 +41,16 @@ func TestDocling_FacadeIsTransparent(t *testing.T) {
 	doclingURL := "http://" + host + ":" + port.Port()
 
 	cfg := config.Default()
-	cfg.Routing.DefaultCEEEngine = "docling"
-	cfg.Engines.Docling.Enable = true
-	cfg.Engines.Docling.URL = doclingURL
+	cfg.Routing.DefaultEngine = "docling"
+	cfg.Engines = map[string]config.EngineConfig{
+		"docling": {
+			Enable:     true,
+			CompatType: config.CompatDocling,
+			URL:        doclingURL,
+			AuthHeader: "X-Api-Key",
+			AuthScheme: "raw",
+		},
+	}
 
 	proxy := newProxyServer(t, cfg)
 	waitForReadiness(t, proxy.URL+"/healthz", 30*time.Second)

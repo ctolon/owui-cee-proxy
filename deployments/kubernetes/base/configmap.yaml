@@ -9,21 +9,31 @@ data:
       read_timeout: 30s
       max_body_bytes: 524288000
     routing:
-      default_cee_engine: "docling"
-      facade_path_prefix: "/v1"
+      default_engine: "main-docling"
+      facade:
+        docling:
+          enabled: true
+          prefix: "/v1"
+        external:
+          enabled: true
+          path: "/process"
+      passthrough:
+        enabled: true
     engines:
-      docling:
+      main-docling:
         enable: true
+        compat_type: "docling"
         url: "http://docling-serve:5001"
         api_key_env: "DOCLING_API_KEY"
-      tika:
-        enable: true
-        url: "http://tika:9998"
-        api_key_env: "TIKA_API_KEY"
-      kreuzberg:
-        enable: true
+        auth_header: "X-Api-Key"
+        auth_scheme: "raw"
+      fallback-kreuzberg:
+        enable: false
+        compat_type: "docling"
         url: "http://kreuzberg:8000"
         api_key_env: "KREUZBERG_API_KEY"
+        auth_header: "Authorization"
+        auth_scheme: "bearer"
     security:
       proxy_api_keys_env: "PROXY_API_KEYS"
       require_api_key: false

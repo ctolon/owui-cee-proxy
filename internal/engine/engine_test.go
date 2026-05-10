@@ -9,95 +9,110 @@ import (
 )
 
 type fakeEngine struct {
-	name Name
+	name    Name
+	caps    EngineCapabilities
+	convert func(*ConvertRequest) (*ConvertResponse, error)
 }
 
-func (f *fakeEngine) Name() Name { return f.name }
-func (f *fakeEngine) Convert(_ context.Context, _ *ConvertRequest) (*ConvertResponse, error) {
+func (f *fakeEngine) Name() Name                       { return f.name }
+func (f *fakeEngine) Capabilities() EngineCapabilities { return f.caps }
+func (f *fakeEngine) Convert(_ context.Context, r *ConvertRequest) (*ConvertResponse, error) {
+	if f.convert != nil {
+		return f.convert(r)
+	}
 	return &ConvertResponse{StatusCode: 200}, nil
 }
 func (f *fakeEngine) Health(_ context.Context) error { return nil }
 
+// docFacade returns capabilities with only the docling facade.
+func docFacade() EngineCapabilities {
+	return EngineCapabilities{Facades: []Facade{FacadeDocling}}
+}
+
+func bothFacades() EngineCapabilities {
+	return EngineCapabilities{Facades: []Facade{FacadeDocling, FacadeExternal}}
+}
+
 func TestNewRegistry_DefaultMustExist(t *testing.T) {
 	t.Parallel()
 	_, err := NewRegistry(map[Name]RegistryEntry{
-		Docling: {Engine: &fakeEngine{name: Docling}},
-	}, Tika)
+		"a": {Engine: &fakeEngine{name: "a", caps: docFacade()}},
+	}, "missing")
 	require.ErrorIs(t, err, ErrUnknownEngine)
 }
 
 func TestNewRegistry_GetAndDefault(t *testing.T) {
 	t.Parallel()
-	d := &fakeEngine{name: Docling}
-	tk := &fakeEngine{name: Tika}
+	d := &fakeEngine{name: "primary", caps: docFacade()}
+	tk := &fakeEngine{name: "secondary", caps: docFacade()}
 	r, err := NewRegistry(map[Name]RegistryEntry{
-		Docling: {Engine: d},
-		Tika:    {Engine: tk},
-	}, Docling)
+		"primary":   {Engine: d},
+		"secondary": {Engine: tk},
+	}, "primary")
 	require.NoError(t, err)
 	require.Equal(t, d, r.Default())
 
-	got, err := r.Get(Tika)
+	got, err := r.Get("secondary")
 	require.NoError(t, err)
 	require.Equal(t, tk, got)
 
 	_, err = r.Get("missing")
 	require.True(t, errors.Is(err, ErrUnknownEngine))
 
-	require.ElementsMatch(t, []Name{Docling, Tika}, r.Names())
+	require.ElementsMatch(t, []Name{"primary", "secondary"}, r.Names())
 }
 
-func TestNewRegistry_Empty(t *testing.T) {
+func TestRegistry_PickByMimeAndFacade(t *testing.T) {
 	t.Parallel()
-	_, err := NewRegistry(nil, Docling)
-	require.Error(t, err)
-}
-
-func TestRegistry_PickByMime(t *testing.T) {
-	t.Parallel()
-	d := &fakeEngine{name: Docling}
-	tk := &fakeEngine{name: Tika}
-	kb := &fakeEngine{name: Kreuzberg}
+	d := &fakeEngine{name: "default-eng", caps: bothFacades()}
+	pdf := &fakeEngine{name: "pdf-eng", caps: docFacade()}
+	img := &fakeEngine{name: "img-eng", caps: bothFacades()}
 
 	r, err := NewRegistry(map[Name]RegistryEntry{
-		Docling:   {Engine: d},
-		Tika:      {Engine: tk, MimeTypes: []string{"application/pdf", "image/*"}},
-		Kreuzberg: {Engine: kb, MimeTypes: []string{"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}},
-	}, Docling)
+		"default-eng": {Engine: d},
+		"pdf-eng":     {Engine: pdf, MimeTypes: []string{"application/pdf"}},
+		"img-eng":     {Engine: img, MimeTypes: []string{"image/*"}},
+	}, "default-eng")
 	require.NoError(t, err)
 
 	cases := []struct {
-		mime string
-		want Engine
+		facade Facade
+		mime   string
+		want   Engine
 	}{
-		{"application/pdf", tk},
-		{"application/pdf; charset=utf-8", tk},
-		{"APPLICATION/PDF", tk},
-		{"image/png", tk},
-		{"image/jpeg", tk},
-		{"application/vnd.openxmlformats-officedocument.wordprocessingml.document", kb},
-		{"application/octet-stream", d},
-		{"", d},
-		{"text/plain", d},
+		{FacadeDocling, "application/pdf", pdf},
+		{FacadeDocling, "image/png", img},
+		{FacadeDocling, "text/plain", d},
+		{FacadeExternal, "application/pdf", d}, // pdf-eng doesn't accept external; fall through
+		{FacadeExternal, "image/png", img},     // img-eng accepts external
+		{FacadeExternal, "text/plain", d},
 	}
 	for _, c := range cases {
-		got := r.Pick(c.mime)
-		require.Same(t, c.want, got, "mime=%q", c.mime)
+		got := r.Pick(c.facade, c.mime)
+		require.Same(t, c.want, got, "facade=%s mime=%s", c.facade, c.mime)
 	}
 }
 
-func TestRegistry_PickIgnoresDefaultMimeRules(t *testing.T) {
+func TestRegistry_PickWithError_NoEngineForFacade(t *testing.T) {
 	t.Parallel()
-	// Even if default engine declares mime types, they are ignored:
-	// non-default engines are checked first; default is the catch-all.
-	d := &fakeEngine{name: Docling}
-	tk := &fakeEngine{name: Tika}
-
+	d := &fakeEngine{name: "doc-only", caps: docFacade()}
 	r, err := NewRegistry(map[Name]RegistryEntry{
-		Docling: {Engine: d, MimeTypes: []string{"application/pdf"}},
-		Tika:    {Engine: tk, MimeTypes: []string{"application/pdf"}},
-	}, Docling)
+		"doc-only": {Engine: d},
+	}, "doc-only")
 	require.NoError(t, err)
 
-	require.Same(t, tk, r.Pick("application/pdf"), "non-default tika should win")
+	_, err = r.PickWithError(FacadeExternal, "application/pdf")
+	require.ErrorIs(t, err, ErrNoEngineForFacade)
+
+	got, err := r.PickWithError(FacadeDocling, "application/pdf")
+	require.NoError(t, err)
+	require.Same(t, d, got)
+}
+
+func TestEngineCapabilities_AcceptsFacade(t *testing.T) {
+	t.Parallel()
+	c := bothFacades()
+	require.True(t, c.AcceptsFacade(FacadeDocling))
+	require.True(t, c.AcceptsFacade(FacadeExternal))
+	require.False(t, c.AcceptsFacade("unknown"))
 }

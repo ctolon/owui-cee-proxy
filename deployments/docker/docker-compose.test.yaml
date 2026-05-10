@@ -1,6 +1,6 @@
 name: owui-cee-test
 
-# Test stack: OpenWebUI + Docling + Kreuzberg + owui-cee-proxy.
+# Test stack: OpenWebUI + Docling + Kreuzberg + Tika + owui-cee-proxy.
 # Ports are offset to avoid conflicts with other local stacks.
 
 services:
@@ -16,6 +16,8 @@ services:
       docling:
         condition: service_started
       kreuzberg:
+        condition: service_started
+      tika:
         condition: service_started
     environment:
       OWUI_PROXY_CONFIG: /app/config.yaml
@@ -47,6 +49,13 @@ services:
     container_name: owui-cee-test-kreuzberg
     ports:
       - "18001:8000"
+    restart: unless-stopped
+
+  tika:
+    image: apache/tika:latest-full
+    container_name: owui-cee-test-tika
+    ports:
+      - "19998:9998"
     restart: unless-stopped
 
   openwebui:
