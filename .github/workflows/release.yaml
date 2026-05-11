@@ -33,7 +33,15 @@ env:
 
 jobs:
   release:
-    if: "!contains(github.event.head_commit.message, '[skip release]') && github.event.head_commit.author.username != 'github-actions[bot]'"
+    # Skip recursion when this workflow's own CHANGELOG commit-back
+    # lands (`chore(release): vX.Y.Z [skip release]`). Anchoring on
+    # the subject prefix instead of substring-matching the whole
+    # message keeps us safe when a feature PR's squash body happens
+    # to embed an earlier release commit (after a `-s ours` align-
+    # merge from main into dev, or via an unrelated historical
+    # commit like `fix(ci): … chore-release commit` that referenced
+    # the marker). Substring-match would otherwise mute legit releases.
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):') && github.event.head_commit.author.username != 'github-actions[bot]'"
     runs-on: ubuntu-latest
     outputs:
       new_version: ${{ steps.semver.outputs.new_tag }}
