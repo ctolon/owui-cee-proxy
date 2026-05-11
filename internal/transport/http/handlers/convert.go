@@ -21,6 +21,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
+	"github.com/ctolon/owui-cee-proxy/internal/spool"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
@@ -269,11 +270,11 @@ func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, fun
 			// global BodyLimit middleware already bounds the request
 			// stream, so this only adds the per-part overflow guard.
 			declaredCT := part.Header.Get("Content-Type")
-			sr, err := spoolPart(part, spoolThresholdDefault, maxFilePartBytes)
+			sr, err := spool.Part(part, spool.ThresholdDefault, maxFilePartBytes)
 			_ = part.Close()
 			if err != nil {
 				cleanup()
-				if errors.Is(err, ErrSpoolTooLarge) {
+				if errors.Is(err, spool.ErrTooLarge) {
 					return nil, noop, fmt.Errorf("file %q too large", part.FileName())
 				}
 				return nil, noop, fmt.Errorf("read part %q: %w", part.FormName(), err)
@@ -305,7 +306,7 @@ func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, fun
 					Str("resolved_mime", resolved.MIME).
 					Str("mime_source", string(resolved.Source)).
 					Int64("size_bytes", sr.Size()).
-					Bool("spilled_to_disk", sr.Size() > spoolThresholdDefault).
+					Bool("spilled_to_disk", sr.Size() > spool.ThresholdDefault).
 					Msg("multipart part received")
 			}
 
