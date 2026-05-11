@@ -192,7 +192,10 @@ engines:
     auth_header: "Authorization"
     auth_scheme: "bearer"
     paths:
-      external_process: "/process"
+      # v0.8.0+: keys are unprefixed adapter-owned strings.
+      # Legacy `external_process` / `docling_convert_file` /
+      # `tika_text` shapes are no longer accepted.
+      process: "/process"
     mime_types: []
 
 security:

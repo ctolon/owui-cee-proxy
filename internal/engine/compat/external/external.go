@@ -100,9 +100,13 @@ func (a *Adapter) Health(ctx context.Context) error {
 	return nil
 }
 
+// PathProcess is the EngineConfig.Paths key this adapter consults
+// to override the default /process endpoint.
+const PathProcess = "process"
+
 func (a *Adapter) processPath() string {
-	if a.cfg.Paths.ExternalProcess != "" {
-		return a.cfg.Paths.ExternalProcess
+	if v, ok := a.cfg.Paths[PathProcess]; ok && v != "" {
+		return v
 	}
 	return defaultProcessPath
 }
