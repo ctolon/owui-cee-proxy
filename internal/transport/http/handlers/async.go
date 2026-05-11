@@ -48,6 +48,93 @@ func (a *Async) SubmitSource(w http.ResponseWriter, r *http.Request) {
 	a.submit(w, r, true)
 }
 
+// SubmitProcess is the async sibling of the synchronous External
+// facade (PUT /process). Body is a single raw upload; Content-Type
+// drives engine selection; X-Filename is the optional filename
+// hint. The status/result endpoints under the docling prefix serve
+// every facade — the TaskID is opaque (closes the facade-asymmetry
+// gap C-45 from REVIEW-FAANG.md).
+func (a *Async) SubmitProcess(w http.ResponseWriter, r *http.Request) {
+	defaultEng := a.Registry.Default()
+	r = r.WithContext(mw.WithEngine(r.Context(), string(defaultEng.Name()), defaultEng.URL()))
+	r = r.WithContext(mw.WithPickDecision(r.Context(), string(engine.PickSourceDefault), string(a.Registry.Strategy())))
+
+	if a.Orchestrator == nil {
+		writeJSON(w, http.StatusNotImplemented, respond.NewExternalError("async tasks not enabled"))
+		return
+	}
+
+	filename := decodeFilename(r.Header.Get("X-Filename"))
+	payload, cleanup, err := tasks.PayloadFromExternalRequest(r, filename, a.maxBlobBytes(), a.Resolver)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, respond.NewExternalError(err.Error()))
+		return
+	}
+	defer cleanup()
+
+	payload.Facade = string(engine.FacadeExternal)
+	eng := defaultEng
+	pickSrc := engine.PickSourceDefault
+	if len(payload.BlobKeys) > 0 {
+		picked, src, perr := a.Registry.PickRouteVerbose(engine.FacadeExternal, engine.PickHint{
+			MIME:     payload.BlobKeys[0].ContentType,
+			Filename: payload.BlobKeys[0].Filename,
+		})
+		if perr == nil {
+			eng = picked
+			pickSrc = src
+		} else {
+			writeJSON(w, http.StatusNotImplemented, respond.NewExternalError(
+				fmt.Sprintf("no engine for external facade: %v", perr)))
+			return
+		}
+	}
+
+	ctx := mw.WithEngine(r.Context(), string(eng.Name()), eng.URL())
+	ctx = mw.WithPickDecision(ctx, string(pickSrc), string(a.Registry.Strategy()))
+	if len(payload.BlobKeys) > 0 {
+		ctx = mw.WithFilename(ctx, payload.BlobKeys[0].Filename)
+		ctx = mw.WithMimeType(ctx, payload.BlobKeys[0].ContentType)
+		ctx = mw.WithFileCount(ctx, 1)
+	}
+	payload.Engine = string(eng.Name())
+	payload.RequestID = mw.IDFrom(ctx)
+
+	apiKey := ""
+	if a.APIKeyHeader != "" {
+		apiKey = r.Header.Get(a.APIKeyHeader)
+	}
+
+	idem := r.Header.Get("Idempotency-Key")
+	if existing, found, err := a.Orchestrator.ResolveIdempotent(ctx, idem, apiKey); err == nil && found {
+		writeJSON(w, http.StatusAccepted, asyncAcceptedResponse{
+			TaskID:     existing,
+			TaskStatus: "pending",
+		})
+		return
+	}
+
+	token, err := a.Orchestrator.Enqueue(ctx, payload, apiKey)
+	if err != nil {
+		if isClientError(err) {
+			writeJSON(w, http.StatusBadRequest, respond.NewExternalError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, respond.NewExternalError(
+			fmt.Sprintf("enqueue: %v", err)))
+		return
+	}
+
+	if effective, ierr := a.Orchestrator.RecordIdempotent(ctx, idem, apiKey, token); ierr == nil && effective != "" {
+		token = effective
+	}
+
+	writeJSON(w, http.StatusAccepted, asyncAcceptedResponse{
+		TaskID:     token,
+		TaskStatus: "pending",
+	})
+}
+
 func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	// Baseline observability stamp — see Convert.handle for the rationale.
 	// Async submit has its own collection of early-return paths

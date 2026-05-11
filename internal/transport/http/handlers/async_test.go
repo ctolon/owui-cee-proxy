@@ -21,13 +21,21 @@ import (
 type stubEngine struct {
 	name        engine.Name
 	httpSources bool
+	// facades opts an instance into a specific set of facades. Empty
+	// keeps the historical docling-only default so existing tests
+	// don't shift behaviour.
+	facades []engine.Facade
 }
 
 func (s *stubEngine) Name() engine.Name { return s.name }
 func (s *stubEngine) URL() string       { return "http://" + string(s.name) + ".test" }
 func (s *stubEngine) Capabilities() engine.EngineCapabilities {
+	fs := s.facades
+	if len(fs) == 0 {
+		fs = []engine.Facade{engine.FacadeDocling}
+	}
 	return engine.EngineCapabilities{
-		Facades:     []engine.Facade{engine.FacadeDocling},
+		Facades:     fs,
 		HTTPSources: s.httpSources,
 	}
 }
@@ -146,6 +154,85 @@ func TestWriteResultResponse_DisallowedCTForcedDownload(t *testing.T) {
 				t.Fatalf("Content-Disposition: got %q want prefix %q", disp, tc.wantDispPrefix)
 			}
 		})
+	}
+}
+
+// newExternalRegistry wires a single external-facade engine as the
+// default. Used by the SubmitProcess tests so the External facade
+// pick path resolves an engine.
+func newExternalRegistry(t *testing.T) engine.Registry {
+	t.Helper()
+	entries := map[engine.Name]engine.RegistryEntry{
+		"ext-default": {Engine: &stubEngine{
+			name:    "ext-default",
+			facades: []engine.Facade{engine.FacadeExternal},
+		}},
+	}
+	reg, err := engine.NewRegistry(entries, "ext-default", "")
+	if err != nil {
+		t.Fatalf("external registry: %v", err)
+	}
+	return reg
+}
+
+func TestAsync_SubmitProcess_RejectsMissingContentType(t *testing.T) {
+	t.Parallel()
+	reg := newExternalRegistry(t)
+	orch := newOrchestratorOrSkip(t)
+	a := &Async{Registry: reg, Orchestrator: orch}
+
+	req := httptest.NewRequest(http.MethodPost, "/process/async", strings.NewReader("hello"))
+	// deliberately do NOT set Content-Type
+	rr := httptest.NewRecorder()
+	a.SubmitProcess(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "Content-Type") {
+		t.Fatalf("expected error mentioning Content-Type, got %q", rr.Body.String())
+	}
+}
+
+func TestAsync_SubmitProcess_RejectsWhenOrchestratorMissing(t *testing.T) {
+	t.Parallel()
+	reg := newExternalRegistry(t)
+	// Orchestrator left nil — the handler must short-circuit with
+	// 501 (matching the docling-facade async behaviour).
+	a := &Async{Registry: reg}
+
+	req := httptest.NewRequest(http.MethodPost, "/process/async", strings.NewReader("hello"))
+	req.Header.Set("Content-Type", "text/plain")
+	rr := httptest.NewRecorder()
+	a.SubmitProcess(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status: want 501 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "async tasks not enabled") {
+		t.Fatalf("expected friendly error, got %q", rr.Body.String())
+	}
+}
+
+func TestAsync_SubmitProcess_RejectsWhenNoEngineForFacade(t *testing.T) {
+	t.Parallel()
+	// Registry whose only engine speaks the docling facade, NOT
+	// external. PickRoute on the external facade must fail; the
+	// handler surfaces 501 with a contextual message.
+	reg := newRegistry(t, "docling-only")
+	orch := newOrchestratorOrSkip(t)
+	a := &Async{Registry: reg, Orchestrator: orch}
+
+	req := httptest.NewRequest(http.MethodPost, "/process/async", strings.NewReader("hi"))
+	req.Header.Set("Content-Type", "text/plain")
+	rr := httptest.NewRecorder()
+	a.SubmitProcess(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status: want 501 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "no engine for external facade") {
+		t.Fatalf("expected facade-not-supported error, got %q", rr.Body.String())
 	}
 }
 
