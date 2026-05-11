@@ -59,7 +59,7 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	r = r.WithContext(mw.WithPickDecision(r.Context(), string(engine.PickSourceDefault), string(a.Registry.Strategy())))
 
 	if a.Orchestrator == nil {
-		http.Error(w, "async tasks not enabled", http.StatusNotImplemented)
+		writeJSON(w, http.StatusNotImplemented, respond.NewDoclingError("async tasks not enabled"))
 		return
 	}
 	payload, cleanup, err := tasks.PayloadFromRequest(r, source, a.maxBlobBytes(), a.Resolver)
@@ -140,7 +140,7 @@ type asyncAcceptedResponse struct {
 
 func (a *Async) Poll(w http.ResponseWriter, r *http.Request) {
 	if a.Orchestrator == nil {
-		http.Error(w, "async tasks not enabled", http.StatusNotImplemented)
+		writeJSON(w, http.StatusNotImplemented, respond.NewDoclingError("async tasks not enabled"))
 		return
 	}
 	token := chi.URLParam(r, "id")
@@ -151,10 +151,10 @@ func (a *Async) Poll(w http.ResponseWriter, r *http.Request) {
 	info, err := a.Orchestrator.Status(r.Context(), token, apiKey)
 	if err != nil {
 		if errors.Is(err, tasks.ErrNotFound) {
-			http.Error(w, "task not found", http.StatusNotFound)
+			writeJSON(w, http.StatusNotFound, respond.NewDoclingError("task not found"))
 			return
 		}
-		http.Error(w, "lookup failed", http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, respond.NewDoclingError("lookup failed"))
 		return
 	}
 	writeJSON(w, http.StatusOK, info)
@@ -172,7 +172,7 @@ var allowedResultContentTypes = map[string]struct{}{
 
 func (a *Async) Result(w http.ResponseWriter, r *http.Request) {
 	if a.Orchestrator == nil {
-		http.Error(w, "async tasks not enabled", http.StatusNotImplemented)
+		writeJSON(w, http.StatusNotImplemented, respond.NewDoclingError("async tasks not enabled"))
 		return
 	}
 	token := chi.URLParam(r, "id")
@@ -183,10 +183,10 @@ func (a *Async) Result(w http.ResponseWriter, r *http.Request) {
 	body, contentType, err := a.Orchestrator.Result(r.Context(), token, apiKey)
 	if err != nil {
 		if errors.Is(err, tasks.ErrNotFound) {
-			http.Error(w, "result not ready", http.StatusNotFound)
+			writeJSON(w, http.StatusNotFound, respond.NewDoclingError("result not ready"))
 			return
 		}
-		http.Error(w, "lookup failed", http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, respond.NewDoclingError("lookup failed"))
 		return
 	}
 	defer func() { _ = body.Close() }()

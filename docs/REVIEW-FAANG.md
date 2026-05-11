@@ -63,14 +63,19 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-6 | Security | Sync `buildFileRequest` and async `payloadFromMultipart` cap non-file form-field parts at 1 MiB via `io.LimitReader(part, 1MiB+1)`. Oversized parts 400 before reaching the engine. Parity test asserts both paths reject. |
 | F1 | Architecture | (Landed in the prior PR.) `Async.APIKeyHeader` wired from `Security.ProxyAPIKeyHeader` in `routes.go`. |
 
+### Closed in `feat/timeout-hierarchy-error-envelope`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-2 | Reliability | `validateTimeoutHierarchy` runs at config Load and rejects inverted timeout knobs (`max(engines.*.request_timeout) > server.request_timeout`, or `server.request_timeout + 2s > server.write_timeout`). The chi `mw.Timeout` cancel was tripping breakers on healthy-but-slow backends; the validator surfaces the misconfig at bootstrap with a precise diff. `Default()` `WriteTimeout` bumped to `5m30s` to honour the new 2 s slack. |
+| C-9 | API | Every `http.Error` call in `external.go` and the async `Poll`/`Result` paths is gone — replaced with `writeJSON(w, status, respond.NewExternalError(...))` (external facade) or `respond.NewDoclingError(...)` (docling facade async). Schema-strict OpenWebUI loaders now see one shape per facade across every status code. `TestExternal_ErrorEnvelope_MissingContentType` pins it. |
+
 ### P0 (carry-over)
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|
-| C-2 | Reliability | `Server.WriteTimeout` (5m) can cancel in-flight streaming responses; long Docling OCR jobs are killed mid-stream. | Set `WriteTimeout: 0` on the convert path and rely on context deadline; or add `validateTimeoutHierarchy`. |
 | C-7 | DevOps | CI workflow pins four security-critical actions to `@master` (`trivy-action`, `gosec`, `checkov`). Supply-chain compromise lands in release pipeline. | Pin every third-party action to immutable commit SHA; Renovate manages bumps. |
 | C-8 | DevOps | Release pipeline pushes `${VERSION}` and `:latest` to two registries with **no cosign signing, no SBOM attestation, no SLSA provenance**. | Wire `sigstore/cosign-installer` + `cosign sign --yes` keyless OIDC; push CycloneDX SBOM as cosign attestation. |
-| C-9 | API | External facade emits `http.Error` (plain text) on every error path while Docling facade emits `respond.DoclingError` (JSON). Schema-strict clients break. | Route every External error through `respond.NewExternalError` + `writeJSON`. |
 | C-10 | Helm | `templates/networkpolicy.yaml` produces a full-deny ingress block when `ingressFrom: []` (the default). NetworkPolicy enabled → pod CrashLoopBackOff. | Always emit an allow rule for the kubelet probe port. |
 | C-11 | Helm | `templates/deployment.yaml` `preStop` uses `/bin/sh` which doesn't exist in distroless static — exec fails, in-flight requests get reset during rolling updates. | Replace with `httpGet` preStop or remove and rely on graceful drain. |
 
