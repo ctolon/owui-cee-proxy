@@ -131,9 +131,12 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	// without joining the access-log line against a separate trace.
 	// Kept at debug level — production-noisy by design.
 	if c.Logger.GetLevel() <= zerolog.DebugLevel && len(req.Files) > 0 {
+		traceID, spanID := mw.TraceFieldsFrom(ctx)
 		c.Logger.Debug().
 			Str("event", "engine_pick_decision").
 			Str("request_id", req.RequestID).
+			Str("trace_id", traceID).
+			Str("span_id", spanID).
 			Str("engine", string(eng.Name())).
 			Str("engine_url", eng.URL()).
 			Str("pick_source", string(pickSrc)).
@@ -150,10 +153,13 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 		// the fact that a circuit breaker is open. Log the full error
 		// at error level (with request_id for correlation) and return
 		// a stable redacted message keyed by request_id.
+		traceID, spanID := mw.TraceFieldsFrom(ctx)
 		c.Logger.Error().
 			Err(err).
 			Str("event", "engine_convert_failed").
 			Str("request_id", req.RequestID).
+			Str("trace_id", traceID).
+			Str("span_id", spanID).
 			Str("engine", string(eng.Name())).
 			Str("engine_url", eng.URL()).
 			Msg("engine convert failed")

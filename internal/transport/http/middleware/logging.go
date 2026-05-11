@@ -10,7 +10,30 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// traceFieldsFromContext pulls the W3C trace_id / span_id off ctx
+// (populated by the otelhttp middleware) and returns them as strings.
+// Returns empty strings when ctx carries no span — every emitter that
+// stamps trace_id MUST tolerate the empty case so non-traced
+// requests (health probes with WithSilenceLog, integration tests
+// without an exporter) still log cleanly.
+//
+// Helper kept package-local so handler-side emitters can call it via
+// `mw.TraceFieldsFrom(ctx)` and produce log lines that join cleanly
+// against Tempo / Jaeger on `trace_id`. Closes C-18 from
+// docs/REVIEW-FAANG.md.
+func TraceFieldsFrom(ctx context.Context) (traceID, spanID string) {
+	if ctx == nil {
+		return "", ""
+	}
+	sc := trace.SpanFromContext(ctx).SpanContext()
+	if !sc.IsValid() {
+		return "", ""
+	}
+	return sc.TraceID().String(), sc.SpanID().String()
+}
 
 // requestMeta is a mutable struct stashed in the request context. The
 // AccessLog middleware installs it; convert handlers mutate it once
@@ -319,9 +342,12 @@ func AccessLog(logger zerolog.Logger, silencePaths ...string) func(http.Handler)
 			} else if rw.status >= 400 {
 				ev = logger.Warn()
 			}
+			traceID, spanID := TraceFieldsFrom(r.Context())
 			ev.
 				Str("event", "request_completed").
 				Str("request_id", IDFrom(r.Context())).
+				Str("trace_id", traceID).
+				Str("span_id", spanID).
 				Str("method", r.Method).
 				Str("path", r.URL.Path).
 				Int("status", rw.status).

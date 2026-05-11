@@ -1,10 +1,43 @@
 package tasks
 
 import (
+	"context"
 	"encoding/hex"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ctolon/owui-cee-proxy/internal/config"
 )
+
+// newOrchestratorWithMiniredis spins a miniredis server and returns a
+// fully-wired Orchestrator pointed at it. Lifts the long-standing
+// `t.Skip("requires Redis")` ban from the lifecycle-shaped tests so
+// Enqueue → Status → SaveResult → Result can be exercised end-to-end
+// in unit mode.
+func newOrchestratorWithMiniredis(t *testing.T) (*Orchestrator, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	cfg := config.TasksConfig{
+		Enabled:       true,
+		RedisURL:      config.Secret("redis://" + mr.Addr()),
+		Retention:     5 * time.Minute,
+		ResultTTL:     5 * time.Minute,
+		TaskTimeout:   30 * time.Second,
+		MaxBlobBytes:  1 << 20,
+		MaxTotalBytes: 4 << 20,
+		Retry:         1,
+	}
+	orch, err := NewOrchestrator(cfg, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = orch.Close() })
+	return orch, mr
+}
 
 func TestMintToken_LengthAndUniqueness(t *testing.T) {
 	t.Parallel()
@@ -109,4 +142,152 @@ func TestValidateBlobLimits(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOrchestrator_EnqueueSaveResultRoundtrip closes the C-14 unit-
+// coverage gap for the orchestrator's persistence surface. With a
+// miniredis backend we exercise the path Enqueue → resolveToken →
+// SaveResult → Result end-to-end without standing up a real Redis
+// container.
+//
+// Status() is NOT part of this assertion because the underlying
+// asynq.Inspector walks Redis data structures (LRANGE / ZRANGEBYSCORE
+// against asynq's internal queue keys) that miniredis can emulate but
+// not perfectly model when asynq writes via its own Lua scripts. That
+// path stays covered by the integration suite; here we pin the
+// Orchestrator's Redis-direct lifecycle.
+func TestOrchestrator_EnqueueSaveResultRoundtrip(t *testing.T) {
+	t.Parallel()
+	orch, _ := newOrchestratorWithMiniredis(t)
+
+	ctx := context.Background()
+	p := &Payload{
+		Engine:    "main-docling",
+		Facade:    "docling",
+		RequestID: "req-1",
+		Options:   map[string]string{"output_format": "markdown"},
+	}
+
+	token, err := orch.Enqueue(ctx, p, "caller-key-A")
+	require.NoError(t, err, "miniredis-backed Enqueue must succeed")
+	require.NotEmpty(t, token, "Enqueue returns a minted token")
+
+	// Pull the asynq task ID from the token binding we just wrote.
+	// resolveToken is the in-package helper Status/Result use; the
+	// happy path round-trips correctly via the Redis-direct calls.
+	id, err := orch.resolveToken(ctx, token, "caller-key-A")
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+
+	// Simulate the worker writing the final result. The retrieval
+	// path then yields the body + content type via the result
+	// store (pure redis Set/Get — no asynq inspector involvement).
+	require.NoError(t, orch.SaveResult(ctx, id, "application/json",
+		[]byte(`{"document":{"md_content":"ok"}}`)))
+
+	body, ct, err := orch.Result(ctx, token, "caller-key-A")
+	require.NoError(t, err)
+	defer body.Close()
+	require.Equal(t, "application/json", ct)
+	out, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Contains(t, string(out), `"md_content":"ok"`)
+}
+
+// TestOrchestrator_TokenBindingRejectsCrossTenant pins the load-
+// bearing security invariant for the async path: a task token MUST
+// only resolve when paired with the SAME caller API key that
+// produced it. Without this, anyone holding a leaked token could
+// poll any tenant's task and fetch its result body.
+//
+// The previous test suite skipped this on the assumption that the
+// integration suite covered it — F1 from the architecture review
+// proved that `Async.APIKeyHeader` was unwired in production
+// (token binding collapsed to empty fingerprint, no cross-tenant
+// barrier). Pin it at unit level now.
+func TestOrchestrator_TokenBindingRejectsCrossTenant(t *testing.T) {
+	t.Parallel()
+	orch, _ := newOrchestratorWithMiniredis(t)
+
+	ctx := context.Background()
+	p := &Payload{Engine: "main-docling", Facade: "docling", RequestID: "tenant-A-req"}
+	token, err := orch.Enqueue(ctx, p, "tenant-A")
+	require.NoError(t, err)
+
+	// Same caller: success.
+	_, err = orch.Status(ctx, token, "tenant-A")
+	require.NoError(t, err)
+
+	// Different caller: must surface ErrNotFound (not an auth-level
+	// error — the orchestrator treats the lookup as if the token
+	// doesn't exist, denying any oracle on whether a token is
+	// valid-but-for-someone-else).
+	_, err = orch.Status(ctx, token, "tenant-B")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrNotFound),
+		"cross-tenant Status MUST return ErrNotFound, got %v", err)
+
+	// Same for Result.
+	_, _, err = orch.Result(ctx, token, "tenant-B")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrNotFound))
+
+	// And an empty caller (the F1 footgun): also rejected.
+	_, err = orch.Status(ctx, token, "")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrNotFound))
+}
+
+// TestOrchestrator_IdempotencyResolveAndRecord pins the C-20
+// Idempotency-Key contract:
+//   - first call with a given (apiKey, idem) records the token and
+//     resolves it on subsequent reads;
+//   - empty idem is a no-op (caller intentionally opted out);
+//   - cross-tenant: same idem-key under a different apiKey returns
+//     a distinct lookup (no collision);
+//   - SETNX race: if a second RecordIdempotent fires with a
+//     different token for the same (apiKey, idem), the FIRST token
+//     wins and the loser sees the winner's value.
+func TestOrchestrator_IdempotencyResolveAndRecord(t *testing.T) {
+	t.Parallel()
+	orch, _ := newOrchestratorWithMiniredis(t)
+	ctx := context.Background()
+
+	// Empty idem-key short-circuits without touching Redis.
+	stored, found, err := orch.ResolveIdempotent(ctx, "", "tenant-A")
+	require.NoError(t, err)
+	require.False(t, found)
+	require.Empty(t, stored)
+
+	// Miss on first lookup → not found.
+	_, found, err = orch.ResolveIdempotent(ctx, "client-key-1", "tenant-A")
+	require.NoError(t, err)
+	require.False(t, found)
+
+	// Record the (tenant-A, client-key-1) → token-A binding.
+	tok, err := orch.RecordIdempotent(ctx, "client-key-1", "tenant-A", "token-A")
+	require.NoError(t, err)
+	require.Equal(t, "token-A", tok)
+
+	// Same lookup now resolves to token-A.
+	stored, found, err = orch.ResolveIdempotent(ctx, "client-key-1", "tenant-A")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "token-A", stored)
+
+	// Race: a second Record with a different token for the SAME
+	// (tenant, key) returns the FIRST token. The second caller now
+	// shares the same task as the first.
+	tok, err = orch.RecordIdempotent(ctx, "client-key-1", "tenant-A", "token-B")
+	require.NoError(t, err)
+	require.Equal(t, "token-A", tok, "SETNX winner-token MUST be returned to the loser")
+
+	// Cross-tenant: same idem-key under tenant-B is independent.
+	_, found, err = orch.ResolveIdempotent(ctx, "client-key-1", "tenant-B")
+	require.NoError(t, err)
+	require.False(t, found, "(tenant-A, idem) MUST NOT shadow (tenant-B, idem)")
+
+	tok, err = orch.RecordIdempotent(ctx, "client-key-1", "tenant-B", "token-B")
+	require.NoError(t, err)
+	require.Equal(t, "token-B", tok)
 }

@@ -111,6 +111,21 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 		apiKey = r.Header.Get(a.APIKeyHeader)
 	}
 
+	// Idempotency-Key: when the client signals retry-intent, fast-
+	// path resolve the prior submission's token instead of double-
+	// enqueueing the work. Keyed on (apiKey-fingerprint, idem-key)
+	// so two tenants reusing the same opaque string never collide.
+	// TTL matches ResultTTL — the window during which the original
+	// result is still fetchable.
+	idem := r.Header.Get("Idempotency-Key")
+	if existing, found, err := a.Orchestrator.ResolveIdempotent(ctx, idem, apiKey); err == nil && found {
+		writeJSON(w, http.StatusAccepted, asyncAcceptedResponse{
+			TaskID:     existing,
+			TaskStatus: "pending",
+		})
+		return
+	}
+
 	token, err := a.Orchestrator.Enqueue(ctx, payload, apiKey)
 	if err != nil {
 		// Blob limit / per-blob validation errors map to 400.
@@ -124,6 +139,15 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 		)
 		return
 	}
+
+	// Record the (idem, token) tuple so a retry within ResultTTL
+	// hits the fast-path above. A concurrent submit that lost the
+	// SETNX race gets the WINNER's token here — both callers see
+	// the same task; only one actually runs the engine work.
+	if effective, ierr := a.Orchestrator.RecordIdempotent(ctx, idem, apiKey, token); ierr == nil && effective != "" {
+		token = effective
+	}
+
 	writeJSON(w, http.StatusAccepted, asyncAcceptedResponse{
 		TaskID:     token,
 		TaskStatus: "pending",
