@@ -96,6 +96,25 @@ pdb:
 
 networkPolicy:
   enabled: false
+  # probeSources is the ALWAYS-emitted ingress allow rule that keeps
+  # kubelet probes (liveness/readiness/startup) reachable when the
+  # policy is enabled. The chart's empty default ([]) resolves to a
+  # kube-system namespaceSelector — the broadly safe choice. Tighten
+  # in production by listing the exact node CIDR / namespace your
+  # cluster's kubelet probe sources actually come from. Setting
+  # probeSources to a non-empty list REPLACES the default; ingressFrom
+  # is independent and stacks additively.
+  probeSources: []
+  # ingressFrom: extra allow rules layered ON TOP of probeSources.
+  # Use for service-to-service ingress from sibling pods in the same
+  # cluster. Example:
+  #   ingressFrom:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           name: openwebui
+  #       podSelector:
+  #         matchLabels:
+  #           app: openwebui
   ingressFrom: []
   egressTo: []
 

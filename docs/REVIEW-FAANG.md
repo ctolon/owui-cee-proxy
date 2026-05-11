@@ -78,12 +78,16 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-8 | DevOps | `release.yaml` gained three steps after the buildx push: (1) `sigstore/cosign-installer` v4.1.2, (2) `cosign sign --yes` against the exact pushed digest on BOTH GHCR and Docker Hub refs (keyless OIDC via the already-granted `id-token: write`), (3) `anchore/sbom-action` v0.24.0 produces a CycloneDX SBOM that `cosign attest` pins to the digest as a typed predicate. Operators verify with `cosign verify` + `cosign download attestation --predicate-type=cyclonedx`. The buildx step now writes a metadata file so the digest is canonical and immutable (no tag re-resolution race). |
 | C-21 | DX | `cmd/proxy/main.go` gained `-validate` flag: loads + validates the config and exits 0 (safe to roll) / 2 (stop the rollout) without binding ports. Designed for Helm pre-upgrade hooks; smoke-tested locally against `configs/config.minimal.yaml`. The DX review's earlier "tasks.enabled=true in example.yaml without REDIS_URL" anti-example surfaces immediately with the new flag — operator-visible regression test. |
 
-### P0 (carry-over)
+### Closed in `feat/helm-hardening`
 
-| ID  | Lens | Finding | Recommended action |
-|-----|------|---------|--------------------|
-| C-10 | Helm | `templates/networkpolicy.yaml` produces a full-deny ingress block when `ingressFrom: []` (the default). NetworkPolicy enabled → pod CrashLoopBackOff. | Always emit an allow rule for the kubelet probe port. |
-| C-11 | Helm | `templates/deployment.yaml` `preStop` uses `/bin/sh` which doesn't exist in distroless static — exec fails, in-flight requests get reset during rolling updates. | Replace with `httpGet` preStop or remove and rely on graceful drain. |
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-10 | Helm | `templates/networkpolicy.yaml` now ALWAYS emits a kubelet probe allow rule (port 8080) ahead of the user-supplied `ingressFrom`. Default selector is `namespaceSelector.matchLabels.kubernetes.io/metadata.name: kube-system` (the broadly safe target since every common CNI routes its probe path there). New values knob `networkPolicy.probeSources` lets operators tighten to their exact node-pool / CNI. `ingressFrom` is independent and stacks additively. `helm template` verified — enabling networkPolicy with empty values now renders a usable policy instead of a full-deny block. |
+| C-11 | Helm | `templates/deployment.yaml` `lifecycle.preStop` block (which called `/bin/sh -c "sleep 5"` against a distroless static image with no shell → exec error → no delay → in-flight RST during rolling updates) is removed. Graceful drain now relies on `terminationGracePeriodSeconds` + the Go server's SIGTERM handler (`server.shutdown_grace`, default 30 s). Operators who need a longer window bump both knobs together. `helm template` confirmed: no `lifecycle:` block in the rendered Deployment. |
+
+### Milestone status
+
+**All P0 carry-over items closed.** The original 11-item P0 table is exhausted across PRs #13 (security-hardening), #14 (timeout + envelope), #15 (supply-chain), and this PR (#16). What remains is the P1 / P2 backlog plus the roadmap themes. Next sprint candidates: C-12..C-32 (P1 — see the table below).
 
 ### P1 (release after P0)
 
