@@ -17,14 +17,16 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/ctolon/owui-cee-proxy/internal/breaker"
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/authutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
 	"github.com/ctolon/owui-cee-proxy/internal/httpclient"
+	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
 const (
@@ -49,6 +51,8 @@ func New(name engine.Name, cfg config.EngineConfig, client *httpclient.Client, b
 }
 
 func (a *Adapter) Name() engine.Name { return a.name }
+
+func (a *Adapter) URL() string { return a.cfg.URL }
 
 func (a *Adapter) Capabilities() engine.EngineCapabilities {
 	return engine.EngineCapabilities{
@@ -141,7 +145,7 @@ func (a *Adapter) convertFile(ctx context.Context, req *engine.ConvertRequest) (
 		return nil, err
 	}
 	hreq.Header.Set("Content-Type", mw.FormDataContentType())
-	ApplyAuth(hreq.Header, a.cfg)
+	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	ApplyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 
 	return a.do(hreq)
@@ -161,7 +165,7 @@ func (a *Adapter) convertSource(ctx context.Context, req *engine.ConvertRequest)
 		return nil, err
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	ApplyAuth(hreq.Header, a.cfg)
+	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	ApplyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 	return a.do(hreq)
 }
@@ -176,15 +180,22 @@ func (a *Adapter) do(hreq *http.Request) (*engine.ConvertResponse, error) {
 	}
 	var rawResp any
 	var err error
+	mw.StartUpstream(hreq.Context())
 	if a.breaker != nil {
 		rawResp, err = a.breaker.Execute(exec)
 	} else {
 		rawResp, err = exec()
 	}
 	if err != nil {
+		mw.EndUpstream(hreq.Context(), 0)
 		return nil, err
 	}
-	resp, _ := rawResp.(*http.Response)
+	resp, ok := rawResp.(*http.Response)
+	if !ok || resp == nil {
+		mw.EndUpstream(hreq.Context(), 0)
+		return nil, fmt.Errorf("docling: breaker returned unexpected %T (want *http.Response)", rawResp)
+	}
+	mw.EndUpstream(hreq.Context(), resp.StatusCode)
 	body, headers, err := maybeNormalize(resp)
 	if err != nil {
 		_ = resp.Body.Close()
@@ -237,17 +248,13 @@ func normalizeNullContent(raw []byte) []byte {
 	return out
 }
 
-// ApplyAuth stamps the configured auth header onto the outbound
-// request. Exported so the docling-external composite can reuse it.
+// ApplyAuth is a thin shim around authutil.Apply for callers that
+// don't have an engine name or AuthMetrics handle (notably the
+// doclingexternal composite, which used to live inside this package).
+// Production call sites should prefer authutil.Apply directly so the
+// outcome metric is recorded.
 func ApplyAuth(h http.Header, cfg config.EngineConfig) {
-	if cfg.APIKey == "" || cfg.AuthHeader == "" {
-		return
-	}
-	value := string(cfg.APIKey)
-	if cfg.AuthScheme == "bearer" {
-		value = "Bearer " + value
-	}
-	h.Set(cfg.AuthHeader, value)
+	authutil.Apply(h, "", cfg, authutil.Nop{})
 }
 
 // ApplyForwardHeaders copies an allowlist of caller-supplied request
@@ -287,31 +294,19 @@ func CreateFilePart(mw *multipart.Writer, field, filename, contentType string) (
 	return mw.CreatePart(h)
 }
 
-// SafeMultipartFilename sanitises a user-supplied filename. Returns ""
-// for inputs containing CR/LF/NUL or any byte outside printable ASCII
-// (H5). Caller substitutes a placeholder ("upload") in that case.
+// SafeMultipartFilename is a thin shim around compatutil so sibling
+// adapters (doclingexternal composite) still find the symbol where it
+// historically lived. Prefer compatutil.SafeMultipartFilename in new
+// code.
 func SafeMultipartFilename(name string) string {
-	for i := 0; i < len(name); i++ {
-		b := name[i]
-		if b < 0x20 || b > 0x7E {
-			return ""
-		}
-	}
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(name)
+	return compatutil.SafeMultipartFilename(name)
 }
 
-// JoinURL appends p to base, ensuring a single slash between them.
-// Exported so sibling adapters reuse the same URL composition.
+// JoinURL is a thin shim around compatutil.JoinURL kept for sibling
+// adapters that imported docling.JoinURL when this package owned the
+// canonical copy.
 func JoinURL(base, p string) (string, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("invalid url: %w", err)
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	u.Path = strings.TrimRight(u.Path, "/") + p
-	return u.String(), nil
+	return compatutil.JoinURL(base, p)
 }
 
 func healthPath(p string) string {

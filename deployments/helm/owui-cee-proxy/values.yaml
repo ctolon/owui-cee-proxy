@@ -32,13 +32,23 @@ containerSecurityContext:
   capabilities:
     drop: ["ALL"]
 
+# Performance budget (CLAUDE.md): 512 MiB ceiling under 100 concurrent
+# requests of 10 MiB bodies. The request must reserve enough headroom
+# for the kubelet not to OOM-kill the pod under realistic load —
+# 128Mi WAS the historical default and routinely OOM-killed at ≥30
+# concurrent uploads. 256Mi is the validated floor.
 resources:
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 256Mi
   limits:
     cpu: 1000m
     memory: 512Mi
+
+# Pod-level grace period. Should match observability-relevant
+# shutdown_grace in config; the Helm template substitutes this value
+# verbatim into the Pod spec so kubelet waits before SIGKILL.
+terminationGracePeriodSeconds: 30
 
 service:
   type: ClusterIP
@@ -93,7 +103,13 @@ serviceMonitor:
   enabled: false
   interval: 30s
   scrapeTimeout: 10s
-  labels: {}
+  # Prometheus Operator selects ServiceMonitor objects by label. The
+  # most common production wiring is the kube-prometheus-stack release
+  # name; override per-cluster (e.g., release: prometheus). Empty map
+  # leaves the ServiceMonitor labelless — many Operator instances
+  # will then SKIP it silently.
+  labels:
+    release: kube-prometheus
 
 # ── application configuration ────────────────────────────────────────
 config:
@@ -139,6 +155,14 @@ config:
       request_timeout: 120s
       health_path: "/health"
       mime_types: []
+      # Per-engine overrides for observability.upstream defaults.
+      # Uncomment any field to override; omitted fields inherit global.
+      # observability:
+      #   enabled: true
+      #   body_snippet_bytes: 512
+      #   level_4xx: "info"        # dial down for known-flaky backends
+      #   level_5xx: "error"
+      #   body_log_bytes: 0
     fallback-kreuzberg:
       enable: false
       compat_type: "docling"
@@ -168,7 +192,44 @@ config:
     log:
       level: "info"
       format: "json"
+      # BurstSampler caps log volume at 5 events/level/sec. Enable when
+      # debug-heavy outbound logging would otherwise saturate the log
+      # pipeline; keep off in normal info-level operation.
+      sampling: false
       add_caller: true
+      # Timezone applied to log timestamps. Accepts IANA names, "UTC",
+      # or "Local". Invalid values fall back to UTC with a stderr
+      # warning. Example: "Europe/Istanbul".
+      timezone: "UTC"
+      # Timestamp serialisation. Aliases: RFC3339Nano (default), RFC3339,
+      # unix, unix_ms, unix_micro. Any other value is treated as a Go
+      # layout literal (e.g. "2006-01-02 15:04:05.000Z07:00").
+      time_format: "RFC3339Nano"
+      # Paths the AccessLog middleware skips entirely. Default empty
+      # (log everything). Set this to mute readiness/health/metrics
+      # probes if they dominate your log shipper.
+      silence_paths: []
+      # silence_paths: ["/healthz", "/readyz", "/metrics"]
+      #
+      # When true, the readiness handler marks every engine.Health()
+      # probe context as silent — the instrumented HTTP transport
+      # then drops its outbound_engine_request debug line for those
+      # calls. Status / auth counters still fire.
+      silence_engine_health: false
+      # Remap zerolog's canonical field names to match your log
+      # shipper's schema. Empty strings keep the upstream default.
+      field_names: {}
+      # field_names:
+      #   level: severity        # GCP Cloud Logging convention
+      #   message: msg
+      #   timestamp: ts
+      #
+      # Static fields appended to EVERY log line via logger.With().
+      # Use for service/env/pod identity stamps.
+      static_fields: {}
+      # static_fields:
+      #   service: owui-cee-proxy
+      #   env: prod
     metrics:
       enabled: true
       path: "/metrics"
@@ -177,6 +238,20 @@ config:
       otlp_endpoint: "http://otel-collector:4318"
       sample_ratio: 0.1
       service_name: "owui-cee-proxy"
+    # Upstream-response observability: per-engine 4xx/5xx logging plus
+    # the new engine_upstream_status / engine_auth_attached counters.
+    # These are global defaults; each engine may override via
+    # `engines.<name>.observability` (see below).
+    upstream:
+      enabled: true
+      body_snippet_bytes: 256        # 0 to disable body snippet
+      level_4xx: "warn"              # one of: trace debug info warn error
+      level_5xx: "error"
+      # body_log_bytes: outbound REQUEST body snippet captured by the
+      # logging transport at DEBUG level. 0=off. WARNING: any value >0
+      # writes upload contents to the log stream — set ONLY for an
+      # ephemeral debugging session.
+      body_log_bytes: 0
 
 # Secrets are sourced from existing Secret(s); do NOT put values here.
 secrets:

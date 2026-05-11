@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,13 +45,13 @@ func TestLoad_ValidYAML(t *testing.T) {
 	require.Equal(t, "http://docling.local:5001", main.URL)
 	require.Equal(t, Secret("docling-secret"), main.APIKey)
 	require.Equal(t, "X-Api-Key", main.AuthHeader)
-	require.Equal(t, "raw", main.AuthScheme)
+	require.Equal(t, AuthSchemeRaw, main.AuthScheme)
 
 	kb := c.Engines["fallback"]
 	require.Equal(t, CompatDocling, kb.CompatType)
 	require.Equal(t, Secret("kreuzberg-secret"), kb.APIKey)
 	require.Equal(t, "Authorization", kb.AuthHeader)
-	require.Equal(t, "bearer", kb.AuthScheme)
+	require.Equal(t, AuthSchemeBearer, kb.AuthScheme)
 
 	require.Len(t, c.Security.ProxyAPIKeys, 3)
 }
@@ -178,6 +179,176 @@ func TestSecret_RedactsInJSON(t *testing.T) {
 	b, err = json.Marshal(wrapper{Token: ""})
 	require.NoError(t, err)
 	require.Equal(t, `{"token":""}`, string(b))
+}
+
+// TestResolveSecrets_MissingEnvLeavesAPIKeyEmpty pins the silent-failure
+// mode the user hits when api_key_env is set but the named env var
+// isn't exported into the container/Pod (e.g., Helm Secret not mounted,
+// Secret key name doesn't match, pod not rolled after Secret update).
+// The proxy intentionally does NOT error out — the engine may legitimately
+// be public — but operators MUST be able to tell from the resulting empty
+// APIKey that the wiring is broken. Without this test, a refactor that
+// throws on missing env vars would silently regress the "engine without
+// auth" deployment.
+func TestResolveSecrets_MissingEnvLeavesAPIKeyEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(validYAML), 0o600))
+
+	// Ensure the env vars are NOT set for this test (t.Setenv is unset
+	// at teardown but we never set it). Explicitly Unsetenv to defeat
+	// any pollution from a prior test in the same process.
+	require.NoError(t, os.Unsetenv("DOCLING_API_KEY"))
+	require.NoError(t, os.Unsetenv("KREUZBERG_API_KEY"))
+	require.NoError(t, os.Unsetenv("PROXY_API_KEYS"))
+
+	c, err := Load(path)
+	require.NoError(t, err, "missing api_key_env env vars must not fail Load")
+	require.Equal(t, Secret(""), c.Engines["main"].APIKey,
+		"unresolved api_key_env must leave APIKey empty; adapters skip the auth header on empty")
+	require.Equal(t, Secret(""), c.Engines["fallback"].APIKey)
+	require.Empty(t, c.Security.ProxyAPIKeys,
+		"unresolved proxy_api_keys_env must leave ProxyAPIKeys empty")
+}
+
+// TestResolveSecrets_NoAPIKeyEnvLeavesAPIKeyEmpty covers the OTHER
+// silent path: the YAML doesn't declare api_key_env at all (matches
+// deployments/docker/test-proxy-config.yaml as of v0.2.0). The proxy
+// won't look up any env var, even if one is set. This is the
+// configuration error most commonly reported as "I set DOCLING_API_KEY
+// but the proxy isn't forwarding it" — the fix is to add
+// `api_key_env: DOCLING_API_KEY` to the engine stanza.
+func TestResolveSecrets_NoAPIKeyEnvLeavesAPIKeyEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v.yaml")
+	yamlNoEnv := `
+server:
+  listen: "0.0.0.0:8080"
+routing:
+  default_engine: "main"
+  facade:
+    docling:
+      enabled: true
+    external:
+      enabled: false
+engines:
+  main:
+    enable: true
+    compat_type: "docling"
+    url: "http://docling.local:5001"
+    auth_header: "X-Api-Key"
+`
+	require.NoError(t, os.WriteFile(path, []byte(yamlNoEnv), 0o600))
+
+	// Even with the env var set, the proxy should NOT pick it up
+	// because the YAML never declared api_key_env.
+	t.Setenv("DOCLING_API_KEY", "this-should-be-ignored")
+
+	c, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, Secret(""), c.Engines["main"].APIKey,
+		"missing api_key_env in YAML means proxy never reads any env var, even if one is set")
+}
+
+// TestSecretMasking_LeakProtection guarantees that Secret values are
+// never written verbatim to logs/JSON, regardless of how an adapter
+// or middleware accidentally tries to format them. Defence in depth
+// against an operator running with debug-level logging or dumping
+// config in an incident.
+func TestSecretMasking_LeakProtection(t *testing.T) {
+	t.Parallel()
+	s := Secret("super-secret-do-not-leak")
+
+	require.Equal(t, "***", s.String(), "Stringer must mask")
+
+	b, err := s.MarshalJSON()
+	require.NoError(t, err)
+	require.Equal(t, `"***"`, string(b))
+
+	b2, err := s.MarshalText()
+	require.NoError(t, err)
+	require.Equal(t, "***", string(b2))
+
+	// And the empty Secret stays empty (no spurious "***" when no
+	// secret was configured — operators rely on the empty signal).
+	require.Equal(t, "", Secret("").String())
+}
+
+// TestResolveUpstream_GlobalFallback confirms per-engine fields fall
+// back to the global defaults when nil. A regression that copies the
+// zero value rather than inheriting would silently disable upstream
+// logging for any engine that doesn't override anything.
+func TestResolveUpstream_GlobalFallback(t *testing.T) {
+	t.Parallel()
+	global := UpstreamLogConfig{
+		Enabled: true, BodySnippetBytes: 256, Level4xx: "warn", Level5xx: "error", BodyLogBytes: 0,
+	}
+	ec := EngineConfig{} // no overrides
+	got := ec.ResolveUpstream(global)
+	require.Equal(t, global, got, "empty override must produce the global config")
+}
+
+// TestResolveUpstream_PerEngineOverride verifies each pointer-typed
+// override field is honoured individually (a *bool to false MUST
+// disable, even when global default is true).
+func TestResolveUpstream_PerEngineOverride(t *testing.T) {
+	t.Parallel()
+	global := UpstreamLogConfig{
+		Enabled: true, BodySnippetBytes: 256, Level4xx: "warn", Level5xx: "error",
+	}
+	falseV := false
+	bs := 1024
+	lv := "info"
+	bl := 512
+	ec := EngineConfig{
+		Observability: EngineObservabilityConfig{
+			Enabled:          &falseV,
+			BodySnippetBytes: &bs,
+			Level4xx:         &lv,
+			BodyLogBytes:     &bl,
+		},
+	}
+	got := ec.ResolveUpstream(global)
+	require.False(t, got.Enabled, "explicit false override must win over global true")
+	require.Equal(t, 1024, got.BodySnippetBytes)
+	require.Equal(t, "info", got.Level4xx)
+	require.Equal(t, "error", got.Level5xx, "non-overridden Level5xx must inherit global")
+	require.Equal(t, 512, got.BodyLogBytes)
+}
+
+// TestAuthWarnings covers the validation surface that catches the
+// user's actual silent-failure: api_key_env set but env var empty.
+func TestAuthWarnings(t *testing.T) {
+	t.Parallel()
+	c := &Config{
+		Engines: map[string]EngineConfig{
+			"happy": {
+				Enable: true, CompatType: CompatDocling,
+				AuthHeader: "X-Api-Key", APIKeyEnv: "K", APIKey: "v",
+			},
+			"silent_missing_env": {
+				Enable: true, CompatType: CompatDocling,
+				AuthHeader: "X-Api-Key", APIKeyEnv: "K_MISSING", APIKey: "",
+			},
+			"no_env_var_but_header": {
+				Enable: true, CompatType: CompatDocling,
+				AuthHeader: "X-Api-Key", APIKeyEnv: "", APIKey: "",
+			},
+			"disabled_engine_skipped": {
+				Enable: false, CompatType: CompatDocling,
+				AuthHeader: "X-Api-Key", APIKeyEnv: "",
+			},
+		},
+	}
+	got := c.AuthWarnings()
+	require.Len(t, got, 2, "exactly 2 enabled engines have asymmetric auth config")
+	joined := strings.Join(got, "\n")
+	require.Contains(t, joined, "silent_missing_env")
+	require.Contains(t, joined, "K_MISSING")
+	require.Contains(t, joined, "no_env_var_but_header")
+	require.NotContains(t, joined, "disabled_engine_skipped",
+		"disabled engines must not produce warnings")
+	require.NotContains(t, joined, "happy", "happy path must not produce a warning")
 }
 
 func TestAcceptedFacades(t *testing.T) {

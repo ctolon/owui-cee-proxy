@@ -219,3 +219,136 @@ func TestDocling_SafeMultipartFilename_RejectsCRLF(t *testing.T) {
 	require.Equal(t, "", docling.SafeMultipartFilename("x\x00y.txt"))
 	require.Equal(t, `x\"y.txt`, docling.SafeMultipartFilename(`x"y.txt`))
 }
+
+// TestDocling_Convert_NoAPIKeyDoesNotStampAuthHeader pins the
+// contract: when api_key_env is unset (or resolves to empty), the
+// proxy MUST NOT stamp the configured auth header. A header with an
+// empty value would still be sent and some backends treat the
+// presence of "X-Api-Key:" as an attempted auth, returning 401.
+func TestDocling_Convert_NoAPIKeyDoesNotStampAuthHeader(t *testing.T) {
+	t.Parallel()
+
+	var sawAuthHeader bool
+	var rawHeaderValue string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, sawAuthHeader = r.Header["X-Api-Key"]
+		rawHeaderValue = r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	a := newDoclingAdapter(t, srv.URL, func(c *config.EngineConfig) {
+		c.APIKey = "" // simulate unresolved api_key_env
+	})
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade: engine.FacadeDocling,
+		Files: []engine.FileBlob{{
+			Filename: "x.txt", ContentType: "text/plain", Body: strings.NewReader("hi"),
+		}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.False(t, sawAuthHeader, "X-Api-Key must not be set when APIKey is empty (got %q)", rawHeaderValue)
+}
+
+// TestDocling_Convert_EmptyAuthHeaderDoesNotStampEvenWithKey pins
+// the inverse: a non-empty APIKey paired with an empty AuthHeader
+// must not stamp anything. There's no canonical header to use, so
+// silently doing nothing is the only safe choice.
+func TestDocling_Convert_EmptyAuthHeaderDoesNotStampEvenWithKey(t *testing.T) {
+	t.Parallel()
+
+	var headerCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Count any header that looks key-ish to catch a regression
+		// that picks an arbitrary fallback header.
+		for k := range r.Header {
+			lower := strings.ToLower(k)
+			if strings.Contains(lower, "api") || strings.Contains(lower, "auth") || strings.Contains(lower, "key") {
+				headerCount++
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	a := newDoclingAdapter(t, srv.URL, func(c *config.EngineConfig) {
+		c.AuthHeader = ""
+	})
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade: engine.FacadeDocling,
+		Files: []engine.FileBlob{{
+			Filename: "x.txt", ContentType: "text/plain", Body: strings.NewReader("hi"),
+		}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Zero(t, headerCount, "no auth-like header should appear when AuthHeader is empty")
+}
+
+// TestDocling_Convert_SourceModeAppliesAuth ensures the convertSource
+// (JSON, /v1/convert/source) path applies auth identically to the
+// file path. Without this test a regression that only wires ApplyAuth
+// into convertFile would slip past CI.
+func TestDocling_Convert_SourceModeAppliesAuth(t *testing.T) {
+	t.Parallel()
+
+	var seenAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	a := newDoclingAdapter(t, srv.URL, nil)
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade:  engine.FacadeDocling,
+		Sources: []engine.HTTPSource{{URL: "https://example.com/x.pdf"}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, "the-key", seenAuth, "source-mode requests must also receive the configured API key")
+}
+
+// TestApplyAuth_TableDriven covers the standalone helper that is also
+// reused by sibling adapters (doclingexternal composite).
+func TestApplyAuth_TableDriven(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		key        string
+		header     string
+		scheme     string
+		wantHeader string // empty means: header must not be present
+		wantValue  string
+	}{
+		{name: "raw with key", key: "secret123", header: "X-Api-Key", scheme: "raw", wantHeader: "X-Api-Key", wantValue: "secret123"},
+		{name: "bearer with key", key: "secret123", header: "Authorization", scheme: "bearer", wantHeader: "Authorization", wantValue: "Bearer secret123"},
+		{name: "empty key omits header", key: "", header: "X-Api-Key", scheme: "raw"},
+		{name: "empty header omits stamping", key: "secret123", header: "", scheme: "raw"},
+		{name: "unknown scheme falls back to raw", key: "secret123", header: "X-Api-Key", scheme: "weird", wantHeader: "X-Api-Key", wantValue: "secret123"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := http.Header{}
+			docling.ApplyAuth(h, config.EngineConfig{
+				APIKey:     config.Secret(tc.key),
+				AuthHeader: tc.header,
+				AuthScheme: config.AuthScheme(tc.scheme),
+			})
+			if tc.wantHeader == "" {
+				require.Empty(t, h, "no headers expected, got %+v", h)
+				return
+			}
+			require.Equal(t, tc.wantValue, h.Get(tc.wantHeader))
+		})
+	}
+}

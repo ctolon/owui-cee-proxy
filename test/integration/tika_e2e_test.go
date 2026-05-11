@@ -118,13 +118,20 @@ func TestTika_PassthroughReturnsNativeJSON(t *testing.T) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, proxy.URL+"/tika/tika/text", bytes.NewReader(contents))
 	require.NoError(t, err)
 	httpReq.Header.Set("Content-Type", "text/plain")
-	httpReq.Header.Set("Accept", "text/plain")
+	// Accept */* — Tika 3.x removed text/plain from the supported
+	// response media types for /tika/text and now returns 406 if we
+	// pin the legacy "Accept: text/plain" Tika 2 used to accept.
+	// */* lets the server negotiate (application/json by default).
+	httpReq.Header.Set("Accept", "*/*")
 	resp, err := newClient().Do(httpReq)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
-	require.Contains(t, string(body), "hello") // sample.txt contains "hello"
+	// Tika 2 returned plain text; Tika 3 returns a JSON envelope
+	// with a "X-TIKA:content" field. Either way the extracted text
+	// from sample.txt — which is the word "hello" — must appear.
+	require.Contains(t, string(body), "hello")
 }
 
 func buildMultipart(t *testing.T, path, field string) (io.Reader, string) {

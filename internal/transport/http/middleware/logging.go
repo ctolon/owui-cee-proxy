@@ -18,12 +18,30 @@ import (
 // is being processed. Because the *pointer* is what travels in the
 // context, the middleware sees the handler's updates after ServeHTTP
 // returns.
+//
+// Timing fields:
+//
+//	upstreamStart  — set by StartUpstream when the adapter dispatches
+//	                 to the engine backend
+//	upstreamDur    — set by EndUpstream once the adapter has the
+//	                 response (or an error); zero means "engine call
+//	                 never happened" (request rejected upstream)
+//	upstreamStatus — backend HTTP status; 0 means "no response /
+//	                 transport error"
+//	ttfb           — wall-clock time from the start of AccessLog to
+//	                 the first WriteHeader (captures handler time
+//	                 spent assembling the response before bytes flow)
 type requestMeta struct {
-	mu        sync.Mutex
-	engine    string
-	engineURL string
-	filename  string
-	fileCount int
+	mu             sync.Mutex
+	engine         string
+	engineURL      string
+	filename       string
+	mimeType       string
+	fileCount      int
+	upstreamStart  time.Time
+	upstreamDur    time.Duration
+	upstreamStatus int
+	ttfb           time.Duration
 }
 
 type metaKey struct{}
@@ -65,6 +83,111 @@ func WithFileCount(ctx context.Context, n int) context.Context {
 	return ctx
 }
 
+// WithMimeType records the inbound Content-Type the proxy picked up
+// from the first file part (multipart facade) or from the request
+// header (external PUT facade). Surfaced as the `mime_type` field on
+// the request_completed access log line and the
+// engine_upstream_status / outbound_engine_request debug lines so
+// operators can group "this MIME type 4xx'd" without reverse-mapping
+// from filename extensions.
+func WithMimeType(ctx context.Context, ct string) context.Context {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		m.mimeType = ct
+		m.mu.Unlock()
+	}
+	return ctx
+}
+
+// MimeTypeFrom reads back the recorded MIME type. Used by handlers
+// that need to enrich a downstream log line (e.g., upstream-error
+// builder).
+func MimeTypeFrom(ctx context.Context) string {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.mimeType
+	}
+	return ""
+}
+
+// StartUpstream records the moment an adapter begins dispatching to
+// its backend. Call it as the LAST thing before client.HTTP.Do (or
+// the equivalent) so the recorded duration is the wall-clock cost of
+// the network round-trip + backend processing — not the time spent
+// assembling the request body.
+func StartUpstream(ctx context.Context) {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		m.upstreamStart = time.Now()
+		m.mu.Unlock()
+	}
+}
+
+// EndUpstream records the response status and elapsed time since the
+// matching StartUpstream call. status=0 signals a transport-level
+// failure (no HTTP response). Safe to call without a prior
+// StartUpstream — the duration is zero in that case.
+func EndUpstream(ctx context.Context, status int) {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		if !m.upstreamStart.IsZero() {
+			m.upstreamDur = time.Since(m.upstreamStart)
+		}
+		m.upstreamStatus = status
+		m.mu.Unlock()
+	}
+}
+
+// UpstreamStatusFrom returns the backend HTTP status recorded by the
+// adapter via EndUpstream, or 0 if no upstream call occurred (or it
+// failed before producing a response). Used by handlers that need to
+// decide whether to emit an "upstream error" log line.
+func UpstreamStatusFrom(ctx context.Context) int {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.upstreamStatus
+	}
+	return 0
+}
+
+// UpstreamDurationFrom returns the wall-clock duration of the most
+// recent engine call (StartUpstream → EndUpstream window), or 0 if
+// no upstream call occurred.
+func UpstreamDurationFrom(ctx context.Context) time.Duration {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.upstreamDur
+	}
+	return 0
+}
+
+// silenceLogKey is the context key used by readiness/health handlers
+// to ask downstream observability layers (AccessLog, instrumented
+// HTTP transport) to drop their per-request log line. Metrics are
+// NEVER suppressed by this flag — only the verbose logs are.
+type silenceLogKey struct{}
+
+// WithSilenceLog returns a ctx whose downstream log emitters skip
+// emission. Use in the readiness/health handler to mute the engine
+// health probes that fire every few seconds when k8s polls /readyz.
+func WithSilenceLog(ctx context.Context) context.Context {
+	return context.WithValue(ctx, silenceLogKey{}, true)
+}
+
+// IsLogSilenced reports whether ctx is marked silent. Both AccessLog
+// and InstrumentedTransport consult this before emitting their
+// per-request log lines. Defensive against nil ctx.
+func IsLogSilenced(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(silenceLogKey{}).(bool)
+	return v
+}
+
 func engineFrom(ctx context.Context) (string, string) {
 	m := metaFrom(ctx)
 	if m == nil {
@@ -78,7 +201,28 @@ func engineFrom(ctx context.Context) (string, string) {
 // AccessLog emits a structured stdout log entry for every completed
 // request. The engine + filename fields fulfil the project requirement
 // "stdouttan hangi dosya hangi engine'e yönlendirilmiş anlayabilmeliyim".
-func AccessLog(logger zerolog.Logger) func(http.Handler) http.Handler {
+//
+// Emitted timing fields (all milliseconds, rounded to nearest int):
+//
+//	total_ms             — wall-clock from middleware entry to handler return
+//	time_to_first_byte_ms — middleware entry → first WriteHeader/Write
+//	upstream_ms          — adapter's StartUpstream → EndUpstream window
+//	                       (0 if no upstream call took place)
+//	upstream_status      — backend HTTP status (0 = no response)
+//
+// silencePaths is the operator-supplied allowlist of paths whose
+// per-request log lines should be dropped (typical: /healthz, /readyz,
+// /metrics). The middleware still installs requestMeta and tracks
+// timing fields — only the final emission is skipped — so a handler
+// that opts into emission later (via WithSilenceLog inverted) still
+// works downstream. Compared by exact path match.
+func AccessLog(logger zerolog.Logger, silencePaths ...string) func(http.Handler) http.Handler {
+	silenceSet := make(map[string]struct{}, len(silencePaths))
+	for _, p := range silencePaths {
+		if p != "" {
+			silenceSet[p] = struct{}{}
+		}
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			meta := &requestMeta{}
@@ -86,12 +230,28 @@ func AccessLog(logger zerolog.Logger) func(http.Handler) http.Handler {
 			r = r.WithContext(ctx)
 
 			start := time.Now()
-			rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+			rw := &responseWriter{
+				ResponseWriter: w,
+				status:         http.StatusOK,
+				start:          start,
+				meta:           meta,
+			}
 			next.ServeHTTP(rw, r)
+			total := time.Since(start)
+
+			// Suppression: either the path is in the operator's mute
+			// list, or a handler explicitly marked this ctx silent
+			// (typically the readiness handler wrapping engine probes).
+			if _, muted := silenceSet[r.URL.Path]; muted || IsLogSilenced(r.Context()) {
+				return
+			}
 
 			meta.mu.Lock()
 			engineName, engineURL := meta.engine, meta.engineURL
 			filename, fileCount := meta.filename, meta.fileCount
+			mimeType := meta.mimeType
+			upstreamDur, upstreamStatus := meta.upstreamDur, meta.upstreamStatus
+			ttfb := meta.ttfb
 			meta.mu.Unlock()
 
 			ev := logger.Info()
@@ -107,11 +267,16 @@ func AccessLog(logger zerolog.Logger) func(http.Handler) http.Handler {
 				Str("path", r.URL.Path).
 				Int("status", rw.status).
 				Int64("bytes_out", rw.bytes).
-				Dur("duration", time.Since(start)).
+				Dur("duration", total).
+				Int64("total_ms", total.Milliseconds()).
+				Int64("time_to_first_byte_ms", ttfb.Milliseconds()).
+				Int64("upstream_ms", upstreamDur.Milliseconds()).
+				Int("upstream_status", upstreamStatus).
 				Str("remote_addr", r.RemoteAddr).
 				Str("engine", engineName).
 				Str("engine_url", engineURL).
 				Str("filename", filename).
+				Str("mime_type", mimeType).
 				Int("file_count", fileCount).
 				Msg("request_completed")
 		})
@@ -132,11 +297,31 @@ type responseWriter struct {
 	status    int
 	bytes     int64
 	writeOnce sync.Once
+	// start + meta let the writer record the time-to-first-byte
+	// against the parent requestMeta without forcing handlers to
+	// thread a separate "I'm about to write" hook.
+	start time.Time
+	meta  *requestMeta
+}
+
+// recordTTFB writes the time-to-first-byte into the request meta the
+// first time it's called. Defensive against missing meta (legacy
+// tests that build a responseWriter without going through AccessLog).
+func (r *responseWriter) recordTTFB() {
+	if r.meta == nil || r.start.IsZero() {
+		return
+	}
+	r.meta.mu.Lock()
+	if r.meta.ttfb == 0 {
+		r.meta.ttfb = time.Since(r.start)
+	}
+	r.meta.mu.Unlock()
 }
 
 func (r *responseWriter) WriteHeader(status int) {
 	r.writeOnce.Do(func() {
 		r.status = status
+		r.recordTTFB()
 		r.ResponseWriter.WriteHeader(status)
 	})
 }
@@ -147,6 +332,7 @@ func (r *responseWriter) Write(b []byte) (int, error) {
 	// (incorrect) WriteHeader call doesn't try to overwrite it.
 	r.writeOnce.Do(func() {
 		// Status stays at the default (200) set in the constructor.
+		r.recordTTFB()
 	})
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += int64(n)

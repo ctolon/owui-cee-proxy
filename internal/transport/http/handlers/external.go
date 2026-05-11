@@ -9,7 +9,9 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
@@ -31,6 +33,9 @@ type External struct {
 	// MaxBytes caps the spooled body (0 disables; the global BodyLimit
 	// middleware also enforces a request-wide cap).
 	MaxBytes int64
+	// UpstreamLog mirrors Convert.UpstreamLog — per-engine policy
+	// resolver for non-2xx response logging.
+	UpstreamLog func(engineName string) config.UpstreamLogConfig
 }
 
 func (e *External) Process(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +61,7 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 
 	req := &engine.ConvertRequest{
 		Facade:    engine.FacadeExternal,
-		Headers:   r.Header.Clone(),
+		Headers:   compatutil.AllowlistedHeaders(r.Header),
 		RequestID: mw.IDFrom(r.Context()),
 		Files: []engine.FileBlob{{
 			Filename:    filename,
@@ -72,9 +77,10 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := mw.WithEngine(r.Context(), string(eng.Name()), "")
+	ctx := mw.WithEngine(r.Context(), string(eng.Name()), eng.URL())
 	ctx = mw.WithFilename(ctx, filename)
 	ctx = mw.WithFileCount(ctx, 1)
+	ctx = mw.WithMimeType(ctx, contentType)
 
 	resp, err := eng.Convert(ctx, req)
 	if err != nil {
@@ -83,9 +89,14 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 			Str("event", "engine_convert_failed").
 			Str("request_id", req.RequestID).
 			Str("engine", string(eng.Name())).
+			Str("engine_url", eng.URL()).
 			Msg("external facade engine convert failed")
 		http.Error(w, fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID), http.StatusBadGateway)
 		return
+	}
+	if e.UpstreamLog != nil {
+		resp = logUpstreamStatus(ctx, e.Logger, resp, e.UpstreamLog(string(eng.Name())),
+			string(eng.Name()), eng.URL(), req.RequestID, filename)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
