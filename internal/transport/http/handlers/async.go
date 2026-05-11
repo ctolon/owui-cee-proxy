@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	"github.com/ctolon/owui-cee-proxy/internal/tasks"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
@@ -48,10 +49,7 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 	payload, cleanup, err := tasks.PayloadFromRequest(r, source, a.maxBlobBytes())
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"status": "failure",
-			"errors": []map[string]string{{"message": err.Error()}},
-		})
+		writeJSON(w, http.StatusBadRequest, respond.NewDoclingError(err.Error()))
 		return
 	}
 	defer cleanup()
@@ -69,14 +67,13 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	// Redis round-trip. This replaces the old hard-coded
 	// "engine == Docling" check with the generic capability lookup.
 	if source && len(payload.Sources) > 0 && !eng.Capabilities().HTTPSources {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"status": "failure",
-			"errors": []map[string]string{{"message": fmt.Sprintf("engine %s does not support http_sources", eng.Name())}},
-		})
+		writeJSON(w, http.StatusBadRequest, respond.NewDoclingError(
+			fmt.Sprintf("engine %s does not support http_sources", eng.Name()),
+		))
 		return
 	}
 
-	ctx := mw.WithEngine(r.Context(), string(eng.Name()), "")
+	ctx := mw.WithEngine(r.Context(), string(eng.Name()), eng.URL())
 	payload.Engine = string(eng.Name())
 	payload.RequestID = mw.IDFrom(ctx)
 
@@ -89,22 +86,27 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	if err != nil {
 		// Blob limit / per-blob validation errors map to 400.
 		if isClientError(err) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"status": "failure",
-				"errors": []map[string]string{{"message": err.Error()}},
-			})
+			writeJSON(w, http.StatusBadRequest, respond.NewDoclingError(err.Error()))
 			return
 		}
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"status": "failure",
-			"errors": []map[string]string{{"message": fmt.Sprintf("enqueue: %v", err)}},
-		})
+		writeJSON(
+			w, http.StatusServiceUnavailable,
+			respond.NewDoclingError(fmt.Sprintf("enqueue: %v", err)),
+		)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"task_id":     token,
-		"task_status": "pending",
+	writeJSON(w, http.StatusAccepted, asyncAcceptedResponse{
+		TaskID:     token,
+		TaskStatus: "pending",
 	})
+}
+
+// asyncAcceptedResponse is the 202 envelope returned when a task is
+// enqueued. Hard-coding the shape here lets callers consume it via
+// json.Unmarshal without guessing at the field names.
+type asyncAcceptedResponse struct {
+	TaskID     string `json:"task_id"`
+	TaskStatus string `json:"task_status"`
 }
 
 func (a *Async) Poll(w http.ResponseWriter, r *http.Request) {

@@ -41,6 +41,11 @@ func New(name engine.Name, cfg config.EngineConfig, client *httpclient.Client, b
 
 func (a *Adapter) Name() engine.Name { return a.name }
 
+// URL is delegated to the docling child; both children share the same
+// base URL (the composite mandates identical URL across the two
+// endpoint paths) so either is canonical.
+func (a *Adapter) URL() string { return a.doc.URL() }
+
 func (a *Adapter) Capabilities() engine.EngineCapabilities {
 	return engine.EngineCapabilities{
 		Facades:     []engine.Facade{engine.FacadeDocling, engine.FacadeExternal},

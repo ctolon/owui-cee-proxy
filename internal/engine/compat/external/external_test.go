@@ -177,6 +177,86 @@ func TestExternal_Capabilities(t *testing.T) {
 	require.False(t, caps.HTTPSources, "external loader does not support http sources")
 }
 
+// TestExternal_Convert_NoAPIKeyDoesNotStampAuth pins the contract:
+// an unresolved api_key_env must NOT translate into an outbound
+// `Authorization:` header. OpenWebUI-side loaders treat the mere
+// presence of the header as an auth attempt.
+func TestExternal_Convert_NoAPIKeyDoesNotStampAuth(t *testing.T) {
+	t.Parallel()
+
+	var sawAuth bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, sawAuth = r.Header["Authorization"]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"page_content":"ok"}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.EngineConfig{
+		Enable:         true,
+		CompatType:     config.CompatExternal,
+		URL:            srv.URL,
+		APIKey:         "", // unresolved
+		AuthHeader:     "Authorization",
+		AuthScheme:     "bearer",
+		RequestTimeout: 5 * time.Second,
+	}
+	c, err := httpclient.New(cfg)
+	require.NoError(t, err)
+	a, err := external.New("ext-noauth", cfg, c, nil)
+	require.NoError(t, err)
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade: engine.FacadeExternal,
+		Files: []engine.FileBlob{{
+			Filename: "x.txt", ContentType: "text/plain", Body: strings.NewReader("hi"),
+		}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.False(t, sawAuth, "Authorization header must not be sent when APIKey is empty")
+}
+
+// TestExternal_Convert_RawSchemeForwardsAsIs covers the non-default
+// scheme: when an operator chooses auth_scheme: raw, the literal key
+// is sent without a "Bearer " prefix even though the external loader
+// contract defaults to bearer.
+func TestExternal_Convert_RawSchemeForwardsAsIs(t *testing.T) {
+	t.Parallel()
+
+	var seenAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("X-Token")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"page_content":"ok"}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.EngineConfig{
+		Enable:         true,
+		CompatType:     config.CompatExternal,
+		URL:            srv.URL,
+		APIKey:         "raw-value",
+		AuthHeader:     "X-Token",
+		AuthScheme:     "raw",
+		RequestTimeout: 5 * time.Second,
+	}
+	c, err := httpclient.New(cfg)
+	require.NoError(t, err)
+	a, err := external.New("ext-raw", cfg, c, nil)
+	require.NoError(t, err)
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade: engine.FacadeExternal,
+		Files: []engine.FileBlob{{
+			Filename: "x.txt", ContentType: "text/plain", Body: strings.NewReader("hi"),
+		}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, "raw-value", seenAuth, "raw scheme must NOT prepend Bearer")
+}
+
 func TestExternal_ContractTests(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

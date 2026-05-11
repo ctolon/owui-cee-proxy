@@ -18,7 +18,12 @@ import (
 
 // New returns a *httputil.ReverseProxy that mounts the entire request
 // onto baseURL after stripping prefix from the path. apiKeyHeader and
-// apiKey, when non-empty, are injected on the outbound request.
+// apiKey, when non-empty, are injected on the outbound request;
+// authScheme controls how apiKey is rendered: "bearer" prepends
+// "Bearer ", anything else (including "" and "raw") sends the literal
+// key. This mirrors the facade-path scheme honoured by
+// internal/engine/authutil.Apply so passthrough mounts and adapters
+// stamp identical wire-format values for the same engine config.
 //
 // trustedProxies is a list of CIDR ranges whose inbound X-Forwarded-*
 // (and Forwarded / X-Real-IP) headers may be preserved. Requests from
@@ -28,7 +33,7 @@ import (
 //
 // An empty trustedProxies list means "trust nobody": all caller-set
 // forwarded-for headers are stripped. This is the safe default.
-func New(baseURL, prefix, apiKeyHeader, apiKey string, transport http.RoundTripper, trustedProxies []string) (*httputil.ReverseProxy, error) {
+func New(baseURL, prefix, apiKeyHeader, apiKey, authScheme string, transport http.RoundTripper, trustedProxies []string) (*httputil.ReverseProxy, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -62,7 +67,11 @@ func New(baseURL, prefix, apiKeyHeader, apiKey string, transport http.RoundTripp
 			out.Header = sanitizeHeaders(cloned)
 
 			if apiKey != "" && apiKeyHeader != "" {
-				out.Header.Set(apiKeyHeader, apiKey)
+				value := apiKey
+				if authScheme == "bearer" {
+					value = "Bearer " + apiKey
+				}
+				out.Header.Set(apiKeyHeader, value)
 			}
 			pr.SetXForwarded()
 		},

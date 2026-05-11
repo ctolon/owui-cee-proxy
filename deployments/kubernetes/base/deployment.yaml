@@ -27,7 +27,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: proxy
-          image: docker.io/ctolon17/owui-cee-proxy:0.0.2
+          image: docker.io/ctolon17/owui-cee-proxy:0.2.0
           imagePullPolicy: IfNotPresent
           args: ["-config", "/etc/owui-cee-proxy/config.yaml"]
           env:

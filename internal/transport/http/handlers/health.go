@@ -11,8 +11,31 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 	"github.com/ctolon/owui-cee-proxy/internal/version"
 )
+
+// Tunables exported for operator-facing configuration. Treat these
+// as defaults; observability.health.* in YAML overrides them
+// per-deployment.
+const (
+	// DefaultReadinessTimeout caps the overall readiness probe at the
+	// kubelet's typical per-probe budget for an upload-heavy service.
+	DefaultReadinessTimeout = 5 * time.Second
+	// DefaultProbeParallelism bounds the engine Health() fan-out.
+	// 16 covers realistic engine counts; bump via
+	// observability.health.max_parallel for >16-engine deployments
+	// where the previous hard-coded 8 would have caused kubelet
+	// probe timeouts on serial fan-out.
+	DefaultProbeParallelism = 16
+)
+
+// HealthMetrics is the observability seam for /readyz. Nil callers
+// (tests) skip metric recording. Production wires this to the
+// HealthProbeTotal counter + HealthProbeDuration histogram.
+type HealthMetrics interface {
+	RecordHealthProbe(engine, status string, duration time.Duration)
+}
 
 // Health serves /healthz (always 200) and /readyz (per-engine probes).
 //
@@ -26,6 +49,17 @@ type Health struct {
 	Registry engine.Registry
 	Redis    func(context.Context) error // nil = no Redis configured
 	Logger   zerolog.Logger
+	// SilenceEngineHealth, when true, marks every engine probe ctx
+	// as log-silent so the instrumented HTTP transport drops its
+	// outbound_engine_request debug line. Status counters still fire.
+	SilenceEngineHealth bool
+	// Timeout caps the readiness probe. 0 → DefaultReadinessTimeout.
+	Timeout time.Duration
+	// MaxParallel bounds the fan-out goroutine count.
+	// 0 → DefaultProbeParallelism.
+	MaxParallel int
+	// Metrics surfaces per-engine probe outcomes + durations.
+	Metrics HealthMetrics
 }
 
 func (h *Health) Liveness(w http.ResponseWriter, _ *http.Request) {
@@ -36,42 +70,51 @@ func (h *Health) Liveness(w http.ResponseWriter, _ *http.Request) {
 }
 
 // Readiness probes every enabled engine and (optionally) Redis in
-// parallel. The 5-second context deadline bounds the worst case so a
-// hung backend cannot delay the kubelet probe past the configured
-// timeout window. Errors from one engine never block another.
+// parallel, capped at h.MaxParallel goroutines. Errors from one
+// engine never block another.
 func (h *Health) Readiness(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	timeout := h.Timeout
+	if timeout <= 0 {
+		timeout = DefaultReadinessTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
+	if h.SilenceEngineHealth {
+		ctx = mw.WithSilenceLog(ctx)
+	}
 
 	results := map[string]string{}
 	var mu sync.Mutex
 
 	g, gctx := errgroup.WithContext(ctx)
-	// Cap the goroutine count to a sensible default. With at most a
-	// handful of engines + Redis this is essentially a no-op, but it
-	// guards against future growth of the registry.
-	g.SetLimit(8)
+	limit := h.MaxParallel
+	if limit <= 0 {
+		limit = DefaultProbeParallelism
+	}
+	g.SetLimit(limit)
 
 	for _, name := range h.Registry.Names() {
 		name := name
 		g.Go(func() error {
+			start := time.Now()
 			e, err := h.Registry.Get(name)
 			if err != nil {
 				h.logProbeError(string(name), err)
+				h.recordProbe(string(name), "unhealthy", time.Since(start))
 				mu.Lock()
 				results[string(name)] = "unhealthy"
 				mu.Unlock()
-				// Do NOT return err: we want every probe to run to
-				// completion regardless of any single failure.
 				return nil
 			}
 			if err := e.Health(gctx); err != nil {
 				h.logProbeError(string(name), err)
+				h.recordProbe(string(name), "unhealthy", time.Since(start))
 				mu.Lock()
 				results[string(name)] = "unhealthy"
 				mu.Unlock()
 				return nil
 			}
+			h.recordProbe(string(name), "ok", time.Since(start))
 			mu.Lock()
 			results[string(name)] = "ok"
 			mu.Unlock()
@@ -81,13 +124,16 @@ func (h *Health) Readiness(w http.ResponseWriter, r *http.Request) {
 
 	if h.Redis != nil {
 		g.Go(func() error {
+			start := time.Now()
 			if err := h.Redis(gctx); err != nil {
 				h.logProbeError("redis", err)
+				h.recordProbe("redis", "unhealthy", time.Since(start))
 				mu.Lock()
 				results["redis"] = "unhealthy"
 				mu.Unlock()
 				return nil
 			}
+			h.recordProbe("redis", "ok", time.Since(start))
 			mu.Lock()
 			results["redis"] = "ok"
 			mu.Unlock()
@@ -121,6 +167,15 @@ func (h *Health) logProbeError(probe string, err error) {
 		Str("event", "readyz_probe_failed").
 		Str("probe", probe).
 		Msg("readiness probe failed")
+}
+
+// recordProbe fires the Prometheus seam if Metrics is wired. Tests
+// without metrics get a free pass.
+func (h *Health) recordProbe(engineName, status string, dur time.Duration) {
+	if h.Metrics == nil {
+		return
+	}
+	h.Metrics.RecordHealthProbe(engineName, status, dur)
 }
 
 func statusFor(s int) string {

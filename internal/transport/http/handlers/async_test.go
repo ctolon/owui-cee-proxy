@@ -24,6 +24,7 @@ type stubEngine struct {
 }
 
 func (s *stubEngine) Name() engine.Name { return s.name }
+func (s *stubEngine) URL() string       { return "http://" + string(s.name) + ".test" }
 func (s *stubEngine) Capabilities() engine.EngineCapabilities {
 	return engine.EngineCapabilities{
 		Facades:     []engine.Facade{engine.FacadeDocling},

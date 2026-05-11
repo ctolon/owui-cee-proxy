@@ -23,6 +23,7 @@ type healthStubEngine struct {
 }
 
 func (s *healthStubEngine) Name() engine.Name { return s.name }
+func (s *healthStubEngine) URL() string       { return "http://" + string(s.name) + ".test" }
 func (s *healthStubEngine) Capabilities() engine.EngineCapabilities {
 	return engine.EngineCapabilities{Facades: []engine.Facade{engine.FacadeDocling}}
 }

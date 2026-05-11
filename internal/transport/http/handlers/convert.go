@@ -16,7 +16,10 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
@@ -39,6 +42,10 @@ type Convert struct {
 	Registry   engine.Registry
 	Logger     zerolog.Logger
 	ResolveURL func(raw string) (*ResolvedURL, error)
+	// UpstreamLog resolves the effective upstream-log policy for a
+	// given engine name. Nil = upstream-error logging disabled, which
+	// matches v0.1.x behaviour and keeps existing tests green.
+	UpstreamLog func(engineName string) config.UpstreamLogConfig
 }
 
 func (c *Convert) File(w http.ResponseWriter, r *http.Request) {
@@ -52,10 +59,7 @@ func (c *Convert) Source(w http.ResponseWriter, r *http.Request) {
 func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	req, cleanup, err := c.buildRequest(r, source)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"status": "failure",
-			"errors": []map[string]string{{"message": err.Error()}},
-		})
+		writeJSON(w, http.StatusBadRequest, respond.NewDoclingError(err.Error()))
 		return
 	}
 	defer cleanup()
@@ -78,11 +82,12 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 			Str("engine", string(eng.Name())).
 			Msg("source mode invoked; routing to default engine (MIME-based dispatch unavailable)")
 	}
-	ctx := mw.WithEngine(r.Context(), string(eng.Name()), "")
+	ctx := mw.WithEngine(r.Context(), string(eng.Name()), eng.URL())
 
 	if len(req.Files) > 0 {
 		ctx = mw.WithFilename(ctx, req.Files[0].Filename)
 		ctx = mw.WithFileCount(ctx, len(req.Files))
+		ctx = mw.WithMimeType(ctx, req.Files[0].ContentType)
 	}
 	req.RequestID = mw.IDFrom(ctx)
 
@@ -98,14 +103,20 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 			Str("event", "engine_convert_failed").
 			Str("request_id", req.RequestID).
 			Str("engine", string(eng.Name())).
+			Str("engine_url", eng.URL()).
 			Msg("engine convert failed")
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"status": "failure",
-			"errors": []map[string]string{{
-				"message": fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID),
-			}},
-		})
+		writeJSON(
+			w, http.StatusBadGateway,
+			respond.NewDoclingError(fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID)),
+		)
 		return
+	}
+	// Surface non-2xx engine responses to the operator log. The helper
+	// also peek-restores the body so io.Copy below still sees the full
+	// upstream payload.
+	if c.UpstreamLog != nil {
+		resp = logUpstreamStatus(ctx, c.Logger, resp, c.UpstreamLog(string(eng.Name())),
+			string(eng.Name()), eng.URL(), req.RequestID, currentFilename(req))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -116,6 +127,13 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func currentFilename(req *engine.ConvertRequest) string {
+	if len(req.Files) > 0 {
+		return req.Files[0].Filename
+	}
+	return ""
 }
 
 func (c *Convert) buildRequest(r *http.Request, source bool) (*engine.ConvertRequest, func(), error) {
@@ -136,7 +154,7 @@ func buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 	mr := multipart.NewReader(r.Body, params["boundary"])
 
 	req := &engine.ConvertRequest{
-		Headers: r.Header.Clone(),
+		Headers: compatutil.AllowlistedHeaders(r.Header),
 		Options: map[string]string{},
 	}
 	// closers tracks every spool reader / temp file that the cleanup
@@ -211,7 +229,7 @@ func (c *Convert) buildSourceRequest(r *http.Request) (*engine.ConvertRequest, f
 	return &engine.ConvertRequest{
 		Sources: body.HTTPSources,
 		Options: body.Options,
-		Headers: r.Header.Clone(),
+		Headers: compatutil.AllowlistedHeaders(r.Header),
 	}, noop, nil
 }
 

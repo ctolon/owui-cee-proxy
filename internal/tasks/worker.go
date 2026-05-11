@@ -55,19 +55,33 @@ func (w *Worker) Shutdown() {
 }
 
 func (w *Worker) handleConvert(ctx context.Context, t *asynq.Task) error {
+	taskID, _ := asynq.GetTaskID(ctx)
 	var p Payload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		w.recordFailure(taskID, "", err, "unmarshal")
 		return fmt.Errorf("unmarshal: %w: %w", err, asynq.SkipRetry)
 	}
 	eng, err := w.registry.Get(engine.Name(p.Engine))
 	if err != nil {
+		w.recordFailure(taskID, p.RequestID, err, "unknown_engine")
 		return fmt.Errorf("engine %s: %w: %w", p.Engine, err, asynq.SkipRetry)
 	}
+
+	// Lifecycle: task left the queue, observability comes online.
+	w.orch.lifecycle.RecordTaskLifecycle("dequeued", "success")
+	w.logger.Info().
+		Str("event", "task_dequeued").
+		Str("task_id", taskID).
+		Str("engine", p.Engine).
+		Str("request_id", p.RequestID).
+		Int("file_count", len(p.BlobKeys)).
+		Msg("async task dequeued")
 
 	files := make([]engine.FileBlob, 0, len(p.BlobKeys))
 	for _, ref := range p.BlobKeys {
 		b, err := w.orch.LoadBlob(ctx, ref.Key)
 		if err != nil {
+			w.recordFailure(taskID, p.RequestID, err, "blob_load")
 			return fmt.Errorf("load blob %s: %w", ref.Key, err)
 		}
 		files = append(files, engine.FileBlob{
@@ -90,34 +104,46 @@ func (w *Worker) handleConvert(ctx context.Context, t *asynq.Task) error {
 		Facade:    facade,
 	}
 
-	w.logger.Info().
-		Str("event", "task_started").
-		Str("engine", p.Engine).
-		Int("file_count", len(files)).
-		Str("request_id", p.RequestID).
-		Msg("task_started")
-
 	resp, err := eng.Convert(ctx, req)
 	if err != nil {
+		w.recordFailure(taskID, p.RequestID, err, "engine_convert")
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		w.recordFailure(taskID, p.RequestID, err, "read_response")
 		return err
 	}
-	taskID, _ := asynq.GetTaskID(ctx)
 	if err := w.orch.SaveResult(ctx, taskID, resp.Headers.Get("Content-Type"), body); err != nil {
+		w.recordFailure(taskID, p.RequestID, err, "save_result")
 		return err
 	}
+	w.orch.lifecycle.RecordTaskLifecycle("completed", "success")
 	w.logger.Info().
 		Str("event", "task_completed").
 		Str("task_id", taskID).
 		Str("engine", p.Engine).
+		Str("request_id", p.RequestID).
 		Int("status", resp.StatusCode).
-		Msg("task_completed")
+		Msg("async task completed")
 	return nil
+}
+
+// recordFailure centralises the failed-task observability surface.
+// reason maps to a stable label value so dashboards alert on
+// distinct failure categories (blob_load failures point at Redis;
+// engine_convert at the backend).
+func (w *Worker) recordFailure(taskID, requestID string, err error, reason string) {
+	w.orch.lifecycle.RecordTaskLifecycle("failed", reason)
+	w.logger.Error().
+		Err(err).
+		Str("event", "task_failed").
+		Str("task_id", taskID).
+		Str("request_id", requestID).
+		Str("reason", reason).
+		Msg("async task failed")
 }
 
 type zerologAsynqLogger struct{ l zerolog.Logger }

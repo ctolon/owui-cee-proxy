@@ -24,6 +24,14 @@ func RunContractTests(t *testing.T, e engine.Engine) {
 		require.NotEmpty(t, string(e.Name()))
 	})
 
+	// CLAUDE.md invariant: convert-path logs MUST carry engine_url.
+	// That field flows from this accessor; asserting it here catches
+	// any adapter that forgets to surface the configured URL.
+	t.Run("url_is_nonempty", func(t *testing.T) {
+		t.Parallel()
+		require.NotEmpty(t, e.URL(), "engine %s must expose its backend URL via URL()", e.Name())
+	})
+
 	t.Run("capabilities_declares_at_least_one_facade", func(t *testing.T) {
 		t.Parallel()
 		caps := e.Capabilities()

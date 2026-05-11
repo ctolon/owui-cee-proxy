@@ -24,6 +24,7 @@ type recordingEngine struct {
 }
 
 func (r *recordingEngine) Name() engine.Name { return r.name }
+func (r *recordingEngine) URL() string       { return "http://" + string(r.name) + ".test" }
 func (r *recordingEngine) Capabilities() engine.EngineCapabilities {
 	return engine.EngineCapabilities{
 		Facades:     []engine.Facade{engine.FacadeDocling},
@@ -120,6 +121,7 @@ type failingEngine struct {
 }
 
 func (f *failingEngine) Name() engine.Name { return f.name }
+func (f *failingEngine) URL() string       { return "http://" + string(f.name) + ".test" }
 func (f *failingEngine) Capabilities() engine.EngineCapabilities {
 	return engine.EngineCapabilities{Facades: []engine.Facade{engine.FacadeDocling}, HTTPSources: true}
 }
