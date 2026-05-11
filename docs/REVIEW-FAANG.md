@@ -203,12 +203,17 @@ list + roadmap themes.)
 |-----|------|------------|
 | C-45 | API design | New async endpoint `POST /process/async` mirrors the synchronous External facade's input shape (raw body + Content-Type + optional X-Filename). New `tasks.PayloadFromExternalRequest` reuses the same spool + MIME-resolver path the sync handler uses so dispatch lands on the same engine either way. The handler (`Async.SubmitProcess`) is mounted alongside the sync `PUT /process` when `tasks.enabled: true`. Status/Result endpoints under the docling prefix already serve every facade (the TaskID is opaque), so the operator surface stays compact. Three unit tests pin the early-return contract (missing Content-Type, orchestrator disabled, no engine for external facade). Closes the facade-asymmetry C-45 flagged. |
 
+### Closed in `feat/p2-engine-paths-map` (v0.7.0 + 6, breaking change → v0.8.0)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-33 | Plugin SDK | `EnginePathsConfig` collapses from a fixed compat-prefixed struct (`docling_convert_file`, `external_process`, `tika_text`, …) into `map[string]string`. Adapter packages now own their key constants (`docling.PathConvertFile`, `docling.PathConvertSource`, `external.PathProcess`, `tika.PathText`). The previous N×M growth surface (each new compat type added M fields; each new path-key axis added N fields) reduces to zero schema cells per axis — out-of-tree adapters declare their own keys without touching `internal/config/config.go`. Breaking change — operators previously setting `paths.docling_convert_file: ...` must rename to `paths.convert_file: ...`. Migration recipe documented in `docs/MIGRATION-v0.8.0.md`; the change is the only breaking item slated for v0.8.0 so the migration cost stays bounded. |
+
 ### P2 (backlog) — remaining
 
 A subset, ordered by likely ROI:
 
-- **C-33** `EnginePathsConfig` is a per-compat grab-bag struct that N×M-explodes; replace with `Paths map[string]string` per-engine. [Plugin SDK]
-- **C-35** No OpenAPI/AsyncAPI spec — the single largest UX gap for client teams. [API design]
+- **C-35** No OpenAPI/AsyncAPI spec — the single largest UX gap for client teams. (Deferred to roadmap pending appetite for a >sprint-scale effort.) [API design]
 
 ---
 

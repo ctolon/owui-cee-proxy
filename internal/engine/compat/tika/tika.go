@@ -113,9 +113,13 @@ func (a *Adapter) Health(ctx context.Context) error {
 	return nil
 }
 
+// PathText is the EngineConfig.Paths key this adapter consults to
+// override the default /tika/text endpoint.
+const PathText = "text"
+
 func (a *Adapter) tikaTextPath() string {
-	if a.cfg.Paths.TikaText != "" {
-		return a.cfg.Paths.TikaText
+	if v, ok := a.cfg.Paths[PathText]; ok && v != "" {
+		return v
 	}
 	return defaultTikaTextPath
 }

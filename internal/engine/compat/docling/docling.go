@@ -97,16 +97,22 @@ func (a *Adapter) Health(ctx context.Context) error {
 	return nil
 }
 
+// Path keys consumed by this adapter from EngineConfig.Paths.
+const (
+	PathConvertFile   = "convert_file"
+	PathConvertSource = "convert_source"
+)
+
 func (a *Adapter) convertFilePath() string {
-	if a.cfg.Paths.DoclingConvertFile != "" {
-		return a.cfg.Paths.DoclingConvertFile
+	if v, ok := a.cfg.Paths[PathConvertFile]; ok && v != "" {
+		return v
 	}
 	return defaultConvertFilePath
 }
 
 func (a *Adapter) convertSourcePath() string {
-	if a.cfg.Paths.DoclingConvertSource != "" {
-		return a.cfg.Paths.DoclingConvertSource
+	if v, ok := a.cfg.Paths[PathConvertSource]; ok && v != "" {
+		return v
 	}
 	return defaultConvertSourcePath
 }

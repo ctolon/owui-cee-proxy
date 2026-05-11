@@ -349,17 +349,26 @@ type EngineObservabilityConfig struct {
 	FullCaptureBodyBytes *int    `koanf:"full_capture_body_bytes"`
 }
 
-// EnginePathsConfig overrides per-compat default paths. When a field
-// is empty the adapter uses its built-in default.
-type EnginePathsConfig struct {
-	// docling-family
-	DoclingConvertFile   string `koanf:"docling_convert_file"`
-	DoclingConvertSource string `koanf:"docling_convert_source"`
-	// external-family
-	ExternalProcess string `koanf:"external_process"`
-	// tika-family
-	TikaText string `koanf:"tika_text"`
-}
+// EnginePathsConfig overrides per-compat default paths. The map is
+// keyed on a logical path name owned by the adapter package (e.g.
+// docling exports `PathConvertFile`, external exports `PathProcess`).
+// Empty map / missing key → the adapter uses its built-in default.
+//
+// Pre-v0.8.0 this was a fixed struct that namespace-prefixed each
+// key with its compat type (`docling_convert_file`, `external_process`,
+// `tika_text`). The prefix was redundant — an engine is exactly one
+// compat type — and added an N×M cell to the schema for every new
+// compat-type or path-key axis. Adding a fifth compat now changes
+// one file (the new package) instead of three.
+//
+// Schema example:
+//
+//	engines:
+//	  main-docling:
+//	    paths:
+//	      convert_file:   /api/v2/extract
+//	      convert_source: /api/v2/source
+type EnginePathsConfig = map[string]string
 
 type HTTPClientConfig struct {
 	MaxIdleConns          int             `koanf:"max_idle_conns"`
