@@ -7,6 +7,22 @@ https://github.com/ctolon/owui-cee-proxy/releases
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.5.0] — 2026-05-11
+
+### Features
+
+- Routing strategy + multi-auth + full-capture + P0 hardening sprint (#17) — **BREAKING**
+## [0.4.0] — 2026-05-11
+
+### Features
+
+- MIME sniff (mimetype lib) + docling API-key E2E coverage — **BREAKING**
+## [0.3.0] — 2026-05-11
+
+### Features
+
+- **ci:** Release gate keys on subject prefix, not body substring — **BREAKING**
+- Observability, performance + Helm chart hardening — **BREAKING**
 ## [0.2.0] — 2026-05-10
 
 ### Features
