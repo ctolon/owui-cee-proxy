@@ -3,6 +3,7 @@ package tasks
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -57,6 +58,28 @@ type Orchestrator struct {
 	logger    zerolog.Logger
 	lifecycle LifecycleRecorder
 	queueDep  QueueDepthRecorder
+	// fingerprintPepper is the per-process secret HMAC'd into
+	// caller-API-key fingerprints. When non-empty, fingerprints are
+	// HMAC-SHA-256(pepper, apiKey); a Redis exfil can no longer
+	// recover the key via offline rainbow-tables against the
+	// fingerprint (C-28 from REVIEW-FAANG.md). Empty → fallback to
+	// plain SHA-256 for backward compat with existing
+	// deployments / unit-test fixtures.
+	fingerprintPepper []byte
+}
+
+// WithFingerprintPepper installs the HMAC pepper used by
+// keyFromAPIKey. Composition root passes the resolved
+// `security.proxy_api_key_fingerprint_pepper_env` value here at
+// startup. Returns the orchestrator for the same chaining shape as
+// WithObservability.
+func (o *Orchestrator) WithFingerprintPepper(pepper []byte) *Orchestrator {
+	if len(pepper) > 0 {
+		cp := make([]byte, len(pepper))
+		copy(cp, pepper)
+		o.fingerprintPepper = cp
+	}
+	return o
 }
 
 // WithObservability wires the structured logger + metric recorders.
@@ -147,14 +170,41 @@ func mintToken() (string, error) {
 }
 
 // keyFromAPIKey returns a deterministic 32-byte hex (64 char)
-// fingerprint for the given API key. Used to bind a task token to the
-// caller. Empty key → empty fingerprint (no binding).
+// fingerprint for the given API key. Used to bind a task token to
+// the caller. Empty key → empty fingerprint (no binding).
+//
+// LEGACY: plain SHA-256. Kept for backward-compat with existing
+// deployments / unit-test fixtures. New code paths SHOULD route
+// through o.keyFromAPIKey (the method) which honours the
+// fingerprintPepper when configured — see C-28.
 func keyFromAPIKey(apiKey string) string {
 	if apiKey == "" {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(apiKey))
 	return hex.EncodeToString(sum[:])
+}
+
+// keyFromAPIKey is the orchestrator's per-instance fingerprint
+// helper. When fingerprintPepper is set, returns
+// HMAC-SHA-256(pepper, apiKey) hex — a Redis exfil + offline
+// rainbow-table cannot recover the original key without ALSO
+// stealing the pepper from the proxy process. Empty pepper falls
+// back to the package-level keyFromAPIKey (plain SHA-256) so
+// existing deployments keep working.
+func (o *Orchestrator) keyFromAPIKey(apiKey string) string {
+	if apiKey == "" {
+		return ""
+	}
+	if len(o.fingerprintPepper) == 0 {
+		// No pepper configured — fall back to the package-level
+		// plain SHA-256 helper. Calling the method here would
+		// recurse infinitely.
+		return keyFromAPIKey(apiKey)
+	}
+	mac := hmac.New(sha256.New, o.fingerprintPepper)
+	mac.Write([]byte(apiKey))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // validateBlobLimits enforces tasks.max_blob_bytes (per file) and
@@ -197,13 +247,28 @@ func (o *Orchestrator) Enqueue(ctx context.Context, p *Payload, apiKey string) (
 	if err := validateBlobLimits(p, o.cfg.MaxBlobBytes, o.cfg.MaxTotalBytes); err != nil {
 		return "", err
 	}
+
+	// Pipeline the blob SETs into a single Redis round-trip instead
+	// of one RTT per blob (N blobs → 1 RTT not N). Pure pipeline (no
+	// MULTI/EXEC) — we don't need atomicity across the batch, just
+	// the round-trip savings on slow / high-RTT Redis links.
+	// (C-23 from REVIEW-FAANG.md: async submit was doing 4 sequential
+	// RTTs inside the request goroutine; slow Redis blocked every
+	// async submit.)
 	bufs := p.takeBuffers()
-	for i, buf := range bufs {
-		key := fmt.Sprintf("owui-cee:blob:%s", uuid.NewString())
-		if err := o.redis.Set(ctx, key, buf.Bytes(), o.cfg.Retention).Err(); err != nil {
-			return "", fmt.Errorf("persist blob: %w", err)
+	if len(bufs) > 0 {
+		pipe := o.redis.Pipeline()
+		blobKeys := make([]string, len(bufs))
+		for i, buf := range bufs {
+			blobKeys[i] = fmt.Sprintf("owui-cee:blob:%s", uuid.NewString())
+			pipe.Set(ctx, blobKeys[i], buf.Bytes(), o.cfg.Retention)
 		}
-		p.BlobKeys[i].Key = key
+		if _, err := pipe.Exec(ctx); err != nil {
+			return "", fmt.Errorf("persist blobs: %w", err)
+		}
+		for i, k := range blobKeys {
+			p.BlobKeys[i].Key = k
+		}
 	}
 	body, err := json.Marshal(p)
 	if err != nil {
@@ -229,7 +294,7 @@ func (o *Orchestrator) Enqueue(ctx context.Context, p *Payload, apiKey string) (
 	if err != nil {
 		return "", fmt.Errorf("mint token: %w", err)
 	}
-	binding := tokenBinding{TaskID: info.ID, APIKeyFinger: keyFromAPIKey(apiKey)}
+	binding := tokenBinding{TaskID: info.ID, APIKeyFinger: o.keyFromAPIKey(apiKey)}
 	bb, err := json.Marshal(binding)
 	if err != nil {
 		return "", err
@@ -238,12 +303,14 @@ func (o *Orchestrator) Enqueue(ctx context.Context, p *Payload, apiKey string) (
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	if err := o.redis.Set(ctx, tokenKey(token), bb, ttl).Err(); err != nil {
-		return "", fmt.Errorf("persist token: %w", err)
-	}
-	// Persist task_id → queue mapping so Status() can target a single queue.
-	if err := o.redis.Set(ctx, queueKey(info.ID), info.Queue, o.cfg.Retention).Err(); err != nil {
-		return "", fmt.Errorf("persist queue mapping: %w", err)
+	// Pipeline the two post-Enqueue SETs (token binding + queue
+	// mapping) into ONE round-trip. Pre-fix this was two sequential
+	// RTTs after the asynq Enqueue's own RTT.
+	pipe := o.redis.Pipeline()
+	pipe.Set(ctx, tokenKey(token), bb, ttl)
+	pipe.Set(ctx, queueKey(info.ID), info.Queue, o.cfg.Retention)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return "", fmt.Errorf("persist token+queue: %w", err)
 	}
 
 	o.lifecycle.RecordTaskLifecycle("enqueued", "success")
@@ -300,7 +367,7 @@ func (o *Orchestrator) resolveToken(ctx context.Context, token, apiKey string) (
 		return "", err
 	}
 	if binding.APIKeyFinger != "" {
-		if keyFromAPIKey(apiKey) != binding.APIKeyFinger {
+		if o.keyFromAPIKey(apiKey) != binding.APIKeyFinger {
 			return "", ErrNotFound
 		}
 	}
@@ -422,7 +489,7 @@ func (o *Orchestrator) ResolveIdempotent(ctx context.Context, idem, apiKey strin
 	if idem == "" {
 		return "", false, nil
 	}
-	v, err := o.redis.Get(ctx, idemKey(keyFromAPIKey(apiKey), idem)).Result()
+	v, err := o.redis.Get(ctx, idemKey(o.keyFromAPIKey(apiKey), idem)).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return "", false, nil
@@ -450,7 +517,7 @@ func (o *Orchestrator) RecordIdempotent(ctx context.Context, idem, apiKey, token
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	key := idemKey(keyFromAPIKey(apiKey), idem)
+	key := idemKey(o.keyFromAPIKey(apiKey), idem)
 	ok, err := o.redis.SetNX(ctx, key, token, ttl).Result()
 	if err != nil {
 		return token, fmt.Errorf("idem record: %w", err)

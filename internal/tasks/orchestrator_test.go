@@ -291,3 +291,35 @@ func TestOrchestrator_IdempotencyResolveAndRecord(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "token-B", tok)
 }
+
+// TestOrchestrator_FingerprintPepperHMAC pins C-28: when the
+// orchestrator carries a non-empty pepper, the per-caller fingerprint
+// is HMAC-SHA-256(pepper, apiKey) — NOT plain SHA-256. An attacker
+// who exfils Redis but doesn't steal the pepper cannot run an
+// offline rainbow-table against the fingerprint to recover the key.
+//
+// Empty pepper falls back to plain SHA-256 for backward-compat with
+// existing deployments.
+func TestOrchestrator_FingerprintPepperHMAC(t *testing.T) {
+	t.Parallel()
+	orch, _ := newOrchestratorWithMiniredis(t)
+
+	// Default (no pepper) — plain SHA-256.
+	require.Equal(t, keyFromAPIKey("tenant-A"), orch.keyFromAPIKey("tenant-A"))
+
+	// With pepper — HMAC differs from plain SHA-256.
+	orch.WithFingerprintPepper([]byte("super-secret-pepper"))
+	pepperedA := orch.keyFromAPIKey("tenant-A")
+	require.NotEqual(t, keyFromAPIKey("tenant-A"), pepperedA,
+		"peppered fingerprint MUST diverge from plain SHA-256")
+	require.Equal(t, 64, len(pepperedA), "HMAC-SHA-256 hex length")
+
+	// Determinism — same key + same pepper → same fingerprint.
+	require.Equal(t, pepperedA, orch.keyFromAPIKey("tenant-A"))
+
+	// Cross-tenant isolation preserved under HMAC.
+	require.NotEqual(t, pepperedA, orch.keyFromAPIKey("tenant-B"))
+
+	// Empty input still returns empty fingerprint (no binding).
+	require.Empty(t, orch.keyFromAPIKey(""))
+}

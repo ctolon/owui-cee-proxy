@@ -60,7 +60,27 @@ type Health struct {
 	MaxParallel int
 	// Metrics surfaces per-engine probe outcomes + durations.
 	Metrics HealthMetrics
+	// Required is the set of probe names whose health is
+	// load-bearing for the pod's readiness. When non-empty, the
+	// overall /readyz status flips to 503 ONLY if a probe in this
+	// set fails — non-required probes are reported as `degraded`
+	// in the body but do not kill kubelet's readiness. Operators
+	// who set the default engine + Redis here keep the pod in
+	// rotation when a flaky non-default engine is the only
+	// failure (C-22 from REVIEW-FAANG.md).
+	//
+	// Empty / nil → legacy all-or-nothing semantics: any
+	// "unhealthy" engine flips the pod 503.
+	Required map[string]struct{}
 }
+
+// (Tiered readiness exposes a per-engine `engines[name]` map with
+// the legacy "ok" / "unhealthy" values for back-compat, plus a
+// separate top-level `degraded` array listing non-required engines
+// whose probe failed. The bucketing logic lives inline in
+// Readiness; explicit enum constants were considered but pruned
+// after their `unused` lint warning revealed nobody actually
+// consumed the type — the values are emitted as string literals.)
 
 func (h *Health) Liveness(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -145,18 +165,40 @@ func (h *Health) Readiness(w http.ResponseWriter, r *http.Request) {
 	// nil from goroutines), but call Wait for the synchronization.
 	_ = g.Wait()
 
+	// Tiered readiness (C-22). With h.Required populated, the pod
+	// stays Ready as long as the required probes succeed; non-
+	// required failures show as `degraded` so operators can see
+	// them without losing the pod from rotation.
 	overall := http.StatusOK
-	for _, v := range results {
-		if v != "ok" {
-			overall = http.StatusServiceUnavailable
-			break
+	degraded := make([]string, 0, len(results))
+	if len(h.Required) > 0 {
+		for name, v := range results {
+			if v == "ok" {
+				continue
+			}
+			if _, req := h.Required[name]; req {
+				overall = http.StatusServiceUnavailable
+			} else {
+				degraded = append(degraded, name)
+			}
+		}
+	} else {
+		for _, v := range results {
+			if v != "ok" {
+				overall = http.StatusServiceUnavailable
+				break
+			}
 		}
 	}
 
-	writeJSON(w, overall, map[string]any{
+	body := map[string]any{
 		"status":  statusFor(overall),
 		"engines": results,
-	})
+	}
+	if len(degraded) > 0 {
+		body["degraded"] = degraded
+	}
+	writeJSON(w, overall, body)
 }
 
 // logProbeError records the full upstream error for operator
