@@ -5,9 +5,45 @@ metadata:
 spec:
   gatewayClassName: envoy
   listeners:
+    # Plain HTTP listener. Useful in two patterns:
+    #   1. Edge TLS termination upstream of this Gateway (cloud LB
+    #      terminating, this Gateway accepting plaintext from the LB
+    #      over a private network).
+    #   2. Local dev cluster where TLS adds operational friction
+    #      without security value.
+    # If TLS terminates HERE, point the HTTPRoute at the `https`
+    # listener (below) via `parentRefs.sectionName: https` and either
+    # drop this listener or add an HTTPS-redirect HTTPRoute that
+    # rewrites every match on this listener with a 301.
     - name: http
       protocol: HTTP
       port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+    # HTTPS listener. The certificateRef points at a Secret in the
+    # SAME namespace as the Gateway (cross-namespace TLS Secrets need
+    # a ReferenceGrant from the cert namespace — out of scope for
+    # this overlay). Recommended wiring:
+    #   1. cert-manager Certificate object reconciles a Secret of
+    #      type kubernetes.io/tls named `owui-cee-proxy-tls`.
+    #   2. This listener loads the Secret on Gateway reconcile.
+    # The HTTPRoute below attaches to BOTH listeners by default
+    # (no sectionName); see the inline comment in httproute.yaml
+    # for the strict-HTTPS variant.
+    #
+    # Parity with the ingress-nginx overlay: that overlay's
+    # ingress.yaml now ships a matching `tls:` stanza with the same
+    # Secret name. Switch overlays without rewriting your cert
+    # pipeline.
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: owui-cee-proxy-tls
       allowedRoutes:
         namespaces:
           from: Same

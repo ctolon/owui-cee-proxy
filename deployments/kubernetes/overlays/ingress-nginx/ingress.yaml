@@ -7,8 +7,25 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Enable to force HTTPS redirects once a TLS Secret exists.
+    # Disabled by default so the overlay still applies cleanly on a
+    # cluster without cert-manager wired.
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
   ingressClassName: nginx
+  # TLS termination. The Secret should be a kubernetes.io/tls Secret
+  # in the SAME namespace as this Ingress. Recommended wiring:
+  #   1. cert-manager Certificate object reconciles a Secret of
+  #      type kubernetes.io/tls named `owui-cee-proxy-tls`.
+  #   2. ingress-nginx loads the cert on each Ingress sync.
+  #
+  # The Gateway API overlay's gateway.yaml uses the SAME Secret name
+  # so operators can switch overlays without rewriting their cert
+  # pipeline (C-43 from REVIEW-FAANG.md).
+  tls:
+    - hosts:
+        - owui-cee-proxy.local
+      secretName: owui-cee-proxy-tls
   rules:
     - host: owui-cee-proxy.local
       http:

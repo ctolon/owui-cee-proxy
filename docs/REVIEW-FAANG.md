@@ -184,15 +184,20 @@ list + roadmap themes.)
 | C-40 | Architecture | `internal/app/app.go` split inside the same package (no exported API change): the 7 observability adapters (`authMetricsAdapter`, `ssrfMetricsAdapter`, `ssrfLoggerAdapter`, `taskLifecycleAdapter`, `queueDepthAdapter`, `healthMetricsAdapter`, `panicRecorderAdapter`, `upstreamStatusAdapter`) moved to `adapters.go`; the two bootstrap log emitters (`logEngineBootstrap`, `logRoutingBootstrap`) plus `breakerStateHook` moved to `bootstrap.go`. `app.go` shrank from 481 → 285 lines; each file now has a single responsibility. Moves intentionally kept INSIDE `package app` because the adapters import `handlers.SSRFRejectReason` + `authutil.Outcome` — relocating to `internal/observability` would have reversed the project's layering invariant. |
 | C-41 | DX | `README.md` "How engine selection works" section rewritten end-to-end. Now documents: (1) the four `routing.strategy` values + their match order; (2) the MIME resolution stage that runs in front of dispatch + the CFB disambiguation that closed the original `.msg` HTTP-400 bug; (3) per-engine multi-stamp `auth_headers` (v0.5.0+); (4) async idempotency via `Idempotency-Key` (v0.6.0+); (5) source-mode SSRF IP pinning (v0.7.0+). The matrix entries match `docs/ARCHITECTURE.md §4` so operators reading either doc land in the same mental model. |
 
+### Closed in `feat/p2-test-coverage-tls` (v0.7.0 + 3)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-37 | QA | New tests for `bodylimit`, `ratelimit`, `timeout`, and `recover` middlewares. 15 unit tests cover the cap-enforce path (under/over/disabled), counter context propagation, token-bucket burst behaviour (allow/reject/refill), context-deadline propagation + firing, and the panic recovery contract (stack as string per C-39, recorder hits + counter, nil-recorder fallback, legacy variadic form). Closes the only zero-coverage middleware files left in the package. |
+| C-43 | Helm | Both raw kustomize overlays now demonstrate TLS termination via a kubernetes.io/tls Secret named `owui-cee-proxy-tls`. `overlays/gateway-api-envoy/gateway.yaml` gains an HTTPS listener (`port: 443`, `tls.mode: Terminate`, `certificateRefs[0].name`); the existing HTTPRoute attaches to BOTH listeners by default (no `sectionName`). `overlays/ingress-nginx/ingress.yaml` gains the matching `spec.tls[]` stanza + a commented `ssl-redirect` annotation. Operators wiring cert-manager (or any external cert pipeline) reuse the same Secret name across overlays. Strict-HTTPS recipe documented inline (sectionName + RequestRedirect filter). |
+
 ### P2 (backlog) — remaining
 
 A subset, ordered by likely ROI:
 
 - **C-33** `EnginePathsConfig` is a per-compat grab-bag struct that N×M-explodes; replace with `Paths map[string]string` per-engine. [Plugin SDK]
 - **C-35** No OpenAPI/AsyncAPI spec — the single largest UX gap for client teams. [API design]
-- **C-37** Body-limit middleware (`bodylimit.go`) has zero tests; ratelimit + timeout middleware same. [QA]
 - **C-38** Tasks duplicate spool implementation (`tasks/spool.go` vs `handlers/spool.go`) — unify into `internal/spool/`. [Backend]
-- **C-43** Gateway API overlay has HTTP-only listener (no TLS); ingress-nginx overlay has TLS — parity gap. [Helm]
 - **C-45** Async path supports only docling facade (`/v1/convert/*/async`); external `/process/async` is missing — facade asymmetry. [API design]
 
 ---
