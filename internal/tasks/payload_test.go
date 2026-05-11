@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -88,4 +89,26 @@ func TestPayloadFromMultipart_NilResolverTrustsDeclared(t *testing.T) {
 	p, _, err := payloadFromMultipart(r, 0, nil /* resolver */)
 	require.NoError(t, err)
 	require.Equal(t, "application/pdf", p.BlobKeys[0].ContentType)
+}
+
+// TestPayloadFromMultipart_FormFieldExceedsCapRejected — async-path
+// version of the C-6 DoS defence. Mirrors the sync handler test;
+// a >1 MiB non-file form-field part fails the parse, never reaches
+// the orchestrator's enqueue path.
+func TestPayloadFromMultipart_FormFieldExceedsCapRejected(t *testing.T) {
+	t.Parallel()
+	buf := &bytes.Buffer{}
+	mw := multipart.NewWriter(buf)
+	require.NoError(t, mw.WriteField("knob", strings.Repeat("X", (1<<20)+1)))
+	fw, err := mw.CreateFormFile("files", "x.txt")
+	require.NoError(t, err)
+	_, _ = fw.Write([]byte("hi"))
+	require.NoError(t, mw.Close())
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	_, _, err = payloadFromMultipart(req, 0, nil)
+	require.Error(t, err, "oversized form field MUST be rejected on the async path too")
+	require.Contains(t, err.Error(), "exceeds")
 }

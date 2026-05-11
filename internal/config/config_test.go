@@ -478,6 +478,69 @@ mimedetect:
 	require.Contains(t, err.Error(), "extension_overrides")
 }
 
+// TestValidateResolvedSecrets_RejectsCRLFInResolvedAPIKey pins the
+// C-4 fix. An env-var value that picks up a stray CR/LF (typical
+// when an operator pastes a multi-line secret) must fail the
+// bootstrap, not silently smuggle a header-injection payload into
+// the outbound auth header.
+func TestValidateResolvedSecrets_RejectsCRLFInResolvedAPIKey(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false // single-engine docling-only fixture
+	c.Engines["main"] = EngineConfig{
+		Enable:     true,
+		CompatType: CompatDocling,
+		URL:        "http://docling.local",
+		AuthHeader: "X-Api-Key",
+		APIKey:     "good-key\r\nX-Admin: yes",
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-printable byte")
+	require.Contains(t, err.Error(), "engines.main.api_key")
+}
+
+// TestValidateResolvedSecrets_RejectsControlByteInMultiAuthEntry
+// covers the C-4 fix on the new multi-stamp surface.
+func TestValidateResolvedSecrets_RejectsControlByteInMultiAuthEntry(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Engines["main"] = EngineConfig{
+		Enable:     true,
+		CompatType: CompatDocling,
+		URL:        "http://docling.local",
+		AuthHeader: "X-Api-Key",
+		APIKey:     "primary",
+		AuthHeaders: []AuthHeaderConfig{
+			{Header: "Authorization", APIKeyEnv: "X", APIKey: "bearer\x00null"},
+		},
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "auth_headers[0]")
+}
+
+// TestValidateResolvedSecrets_AcceptsCleanASCII passes for the happy
+// path — printable ASCII plus tabs (allowed because some token
+// schemes use them as separators) flow through unchanged.
+func TestValidateResolvedSecrets_AcceptsCleanASCII(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Engines["main"] = EngineConfig{
+		Enable:     true,
+		CompatType: CompatDocling,
+		URL:        "http://docling.local",
+		AuthHeader: "X-Api-Key",
+		APIKey:     "ABC.123-tab\there",
+	}
+	require.NoError(t, Validate(c))
+}
+
 // TestEngineConfig_EffectiveAuthSpecs_PrependsSingular pins the
 // migration contract: a legacy singular AuthHeader keeps working
 // AND comes FIRST in the resolved spec list. AuthHeaders entries

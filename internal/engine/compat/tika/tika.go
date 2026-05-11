@@ -59,6 +59,9 @@ func (a *Adapter) Capabilities() engine.EngineCapabilities {
 }
 
 func (a *Adapter) Convert(ctx context.Context, req *engine.ConvertRequest) (*engine.ConvertResponse, error) {
+	// Per-engine request_timeout enforcement — see docling.Convert.
+	ctx, cancel := a.client.WithDeadline(ctx)
+	defer cancel()
 	if len(req.Sources) > 0 {
 		return jsonError(req.Facade, http.StatusNotImplemented, "tika does not support http_sources; upload files instead"), nil
 	}
@@ -126,9 +129,10 @@ func (a *Adapter) convertOne(ctx context.Context, f engine.FileBlob) (item, int,
 	if err != nil {
 		return item{}, 0, err
 	}
-	if f.ContentType != "" {
-		r.Header.Set("Content-Type", f.ContentType)
-	}
+	// Caller-supplied MIME goes through SafeOutboundMIME so any
+	// CR-LF / control byte / parameter survivor cannot reach the
+	// backend's header parser. See compatutil.SafeOutboundMIME.
+	r.Header.Set("Content-Type", compatutil.SafeOutboundMIME(f.ContentType))
 	r.Header.Set("Accept", "application/json")
 	authutil.ApplyMulti(r.Header, string(a.name), a.cfg, a.client.Auth())
 	if v := a.cfg.ForwardOptions["x_tika_pdf_extract_inline_images"]; v == "true" {

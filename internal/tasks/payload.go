@@ -77,6 +77,13 @@ const asyncSpoolThreshold = 8 << 20
 // mimeSniffHeadBytes (512) — every mimetype.Detect signature fits.
 const asyncSniffHeadBytes = 512
 
+// asyncMaxFormFieldBytes caps a single non-file multipart form-field
+// value on the async submit path. Same 1 MiB ceiling as the sync
+// handler's maxFormFieldBytes — defends against the multipart DoS
+// surface where an oversized form-field would otherwise reach
+// io.ReadAll under the global BodyLimit (500 MiB by default).
+const asyncMaxFormFieldBytes = 1 << 20
+
 func payloadFromMultipart(r *http.Request, maxBlob int64, resolver *mimedetect.Resolver) (*Payload, func(), error) {
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
@@ -145,10 +152,17 @@ func payloadFromMultipart(r *http.Request, maxBlob int64, resolver *mimedetect.R
 			})
 			continue
 		}
-		body, err := io.ReadAll(part)
+		// Mirrors the sync convert handler's maxFormFieldBytes
+		// cap. Async paths cap at the same 1 MiB ceiling so the
+		// surface is symmetric — a hostile client cannot route via
+		// /async/* to bypass the sync path's defence.
+		body, err := io.ReadAll(io.LimitReader(part, int64(asyncMaxFormFieldBytes)+1))
 		_ = part.Close()
 		if err != nil {
 			return nil, noop, err
+		}
+		if len(body) > asyncMaxFormFieldBytes {
+			return nil, noop, fmt.Errorf("form field %q exceeds %d bytes", part.FormName(), asyncMaxFormFieldBytes)
 		}
 		p.Options[part.FormName()] = string(body)
 	}

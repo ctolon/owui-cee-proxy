@@ -52,16 +52,22 @@ Verified locally: `go test -race -count=1 ./...` green;
 
 ## Carry-over backlog — prioritised
 
-### P0 (next release, security-hardening cut)
+### Closed in `feat/security-hardening-p0`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-1 | Reliability | Every adapter `Convert` now wraps `ctx` with `client.WithDeadline` so the per-engine YAML `request_timeout` reaches the outbound call. doclingexternal delegates to children — each child re-wraps. |
+| C-3 | Security | `compatutil.SafeOutboundMIME` validates `f.ContentType` against the structural MIME regex before `http.Header.Set`; non-matching values fall back to `application/octet-stream`. Wired into `tika` and `external` adapters. CRLF / control-byte / parameter-bearing inputs all collapse to the safe fallback (table-driven test pins 11 inputs). |
+| C-4 | Security | `validateResolvedSecrets` scans every resolved `APIKey` (singular + every `AuthHeaders` entry + `Security.ProxyAPIKeys`) for bytes outside `[0x20..0x7E] ∪ \t`. CR/LF / NUL / arbitrary control bytes fail the bootstrap with a clear `engines.<name>.api_key: resolved credential contains a non-printable byte at offset N` message. |
+| C-5 | Security | `sanitizeForLog` now runs three regex passes for credential redaction: JSON-string `"keyword":"value"`, HTTP-header `Authorization:` / `Bearer <token>`, and generic `keyword=value` / `keyword: value`. Marker preserved for auditability; only value becomes `***REDACTED***`. Tests cover 6 leak shapes + the don't-overscrub case. |
+| C-6 | Security | Sync `buildFileRequest` and async `payloadFromMultipart` cap non-file form-field parts at 1 MiB via `io.LimitReader(part, 1MiB+1)`. Oversized parts 400 before reaching the engine. Parity test asserts both paths reject. |
+| F1 | Architecture | (Landed in the prior PR.) `Async.APIKeyHeader` wired from `Security.ProxyAPIKeyHeader` in `routes.go`. |
+
+### P0 (carry-over)
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|
-| C-1 | Reliability | Engine `request_timeout` is silently dropped on the convert path — `httpclient.Client.WithDeadline` is exported but never called from adapter `do()`. | Every adapter wraps `hreq` in `WithDeadline(ctx)` before dispatch. |
 | C-2 | Reliability | `Server.WriteTimeout` (5m) can cancel in-flight streaming responses; long Docling OCR jobs are killed mid-stream. | Set `WriteTimeout: 0` on the convert path and rely on context deadline; or add `validateTimeoutHierarchy`. |
-| C-3 | Security | `tika` and `external` adapters forward client `Content-Type` directly to outbound `http.Header.Set` without re-canonicalising. CRLF/control-byte injection surface. | Re-validate forwarded MIME against `mimeValueRE`; fall back to `application/octet-stream` on mismatch. |
-| C-4 | Security | Outbound `Authorization` value never validated against CR/LF / control bytes at config load. | After `resolveSecrets`, scan every resolved `APIKey` byte range; reject at bootstrap if outside `0x20..0x7E`. |
-| C-5 | Security | Body-snippet logging lacks redaction; secrets in JSON bodies leak to operator logs. | Add credential regex pass to `sanitizeForLog` before zerolog sees the bytes. |
-| C-6 | Security | Multipart non-file form-field bodies fully buffered with `io.ReadAll`. DoS surface — 500 MiB form field × 100 concurrent = 50 GiB heap. | Wrap each non-file part in `io.LimitReader` with a 1 MiB ceiling on form fields. |
 | C-7 | DevOps | CI workflow pins four security-critical actions to `@master` (`trivy-action`, `gosec`, `checkov`). Supply-chain compromise lands in release pipeline. | Pin every third-party action to immutable commit SHA; Renovate manages bumps. |
 | C-8 | DevOps | Release pipeline pushes `${VERSION}` and `:latest` to two registries with **no cosign signing, no SBOM attestation, no SLSA provenance**. | Wire `sigstore/cosign-installer` + `cosign sign --yes` keyless OIDC; push CycloneDX SBOM as cosign attestation. |
 | C-9 | API | External facade emits `http.Error` (plain text) on every error path while Docling facade emits `respond.DoclingError` (JSON). Schema-strict clients break. | Route every External error through `respond.NewExternalError` + `writeJSON`. |

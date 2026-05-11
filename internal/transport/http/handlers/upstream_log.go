@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -100,13 +101,23 @@ func eventForLevel(logger zerolog.Logger, level string, status int) *zerolog.Eve
 
 // sanitizeForLog returns a valid-UTF-8 representation safe for
 // zerolog's JSON encoder. Non-UTF8 bytes are dropped (response bodies
-// from binary-content backends would otherwise produce invalid JSON).
+// from binary-content backends would otherwise produce invalid JSON);
+// known credential markers (authorization, api_key, bearer, token,
+// password, secret followed by the obvious assignment punctuation) are
+// further redacted so an upstream that echoes the inbound request, or
+// returns its own credential material in a debug error, does NOT leak
+// secrets into the operator-facing log channel.
 func sanitizeForLog(b []byte) string {
+	utf := utf8String(b)
+	return redactCredentialFragments(utf)
+}
+
+// utf8String mirrors the original sanitizeForLog body — return as-is
+// when valid, strip RuneError runes otherwise.
+func utf8String(b []byte) string {
 	if utf8.Valid(b) {
 		return string(b)
 	}
-	// Strip invalid runes; this is a debug field, fidelity not
-	// critical.
 	v := make([]rune, 0, len(b))
 	for i := 0; i < len(b); {
 		r, size := utf8.DecodeRune(b[i:])
@@ -119,4 +130,79 @@ func sanitizeForLog(b []byte) string {
 		i += size
 	}
 	return string(v)
+}
+
+// Credential redaction is layered over three regex passes — the
+// shapes differ enough that one expression would be unreadable.
+// Each pass strips a different class of leak; replacements use
+// `***REDACTED***` so an operator can still audit that a secret
+// WAS present, just not what it was.
+//
+//  1. jsonStringKVRE — JSON-style `"keyword": "value"` (the most
+//     common shape; engines echoing inbound config / request bodies).
+//  2. bearerTokenRE — `Authorization: <anything>` or inline
+//     `Bearer <token>`; covers HTTP-header echoes in error messages.
+//  3. genericKVRE — bare `keyword=value` or `keyword: value` (urlencoded,
+//     YAML, TOML, ad-hoc log fragments).
+//
+// Keyword set is the OWASP top: authorization, api_key (with
+// dash/underscore variants), bearer, token, password, secret.
+// Operators with unusual credential names should configure their
+// log shipper as defense-in-depth rather than widen this list past
+// the point of false positives on ordinary "code" / "type" fields.
+var (
+	jsonStringKVRE = regexp.MustCompile(
+		`(?i)"(authorization|api[_-]?key|bearer|token|password|secret)"\s*:\s*"[^"]*"`,
+	)
+	bearerTokenRE = regexp.MustCompile(
+		`(?i)(authorization\s*:\s*[^\r\n"]+|\bbearer\s+[^\s"',;}\r\n]+(?:\.[^\s"',;}\r\n]+)*)`,
+	)
+	genericKVRE = regexp.MustCompile(
+		`(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*"?([^\s"',;}]+)"?`,
+	)
+)
+
+func redactCredentialFragments(s string) string {
+	s = jsonStringKVRE.ReplaceAllStringFunc(s, func(match string) string {
+		// Find the `:` separating key from value; redact the value.
+		sub := jsonStringKVRE.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		colon := strings.Index(match, ":")
+		if colon < 0 {
+			return match
+		}
+		return match[:colon+1] + `"***REDACTED***"`
+	})
+	s = bearerTokenRE.ReplaceAllStringFunc(s, func(match string) string {
+		// Two shapes: "Authorization: X" → "Authorization: ***REDACTED***";
+		// "Bearer X.Y.Z" → "Bearer ***REDACTED***".
+		lower := strings.ToLower(match)
+		if strings.HasPrefix(lower, "authorization") {
+			colon := strings.Index(match, ":")
+			if colon >= 0 {
+				return match[:colon+1] + " ***REDACTED***"
+			}
+		}
+		// Bearer-shaped: keep the literal "Bearer" prefix from the
+		// match's casing for auditability.
+		space := strings.IndexAny(match, " \t")
+		if space >= 0 {
+			return match[:space+1] + "***REDACTED***"
+		}
+		return "***REDACTED***"
+	})
+	s = genericKVRE.ReplaceAllStringFunc(s, func(match string) string {
+		sub := genericKVRE.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		idx := strings.Index(match, sub[2])
+		if idx < 0 {
+			return match
+		}
+		return match[:idx] + "***REDACTED***"
+	})
+	return s
 }
