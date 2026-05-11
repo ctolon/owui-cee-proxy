@@ -178,7 +178,10 @@ func mountFacadeDocling(r chi.Router, d RouterDeps) {
 	r.Get(facade+"/result/{id}", async.Result)
 }
 
-// mountFacadeExternal wires the PUT /process external-loader path.
+// mountFacadeExternal wires the PUT /process external-loader path
+// plus its async sibling at POST /process/async. The async path
+// reuses the shared Async handler (status/result endpoints live
+// under the docling facade prefix and are facade-agnostic).
 func mountFacadeExternal(r chi.Router, d RouterDeps) {
 	processPath := d.Config.Routing.Facade.External.Path
 	if processPath == "" {
@@ -192,6 +195,19 @@ func mountFacadeExternal(r chi.Router, d RouterDeps) {
 		Resolver:    d.MimeResolver,
 	}
 	r.Put(processPath, ext.Process)
+
+	// Async sibling: same input shape as the sync external facade
+	// (raw body + Content-Type + optional X-Filename). Closes C-45
+	// facade asymmetry.
+	if d.Orchestrator != nil {
+		async := &handlers.Async{
+			Registry:     d.Registry,
+			Orchestrator: d.Orchestrator,
+			Resolver:     d.MimeResolver,
+			APIKeyHeader: d.Config.Security.ProxyAPIKeyHeader,
+		}
+		r.Post(processPath+"/async", async.SubmitProcess)
+	}
 }
 
 // requiredReadinessNames returns the set of probe names whose health

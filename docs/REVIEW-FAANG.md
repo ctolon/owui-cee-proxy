@@ -197,13 +197,18 @@ list + roadmap themes.)
 |-----|------|------------|
 | C-38 | Backend | New `internal/spool/` package consolidates the two drift-prone copies of the multipart spool: the sync-path version (`handlers/spool.go`, which carried the C-16 geometric-growth fix + O_TMPFILE + Seek) and the async-path version (`tasks/spool.go`, which still allocated `make([]byte, threshold+1)` regardless of file size). Public API: `spool.Part(r, threshold, maxBytes) → *spool.Reader`, `spool.ErrTooLarge`, `spool.ThresholdDefault`, `spool.InitialBuf`. Build-tagged `openSpoolFile` moves with the package so the Linux O_TMPFILE preference applies on both code paths. handlers/ and tasks/ each lose ~110 lines; the `bytes.Buffer`-grow path is now the canonical one (the older fixed pre-alloc is gone). Existing tests carried over verbatim under the new package name. |
 
+### Closed in `feat/p2-async-external-facade` (v0.7.0 + 5)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-45 | API design | New async endpoint `POST /process/async` mirrors the synchronous External facade's input shape (raw body + Content-Type + optional X-Filename). New `tasks.PayloadFromExternalRequest` reuses the same spool + MIME-resolver path the sync handler uses so dispatch lands on the same engine either way. The handler (`Async.SubmitProcess`) is mounted alongside the sync `PUT /process` when `tasks.enabled: true`. Status/Result endpoints under the docling prefix already serve every facade (the TaskID is opaque), so the operator surface stays compact. Three unit tests pin the early-return contract (missing Content-Type, orchestrator disabled, no engine for external facade). Closes the facade-asymmetry C-45 flagged. |
+
 ### P2 (backlog) — remaining
 
 A subset, ordered by likely ROI:
 
 - **C-33** `EnginePathsConfig` is a per-compat grab-bag struct that N×M-explodes; replace with `Paths map[string]string` per-engine. [Plugin SDK]
 - **C-35** No OpenAPI/AsyncAPI spec — the single largest UX gap for client teams. [API design]
-- **C-45** Async path supports only docling facade (`/v1/convert/*/async`); external `/process/async` is missing — facade asymmetry. [API design]
 
 ---
 
