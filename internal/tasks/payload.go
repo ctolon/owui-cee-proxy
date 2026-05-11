@@ -18,6 +18,7 @@ import (
 
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
+	"github.com/ctolon/owui-cee-proxy/internal/spool"
 )
 
 // TypeConvert is the asynq task type for engine convert jobs.
@@ -108,12 +109,12 @@ func payloadFromMultipart(r *http.Request, maxBlob int64, resolver *mimedetect.R
 			// Spool to memory (small) or temp file (large). H1 + H2:
 			// the per-blob cap is enforced BEFORE the bytes are written
 			// past the threshold — fail fast.
-			sr, err := spoolPart(part, asyncSpoolThreshold, maxBlob)
+			sr, err := spool.Part(part, asyncSpoolThreshold, maxBlob)
 			fname := part.FileName()
 			declaredCT := part.Header.Get("Content-Type")
 			_ = part.Close()
 			if err != nil {
-				if errors.Is(err, errSpoolTooLarge) {
+				if errors.Is(err, spool.ErrTooLarge) {
 					return nil, noop, fmt.Errorf("blob %q exceeds max_blob_bytes %d", fname, maxBlob)
 				}
 				return nil, noop, fmt.Errorf("copy part: %w", err)

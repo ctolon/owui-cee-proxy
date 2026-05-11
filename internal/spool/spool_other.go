@@ -1,6 +1,6 @@
 //go:build !linux
 
-package handlers
+package spool
 
 import "os"
 
