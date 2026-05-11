@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ctolon/owui-cee-proxy/internal/engine"
 )
 
 func TestDefaults(t *testing.T) {
@@ -358,6 +360,322 @@ func TestAcceptedFacades(t *testing.T) {
 	require.ElementsMatch(t, []string{"docling", "external"}, AcceptedFacades(CompatDoclingExternal))
 	require.ElementsMatch(t, []string{"docling", "external"}, AcceptedFacades(CompatTika))
 	require.Empty(t, AcceptedFacades("unknown"))
+}
+
+// TestDefaults_RoutingStrategyIsMimeThenExtension pins down the
+// operator-facing default. Any time the default changes, an
+// integration test elsewhere needs to be updated, so the assertion
+// stays on its own line.
+func TestDefaults_RoutingStrategyIsMimeThenExtension(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	require.Equal(t, engine.StrategyMimeThenExt, c.Routing.Strategy,
+		"default routing strategy MUST preserve v0.4.x MIME-only behaviour")
+}
+
+// TestLoad_RoutingStrategy_AllValues is a small driver over the four
+// valid strategy literals — proves the validator accepts each and
+// the value flows through Load() unmolested.
+func TestLoad_RoutingStrategy_AllValues(t *testing.T) {
+	for _, s := range []string{"mime", "extension", "mime_then_extension", "extension_then_mime"} {
+		s := s
+		t.Run(s, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "v.yaml")
+			yaml := strings.Replace(validYAML, `default_engine: "main"`,
+				`default_engine: "main"
+  strategy: "`+s+`"`, 1)
+			require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+
+			t.Setenv("DOCLING_API_KEY", "a")
+			t.Setenv("KREUZBERG_API_KEY", "b")
+
+			c, err := Load(path)
+			require.NoError(t, err)
+			require.Equal(t, engine.RoutingStrategy(s), c.Routing.Strategy)
+		})
+	}
+}
+
+// TestLoad_RoutingStrategy_RejectsUnknown — the validator MUST fail
+// the bootstrap on a typo'd strategy literal. Operator gets a clear
+// startup error instead of a silent degradation into the default.
+func TestLoad_RoutingStrategy_RejectsUnknown(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v.yaml")
+	yaml := strings.Replace(validYAML, `default_engine: "main"`,
+		`default_engine: "main"
+  strategy: "mim_then_ext"`, 1)
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+
+	t.Setenv("DOCLING_API_KEY", "a")
+	t.Setenv("KREUZBERG_API_KEY", "b")
+
+	_, err := Load(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Strategy")
+}
+
+// TestLoad_EngineExtensions_RoundTrip — operator declares an
+// extensions allowlist in YAML; it MUST round-trip through Load
+// without mutation so the registry sees what was written.
+func TestLoad_EngineExtensions_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v.yaml")
+	yaml := strings.Replace(validYAML, `mime_types: ["application/pdf"]`,
+		`mime_types: ["application/pdf"]
+    extensions: [".pdf", ".PDF"]`, 1)
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+
+	t.Setenv("DOCLING_API_KEY", "a")
+	t.Setenv("KREUZBERG_API_KEY", "b")
+
+	c, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, []string{".pdf", ".PDF"}, c.Engines["main"].Extensions,
+		"extensions list must round-trip verbatim; normalisation happens later in compileExtensions")
+}
+
+// TestLoad_MimedetectOverrides_RoundTrip — operator extension
+// overrides MUST flow through Load and validate cleanly.
+func TestLoad_MimedetectOverrides_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v.yaml")
+	yaml := validYAML + `
+mimedetect:
+  extension_overrides:
+    ".epub": "application/epub+zip"
+    ".msg": "application/x-custom-msg"
+`
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+
+	t.Setenv("DOCLING_API_KEY", "a")
+	t.Setenv("KREUZBERG_API_KEY", "b")
+
+	c, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, "application/epub+zip", c.Mimedetect.ExtensionOverrides[".epub"])
+	require.Equal(t, "application/x-custom-msg", c.Mimedetect.ExtensionOverrides[".msg"])
+}
+
+// TestLoad_MimedetectOverrides_RejectsBadKey — typo'd key (missing
+// leading dot, uppercase, etc.) MUST fail Load.
+func TestLoad_MimedetectOverrides_RejectsBadKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v.yaml")
+	yaml := validYAML + `
+mimedetect:
+  extension_overrides:
+    "msg": "application/x-custom-msg"
+`
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+
+	t.Setenv("DOCLING_API_KEY", "a")
+	t.Setenv("KREUZBERG_API_KEY", "b")
+
+	_, err := Load(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "extension_overrides")
+}
+
+// TestValidateTimeoutHierarchy_RejectsEngineExceedingServerTimeout
+// pins the C-2 invariant: an engine's request_timeout MUST NOT
+// exceed server.request_timeout. The chi mw.Timeout(server.request_
+// timeout) would otherwise cancel the context before the engine's
+// own deadline fires, surfacing as a transport error to the breaker
+// and tripping a healthy backend.
+func TestValidateTimeoutHierarchy_RejectsEngineExceedingServerTimeout(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Server.RequestTimeout = 60 * time.Second
+	c.Server.WriteTimeout = 70 * time.Second
+	c.Engines["main"] = EngineConfig{
+		Enable:         true,
+		CompatType:     CompatDocling,
+		URL:            "http://docling.local",
+		AuthHeader:     "X-Api-Key",
+		APIKey:         "k",
+		RequestTimeout: 5 * time.Minute, // exceeds 60 s
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timeout hierarchy")
+	require.Contains(t, err.Error(), "engines.main.request_timeout")
+}
+
+// TestValidateTimeoutHierarchy_RejectsWriteTimeoutBelowSlack pins
+// the second half of the invariant: server.write_timeout MUST be at
+// least 2 s above server.request_timeout so the response writer
+// does not tear down mid-stream when a slow handler exhausts its
+// per-request budget.
+func TestValidateTimeoutHierarchy_RejectsWriteTimeoutBelowSlack(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Server.RequestTimeout = 60 * time.Second
+	c.Server.WriteTimeout = 60 * time.Second // no slack
+	c.Engines["main"] = EngineConfig{
+		Enable: true, CompatType: CompatDocling, URL: "http://docling.local",
+		AuthHeader: "X-Api-Key", APIKey: "k", RequestTimeout: 30 * time.Second,
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timeout hierarchy")
+	require.Contains(t, err.Error(), "write_timeout")
+}
+
+// TestValidateTimeoutHierarchy_AcceptsCorrectHierarchy verifies the
+// happy path: engine ≤ server.request ≤ server.write − slack.
+func TestValidateTimeoutHierarchy_AcceptsCorrectHierarchy(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Server.RequestTimeout = 60 * time.Second
+	c.Server.WriteTimeout = 5 * time.Minute
+	c.Engines["main"] = EngineConfig{
+		Enable: true, CompatType: CompatDocling, URL: "http://docling.local",
+		AuthHeader: "X-Api-Key", APIKey: "k", RequestTimeout: 30 * time.Second,
+	}
+	require.NoError(t, Validate(c))
+}
+
+// TestValidateResolvedSecrets_RejectsCRLFInResolvedAPIKey pins the
+// C-4 fix. An env-var value that picks up a stray CR/LF (typical
+// when an operator pastes a multi-line secret) must fail the
+// bootstrap, not silently smuggle a header-injection payload into
+// the outbound auth header.
+func TestValidateResolvedSecrets_RejectsCRLFInResolvedAPIKey(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false // single-engine docling-only fixture
+	c.Engines["main"] = EngineConfig{
+		Enable:     true,
+		CompatType: CompatDocling,
+		URL:        "http://docling.local",
+		AuthHeader: "X-Api-Key",
+		APIKey:     "good-key\r\nX-Admin: yes",
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-printable byte")
+	require.Contains(t, err.Error(), "engines.main.api_key")
+}
+
+// TestValidateResolvedSecrets_RejectsControlByteInMultiAuthEntry
+// covers the C-4 fix on the new multi-stamp surface.
+func TestValidateResolvedSecrets_RejectsControlByteInMultiAuthEntry(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Engines["main"] = EngineConfig{
+		Enable:     true,
+		CompatType: CompatDocling,
+		URL:        "http://docling.local",
+		AuthHeader: "X-Api-Key",
+		APIKey:     "primary",
+		AuthHeaders: []AuthHeaderConfig{
+			{Header: "Authorization", APIKeyEnv: "X", APIKey: "bearer\x00null"},
+		},
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "auth_headers[0]")
+}
+
+// TestValidateResolvedSecrets_AcceptsCleanASCII passes for the happy
+// path — printable ASCII plus tabs (allowed because some token
+// schemes use them as separators) flow through unchanged.
+func TestValidateResolvedSecrets_AcceptsCleanASCII(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Engines["main"] = EngineConfig{
+		Enable:     true,
+		CompatType: CompatDocling,
+		URL:        "http://docling.local",
+		AuthHeader: "X-Api-Key",
+		APIKey:     "ABC.123-tab\there",
+	}
+	require.NoError(t, Validate(c))
+}
+
+// TestEngineConfig_EffectiveAuthSpecs_PrependsSingular pins the
+// migration contract: a legacy singular AuthHeader keeps working
+// AND comes FIRST in the resolved spec list. AuthHeaders entries
+// follow in YAML order.
+func TestEngineConfig_EffectiveAuthSpecs_PrependsSingular(t *testing.T) {
+	t.Parallel()
+	ec := EngineConfig{
+		AuthHeader: "X-Api-Key",
+		APIKey:     "primary",
+		AuthScheme: AuthSchemeRaw,
+		AuthHeaders: []AuthHeaderConfig{
+			{Header: "Authorization", APIKey: "bearer-key", Scheme: AuthSchemeBearer},
+			{Header: "X-Tenant", APIKey: "tenant-1", Scheme: AuthSchemeRaw},
+		},
+	}
+	specs := ec.EffectiveAuthSpecs()
+	require.Len(t, specs, 3)
+	require.Equal(t, "X-Api-Key", specs[0].Header)
+	require.Equal(t, Secret("primary"), specs[0].APIKey)
+	require.Equal(t, "Authorization", specs[1].Header)
+	require.Equal(t, "X-Tenant", specs[2].Header)
+}
+
+// TestEngineConfig_EffectiveAuthSpecs_PublicEngineEmpty — no
+// AuthHeader, no AuthHeaders → empty slice (public-engine path).
+func TestEngineConfig_EffectiveAuthSpecs_PublicEngineEmpty(t *testing.T) {
+	t.Parallel()
+	require.Empty(t, EngineConfig{}.EffectiveAuthSpecs())
+}
+
+// TestValidate_AuthHeadersDedupAcrossSingularAndSlice locks down the
+// case-insensitive dedup contract. An operator who declares the same
+// header in both forms (or twice in the slice) must get a clear
+// bootstrap error — silent overwrite would mask the real config drift.
+func TestValidate_AuthHeadersDedupAcrossSingularAndSlice(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Engines["main"] = EngineConfig{
+		Enable:     true,
+		CompatType: CompatDocling,
+		URL:        "http://docling.local",
+		AuthHeader: "X-Api-Key",
+		AuthHeaders: []AuthHeaderConfig{
+			{Header: "x-api-key", APIKeyEnv: "X"},
+		},
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate header")
+}
+
+// TestLoad_MimedetectOverrides_RejectsBadValue — value that doesn't
+// look like a MIME (no slash, contains parameters, etc.) MUST fail.
+func TestLoad_MimedetectOverrides_RejectsBadValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v.yaml")
+	yaml := validYAML + `
+mimedetect:
+  extension_overrides:
+    ".msg": "not-a-mime"
+`
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+
+	t.Setenv("DOCLING_API_KEY", "a")
+	t.Setenv("KREUZBERG_API_KEY", "b")
+
+	_, err := Load(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "extension_overrides")
 }
 
 const validYAML = `

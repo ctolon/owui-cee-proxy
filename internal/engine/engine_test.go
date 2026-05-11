@@ -38,7 +38,7 @@ func TestNewRegistry_DefaultMustExist(t *testing.T) {
 	t.Parallel()
 	_, err := NewRegistry(map[Name]RegistryEntry{
 		"a": {Engine: &fakeEngine{name: "a", caps: docFacade()}},
-	}, "missing")
+	}, "missing", "")
 	require.ErrorIs(t, err, ErrUnknownEngine)
 }
 
@@ -49,7 +49,7 @@ func TestNewRegistry_GetAndDefault(t *testing.T) {
 	r, err := NewRegistry(map[Name]RegistryEntry{
 		"primary":   {Engine: d},
 		"secondary": {Engine: tk},
-	}, "primary")
+	}, "primary", "")
 	require.NoError(t, err)
 	require.Equal(t, d, r.Default())
 
@@ -73,7 +73,7 @@ func TestRegistry_PickByMimeAndFacade(t *testing.T) {
 		"default-eng": {Engine: d},
 		"pdf-eng":     {Engine: pdf, MimeTypes: []string{"application/pdf"}},
 		"img-eng":     {Engine: img, MimeTypes: []string{"image/*"}},
-	}, "default-eng")
+	}, "default-eng", "")
 	require.NoError(t, err)
 
 	cases := []struct {
@@ -99,7 +99,7 @@ func TestRegistry_PickWithError_NoEngineForFacade(t *testing.T) {
 	d := &fakeEngine{name: "doc-only", caps: docFacade()}
 	r, err := NewRegistry(map[Name]RegistryEntry{
 		"doc-only": {Engine: d},
-	}, "doc-only")
+	}, "doc-only", "")
 	require.NoError(t, err)
 
 	_, err = r.PickWithError(FacadeExternal, "application/pdf")

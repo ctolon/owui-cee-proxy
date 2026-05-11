@@ -98,6 +98,91 @@ func TestApply_NopMetricsIsSafe(t *testing.T) {
 	})
 }
 
+// TestApplyMulti_StampsAllConfiguredHeaders is the multi-stamp
+// happy path: singular AuthHeader + AuthHeaders entries all land on
+// the outbound request with the right scheme rendering.
+func TestApplyMulti_StampsAllConfiguredHeaders(t *testing.T) {
+	t.Parallel()
+	rec := &recordingMetrics{}
+	h := make(http.Header)
+	cfg := config.EngineConfig{
+		AuthHeader: "X-Api-Key",
+		APIKey:     "primary-key",
+		AuthScheme: config.AuthSchemeRaw,
+		AuthHeaders: []config.AuthHeaderConfig{
+			{Header: "Authorization", APIKey: "bearer-key", Scheme: config.AuthSchemeBearer},
+			{Header: "X-Tenant-Token", APIKey: "tenant-1", Scheme: config.AuthSchemeRaw},
+		},
+	}
+
+	outcomes := authutil.ApplyMulti(h, "kreuzberg", cfg, rec)
+
+	require.Equal(t, []authutil.Outcome{
+		authutil.OutcomeAttached, authutil.OutcomeAttached, authutil.OutcomeAttached,
+	}, outcomes)
+	require.Equal(t, "primary-key", h.Get("X-Api-Key"))
+	require.Equal(t, "Bearer bearer-key", h.Get("Authorization"))
+	require.Equal(t, "tenant-1", h.Get("X-Tenant-Token"))
+	require.Len(t, rec.calls, 3, "metrics emitted once per stamp")
+}
+
+// TestApplyMulti_EmptyKeyInOneEntrySkipsOnlyThatOne pins down the
+// fail-closed semantics. One empty key MUST NOT prevent the others
+// from being attached — operators rotate keys one at a time.
+func TestApplyMulti_EmptyKeyInOneEntrySkipsOnlyThatOne(t *testing.T) {
+	t.Parallel()
+	rec := &recordingMetrics{}
+	h := http.Header{}
+	cfg := config.EngineConfig{
+		AuthHeaders: []config.AuthHeaderConfig{
+			{Header: "X-Api-Key", APIKey: "key-a", Scheme: config.AuthSchemeRaw},
+			{Header: "X-Missing", APIKey: "" /* rotated out */, Scheme: config.AuthSchemeRaw},
+			{Header: "X-Other", APIKey: "key-b", Scheme: config.AuthSchemeRaw},
+		},
+	}
+
+	outcomes := authutil.ApplyMulti(h, "kb", cfg, rec)
+
+	require.Equal(t, []authutil.Outcome{
+		authutil.OutcomeAttached, authutil.OutcomeMissingKey, authutil.OutcomeAttached,
+	}, outcomes)
+	require.Equal(t, "key-a", h.Get("X-Api-Key"))
+	require.Empty(t, h.Get("X-Missing"))
+	require.Equal(t, "key-b", h.Get("X-Other"))
+}
+
+// TestApplyMulti_NoAuthConfiguredRecordsSingleNoAuth — public engine
+// path: no singular fields, no AuthHeaders. One OutcomeNoAuth
+// emitted; no header touched.
+func TestApplyMulti_NoAuthConfiguredRecordsSingleNoAuth(t *testing.T) {
+	t.Parallel()
+	rec := &recordingMetrics{}
+	h := http.Header{}
+	outcomes := authutil.ApplyMulti(h, "public", config.EngineConfig{}, rec)
+	require.Equal(t, []authutil.Outcome{authutil.OutcomeNoAuth}, outcomes)
+	require.Empty(t, h)
+	require.Len(t, rec.calls, 1)
+}
+
+// TestFormatHeaderValuesMulti_BuildsWireMap covers the passthrough
+// composition path: reverseproxy.New takes the rendered map.
+func TestFormatHeaderValuesMulti_BuildsWireMap(t *testing.T) {
+	t.Parallel()
+	cfg := config.EngineConfig{
+		AuthHeader: "X-Api-Key",
+		APIKey:     "k",
+		AuthScheme: config.AuthSchemeRaw,
+		AuthHeaders: []config.AuthHeaderConfig{
+			{Header: "Authorization", APIKey: "b", Scheme: config.AuthSchemeBearer},
+			{Header: "X-Missing"},
+		},
+	}
+	got := authutil.FormatHeaderValuesMulti(cfg)
+	require.Equal(t, "k", got["X-Api-Key"])
+	require.Equal(t, "Bearer b", got["Authorization"])
+	require.NotContains(t, got, "X-Missing", "entries with empty key MUST NOT appear")
+}
+
 // TestFormatHeaderValue covers the passthrough composition. The
 // reverseproxy mount can't call Apply (no http.Header at construction
 // time) so it formats the value via this helper; the two must produce

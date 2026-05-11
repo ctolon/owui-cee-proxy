@@ -24,6 +24,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/doclingexternal"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/external"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/tika"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/httpclient"
 	"github.com/ctolon/owui-cee-proxy/internal/observability"
 	httptransport "github.com/ctolon/owui-cee-proxy/internal/transport/http"
@@ -154,16 +155,21 @@ func newProxyServerWithLogCapture(t *testing.T, cfg *config.Config) (*httptest.S
 		br := breaker.New(name, ec.Breaker, nil)
 		ad, err := buildAdapter(engine.Name(name), ec, c, br)
 		require.NoError(t, err)
-		entries[engine.Name(name)] = engine.RegistryEntry{Engine: ad, MimeTypes: ec.MimeTypes}
+		entries[engine.Name(name)] = engine.RegistryEntry{
+			Engine:     ad,
+			MimeTypes:  ec.MimeTypes,
+			Extensions: ec.Extensions,
+		}
 	}
-	registry, err := engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultEngine))
+	registry, err := engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultEngine), cfg.Routing.Strategy)
 	require.NoError(t, err)
 
 	handler, err := httptransport.NewRouter(httptransport.RouterDeps{
-		Config:   cfg,
-		Logger:   logger,
-		Metrics:  metrics,
-		Registry: registry,
+		Config:       cfg,
+		Logger:       logger,
+		Metrics:      metrics,
+		Registry:     registry,
+		MimeResolver: mimedetect.NewResolver(cfg.Mimedetect.ExtensionOverrides),
 	})
 	require.NoError(t, err)
 

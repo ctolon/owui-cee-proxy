@@ -57,6 +57,11 @@ func (a *Adapter) Capabilities() engine.EngineCapabilities {
 }
 
 func (a *Adapter) Convert(ctx context.Context, req *engine.ConvertRequest) (*engine.ConvertResponse, error) {
+	// Per-engine request_timeout enforcement — see docling.Convert for
+	// the rationale. Without the wrap, RequestTimeout from YAML never
+	// reaches the outbound call deadline.
+	ctx, cancel := a.client.WithDeadline(ctx)
+	defer cancel()
 	if len(req.Sources) > 0 {
 		return jsonError(http.StatusNotImplemented, "external: http_sources not supported"), nil
 	}
@@ -113,11 +118,13 @@ func (a *Adapter) callOnce(ctx context.Context, req *engine.ConvertRequest, f en
 	if err != nil {
 		return nil, err
 	}
-	if f.ContentType != "" {
-		hreq.Header.Set("Content-Type", f.ContentType)
-	}
+	// f.ContentType reaches us from a caller-controlled multipart part
+	// header. Re-validate before stamping on the outbound request —
+	// any control byte / CR-LF / parameter survivor would otherwise
+	// land as a header-injection primitive against the backend.
+	hreq.Header.Set("Content-Type", compatutil.SafeOutboundMIME(f.ContentType))
 	hreq.Header.Set("X-Filename", url.PathEscape(SafeFilename(f.Filename)))
-	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
+	authutil.ApplyMulti(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	if req.RequestID != "" {
 		hreq.Header.Set("X-Request-ID", req.RequestID)
 	}

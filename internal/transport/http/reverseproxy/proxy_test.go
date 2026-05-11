@@ -24,7 +24,7 @@ func TestNew_StripsXForwardedFromUntrustedSource(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	rp, err := New(backend.URL, "/svc", "", "", "", nil, nil) // no trusted proxies
+	rp, err := New(backend.URL, "/svc", nil, nil, nil) // no trusted proxies
 	require.NoError(t, err)
 
 	front := httptest.NewServer(rp)
@@ -58,7 +58,7 @@ func TestNew_PreservesXForwardedFromTrustedSource(t *testing.T) {
 	defer backend.Close()
 
 	// 127.0.0.0/8 covers the loopback that httptest uses.
-	rp, err := New(backend.URL, "/svc", "", "", "", nil, []string{"127.0.0.0/8"})
+	rp, err := New(backend.URL, "/svc", nil, nil, []string{"127.0.0.0/8"})
 	require.NoError(t, err)
 
 	front := httptest.NewServer(rp)
@@ -145,7 +145,7 @@ func TestNew_StampsConfiguredAPIKey(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	rp, err := New(backend.URL, "/docling", "X-Api-Key", "secret-from-env", "raw", nil, nil)
+	rp, err := New(backend.URL, "/docling", map[string]string{"X-Api-Key": "secret-from-env"}, nil, nil)
 	require.NoError(t, err)
 	front := httptest.NewServer(rp)
 	defer front.Close()
@@ -168,7 +168,7 @@ func TestNew_EmptyAPIKeyDoesNotStampHeader(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	rp, err := New(backend.URL, "/docling", "X-Api-Key", "", "raw", nil, nil)
+	rp, err := New(backend.URL, "/docling", nil, nil, nil)
 	require.NoError(t, err)
 	front := httptest.NewServer(rp)
 	defer front.Close()
@@ -195,7 +195,7 @@ func TestNew_StripsInboundAuthorization(t *testing.T) {
 	// Configure the engine's own auth on a DIFFERENT header so we can
 	// be sure the caller's Authorization got dropped (not just
 	// overwritten by the engine's own stamp).
-	rp, err := New(backend.URL, "/docling", "X-Api-Key", "engine-key", "raw", nil, nil)
+	rp, err := New(backend.URL, "/docling", map[string]string{"X-Api-Key": "engine-key"}, nil, nil)
 	require.NoError(t, err)
 	front := httptest.NewServer(rp)
 	defer front.Close()
@@ -225,7 +225,7 @@ func TestNew_AppliesBearerScheme(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	rp, err := New(backend.URL, "/docling", "Authorization", "raw-key", "bearer", nil, nil)
+	rp, err := New(backend.URL, "/docling", map[string]string{"Authorization": "Bearer " + "raw-key"}, nil, nil)
 	require.NoError(t, err)
 	front := httptest.NewServer(rp)
 	defer front.Close()
@@ -249,7 +249,7 @@ func TestNew_RawSchemeForwardsLiteralKey(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	rp, err := New(backend.URL, "/docling", "X-Api-Key", "raw-key", "raw", nil, nil)
+	rp, err := New(backend.URL, "/docling", map[string]string{"X-Api-Key": "raw-key"}, nil, nil)
 	require.NoError(t, err)
 	front := httptest.NewServer(rp)
 	defer front.Close()

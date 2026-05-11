@@ -12,6 +12,8 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
@@ -36,12 +38,24 @@ type External struct {
 	// UpstreamLog mirrors Convert.UpstreamLog — per-engine policy
 	// resolver for non-2xx response logging.
 	UpstreamLog func(engineName string) config.UpstreamLogConfig
+	// Resolver: see Convert.Resolver. The composition root passes the
+	// same instance to both handlers.
+	Resolver *mimedetect.Resolver
 }
 
 func (e *External) Process(w http.ResponseWriter, r *http.Request) {
+	// Baseline observability stamp: error paths from here on (missing
+	// Content-Type, spool failure, no engine for facade) must NOT leave
+	// the access log with empty engine + engine_url fields. Stamp the
+	// default engine and routing strategy up front; later code
+	// overwrites once dispatch settles.
+	defaultEng := e.Registry.Default()
+	r = r.WithContext(mw.WithEngine(r.Context(), string(defaultEng.Name()), defaultEng.URL()))
+	r = r.WithContext(mw.WithPickDecision(r.Context(), string(engine.PickSourceDefault), string(e.Registry.Strategy())))
+
 	declaredCT := r.Header.Get("Content-Type")
 	if declaredCT == "" {
-		http.Error(w, "missing Content-Type", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, respond.NewExternalError("missing Content-Type"))
 		return
 	}
 
@@ -51,23 +65,23 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	sr, err := spoolPart(r.Body, int64(spoolThresholdDefault), e.MaxBytes)
 	if err != nil {
 		if errors.Is(err, ErrSpoolTooLarge) {
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			writeJSON(w, http.StatusRequestEntityTooLarge, respond.NewExternalError("request body too large"))
 			return
 		}
-		http.Error(w, "read body failed", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, respond.NewExternalError("read body failed"))
 		return
 	}
 	defer func() { _ = sr.Close() }()
 
 	// Resolve effective MIME — generic / empty declared types fall
-	// back to a magic-byte sniff over the spool head, restored
-	// afterwards so the adapter still streams the full body. Pinned
-	// down here BEFORE engine selection so a client sending
-	// application/octet-stream + a PDF actually routes to the PDF
-	// engine, not the default catch-all.
-	resolved, srcerr := peekAndResolveMIME(declaredCT, sr)
+	// back to a magic-byte sniff (and finally filename extension)
+	// over the spool head, restored afterwards so the adapter still
+	// streams the full body. Pinned down here BEFORE engine selection
+	// so a client sending application/octet-stream + a PDF actually
+	// routes to the PDF engine, not the default catch-all.
+	resolved, srcerr := peekAndResolveMIME(declaredCT, filename, sr, e.Resolver)
 	if srcerr != nil {
-		http.Error(w, "mime detect failed", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, respond.NewExternalError("mime detect failed"))
 		return
 	}
 	contentType := resolved.MIME
@@ -84,9 +98,13 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 		}},
 	}
 
-	eng, err := e.Registry.PickWithError(engine.FacadeExternal, contentType)
+	eng, pickSrc, err := e.Registry.PickRouteVerbose(engine.FacadeExternal, engine.PickHint{
+		MIME:     contentType,
+		Filename: filename,
+	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("no engine for external facade: %v", err), http.StatusNotImplemented)
+		writeJSON(w, http.StatusNotImplemented,
+			respond.NewExternalError(fmt.Sprintf("no engine for external facade: %v", err)))
 		return
 	}
 
@@ -94,7 +112,21 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	ctx = mw.WithFilename(ctx, filename)
 	ctx = mw.WithFileCount(ctx, 1)
 	ctx = mw.WithMimeType(ctx, contentType)
+	ctx = mw.WithPickDecision(ctx, string(pickSrc), string(e.Registry.Strategy()))
 	mw.WithMimeSource(ctx, string(resolved.Source), declaredCT)
+
+	if e.Logger.GetLevel() <= zerolog.DebugLevel {
+		e.Logger.Debug().
+			Str("event", "engine_pick_decision").
+			Str("request_id", req.RequestID).
+			Str("engine", string(eng.Name())).
+			Str("engine_url", eng.URL()).
+			Str("pick_source", string(pickSrc)).
+			Str("routing_strategy", string(e.Registry.Strategy())).
+			Str("mime_type", contentType).
+			Str("filename", filename).
+			Msg("engine pick decision")
+	}
 
 	resp, err := eng.Convert(ctx, req)
 	if err != nil {
@@ -105,7 +137,8 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 			Str("engine", string(eng.Name())).
 			Str("engine_url", eng.URL()).
 			Msg("external facade engine convert failed")
-		http.Error(w, fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID), http.StatusBadGateway)
+		writeJSON(w, http.StatusBadGateway, respond.NewExternalError(
+			fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID)))
 		return
 	}
 	if e.UpstreamLog != nil {

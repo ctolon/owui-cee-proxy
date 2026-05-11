@@ -20,6 +20,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/doclingexternal"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/external"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/tika"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/httpclient"
 	"github.com/ctolon/owui-cee-proxy/internal/observability"
 	"github.com/ctolon/owui-cee-proxy/internal/tasks"
@@ -83,6 +84,11 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 		&ssrfLoggerAdapter{logger: logger},
 	)
 
+	// Single process-wide MIME resolver. The map merge happens here,
+	// once; handlers + tasks share the same instance for free.
+	mimeResolver := mimedetect.NewResolver(cfg.Mimedetect.ExtensionOverrides)
+	logRoutingBootstrap(logger, cfg, registry, len(cfg.Mimedetect.ExtensionOverrides))
+
 	handler, err := httptransport.NewRouter(httptransport.RouterDeps{
 		Config:        cfg,
 		Logger:        logger,
@@ -92,6 +98,7 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 		RedisHealth:   redisHealth,
 		SSRFResolver:  resolver,
 		HealthMetrics: &healthMetricsAdapter{m: metrics},
+		MimeResolver:  mimeResolver,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("router: %w", err)
@@ -151,12 +158,16 @@ func buildRegistry(cfg *config.Config, logger zerolog.Logger, metrics *observabi
 		if err != nil {
 			return nil, fmt.Errorf("engine %s: %w", name, err)
 		}
-		entries[engine.Name(name)] = engine.RegistryEntry{Engine: ad, MimeTypes: ec.MimeTypes}
+		entries[engine.Name(name)] = engine.RegistryEntry{
+			Engine:     ad,
+			MimeTypes:  ec.MimeTypes,
+			Extensions: ec.Extensions,
+		}
 	}
 	if len(entries) == 0 {
 		return nil, errors.New("no engines enabled")
 	}
-	return engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultEngine))
+	return engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultEngine), cfg.Routing.Strategy)
 }
 
 // logEngineBootstrap emits one info line per enabled engine + one warn
@@ -182,6 +193,7 @@ func logEngineBootstrap(logger zerolog.Logger, cfg *config.Config) {
 			Str("auth_scheme", string(ec.AuthScheme)).
 			Strs("facades", facades).
 			Int("mime_types_count", len(ec.MimeTypes)).
+			Int("extensions_count", len(ec.Extensions)).
 			Msg("engine initialised")
 	}
 	for _, w := range cfg.AuthWarnings() {
@@ -189,6 +201,20 @@ func logEngineBootstrap(logger zerolog.Logger, cfg *config.Config) {
 			Str("event", "engine_auth_warning").
 			Msg(w)
 	}
+}
+
+// logRoutingBootstrap emits a single record describing the effective
+// routing strategy + the number of operator-supplied MIME extension
+// overrides. Surface so operators can verify the YAML knobs landed
+// without diffing a logback config.
+func logRoutingBootstrap(logger zerolog.Logger, cfg *config.Config, reg engine.Registry, overrideCount int) {
+	logger.Info().
+		Str("event", "routing_strategy_initialised").
+		Str("configured_strategy", string(cfg.Routing.Strategy)).
+		Str("effective_strategy", string(reg.Strategy())).
+		Str("default_engine", cfg.Routing.DefaultEngine).
+		Int("mime_extension_overrides_count", overrideCount).
+		Msg("routing strategy initialised")
 }
 
 // breakerStateHook returns the OnStateChange callback bound to the

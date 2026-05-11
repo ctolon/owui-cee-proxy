@@ -64,6 +64,13 @@ func (a *Adapter) Capabilities() engine.EngineCapabilities {
 // Convert routes by request shape. Files → /v1/convert/file (multipart);
 // Sources → /v1/convert/source (JSON).
 func (a *Adapter) Convert(ctx context.Context, req *engine.ConvertRequest) (*engine.ConvertResponse, error) {
+	// Enforce the per-engine request_timeout. Without this wrap, the
+	// configured timeout is silent dead code — only ResponseHeaderTimeout
+	// fired, so a backend that hangs AFTER returning headers (e.g.,
+	// streaming OCR output then deadlocking) holds the goroutine until
+	// the server-wide chi Timeout middleware fires.
+	ctx, cancel := a.client.WithDeadline(ctx)
+	defer cancel()
 	if len(req.Sources) > 0 {
 		return a.convertSource(ctx, req)
 	}
@@ -145,7 +152,7 @@ func (a *Adapter) convertFile(ctx context.Context, req *engine.ConvertRequest) (
 		return nil, err
 	}
 	hreq.Header.Set("Content-Type", mw.FormDataContentType())
-	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
+	authutil.ApplyMulti(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	ApplyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 
 	return a.do(hreq)
@@ -165,7 +172,7 @@ func (a *Adapter) convertSource(ctx context.Context, req *engine.ConvertRequest)
 		return nil, err
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
+	authutil.ApplyMulti(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	ApplyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 	return a.do(hreq)
 }

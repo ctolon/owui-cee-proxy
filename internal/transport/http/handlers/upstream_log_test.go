@@ -97,3 +97,62 @@ func TestLogUpstreamStatus_PerEngineLevelOverride(t *testing.T) {
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &line))
 	require.Equal(t, "info", line["level"], "operator-configured Level4xx must be honoured")
 }
+
+// TestLogUpstreamStatus_BodySnippetRedactsCredentials pins the C-5
+// fix: when an upstream echoes the inbound Authorization / api_key /
+// password / bearer / token / secret marker into its error body,
+// sanitizeForLog scrubs the value so the operator-facing log line
+// never carries the secret. The marker (and its assignment
+// punctuation) is preserved for auditability — only the value
+// becomes "***REDACTED***".
+func TestLogUpstreamStatus_BodySnippetRedactsCredentials(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+		// payload is the literal token a regression would leak.
+		payload string
+	}{
+		{"json api_key", `{"error":"bad","api_key":"sk-superSecret123"}`, "sk-superSecret123"},
+		{"json Authorization echo", `{"detail":"auth failed Authorization: Bearer abc.def.ghi"}`, "abc.def.ghi"},
+		{"urlencoded api-key", "msg=fail&api-key=plainKeyXY&z=1", "plainKeyXY"},
+		{"yaml-ish password", `password: hunter2`, "hunter2"},
+		{"toml token", `token = "tok_alpha"`, "tok_alpha"},
+		{"case-insensitive Secret", `SECRET=topSecretValue`, "topSecretValue"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			buf := &bytes.Buffer{}
+			logger := zerolog.New(buf).Level(zerolog.DebugLevel)
+			cfg := config.UpstreamLogConfig{Enabled: true, BodySnippetBytes: 1024, Level4xx: "warn", Level5xx: "error"}
+
+			_ = logUpstreamStatus(context.Background(), logger, newResp(500, c.body), cfg, "e", "u", "r", "f")
+
+			require.NotContains(t, buf.String(), c.payload, "credential payload MUST NOT survive into the log line")
+			require.Contains(t, buf.String(), "***REDACTED***",
+				"redaction marker MUST appear in place of the credential")
+		})
+	}
+}
+
+// TestLogUpstreamStatus_BodySnippetPreservesInnocuousContent
+// asserts the redactor is precise — non-credential JSON survives
+// the pass unchanged. The literal "code" in "error_code" is one
+// the older regex would have mishandled if it had matched on
+// "code" alone; we want to be sure we did NOT widen the keyword
+// list so aggressively that ordinary error bodies get scrubbed.
+func TestLogUpstreamStatus_BodySnippetPreservesInnocuousContent(t *testing.T) {
+	t.Parallel()
+	buf := &bytes.Buffer{}
+	logger := zerolog.New(buf).Level(zerolog.DebugLevel)
+	cfg := config.UpstreamLogConfig{Enabled: true, BodySnippetBytes: 1024, Level4xx: "warn", Level5xx: "error"}
+
+	body := `{"error_code":"E_INVALID","detail":"unsupported language en-XX"}`
+	_ = logUpstreamStatus(context.Background(), logger, newResp(400, body), cfg, "e", "u", "r", "f")
+	require.Contains(t, buf.String(), "unsupported language en-XX",
+		"non-credential body content MUST flow through verbatim")
+	require.NotContains(t, buf.String(), "***REDACTED***",
+		"redactor MUST NOT scrub ordinary error bodies")
+}

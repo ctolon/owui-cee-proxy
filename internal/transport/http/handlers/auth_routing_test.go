@@ -92,7 +92,7 @@ func TestAuth_RouteByMIME_NonDefaultEngine_StampsCorrectKey(t *testing.T) {
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
 		"primary":  {Engine: primaryEng, MimeTypes: primaryMimes},
 		"fallback": {Engine: fallbackEng},
-	}, "fallback")
+	}, "fallback", "")
 	require.NoError(t, err)
 
 	convert := &handlers.Convert{Registry: registry, Logger: zerolog.Nop()}
@@ -184,7 +184,7 @@ func TestAuth_RouteByMIME_GenericOctetStreamSniffsAndRoutes(t *testing.T) {
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
 		"primary":  {Engine: primaryEng, MimeTypes: primaryMimes},
 		"fallback": {Engine: fallbackEng},
-	}, "fallback")
+	}, "fallback", "")
 	require.NoError(t, err)
 
 	convert := &handlers.Convert{Registry: registry, Logger: zerolog.Nop()}

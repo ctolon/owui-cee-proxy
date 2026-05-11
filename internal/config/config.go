@@ -25,7 +25,16 @@ import (
 	envprovider "github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"github.com/ctolon/owui-cee-proxy/internal/engine"
 )
+
+// RoutingStrategy re-exports engine.RoutingStrategy so YAML/validator
+// machinery can refer to it without forcing the engine package to
+// import config (CLAUDE.md layering invariant: engine never depends
+// on config). The Go type alias means a config.RoutingStrategy IS an
+// engine.RoutingStrategy, no conversion needed at call sites.
+type RoutingStrategy = engine.RoutingStrategy
 
 // Secret wraps a string value that must never be printed or marshaled
 // in cleartext.
@@ -88,6 +97,21 @@ var engineNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 // length cap.
 var authHeaderRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
 
+// Extension key for mimedetect.extension_overrides. Single leading dot,
+// lowercase alphanumeric run, length-capped. We deliberately exclude
+// multi-segment forms (".tar.gz") — filepath.Ext only returns the
+// terminal suffix, so a multi-segment key would never match and
+// would silently confuse operators.
+var extensionOverrideKeyRE = regexp.MustCompile(`^\.[a-z0-9]{1,15}$`)
+
+// MIME value for mimedetect.extension_overrides. Structural sanity:
+// "type/subtype" with the printable, non-whitespace alphabets the
+// IANA grammar permits. We don't enforce IANA registration — many
+// real-world MIME types are de-facto (e.g.,
+// application/vnd.ms-outlook). Parameters (";charset=...") are
+// rejected — overrides should encode the canonical bare media type.
+var mimeValueRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$`)
+
 type Config struct {
 	Server          ServerConfig            `koanf:"server" validate:"required"`
 	Routing         RoutingConfig           `koanf:"routing" validate:"required"`
@@ -96,6 +120,10 @@ type Config struct {
 	RateLimitGlobal RateLimitConfig         `koanf:"ratelimit_global"`
 	Tasks           TasksConfig             `koanf:"tasks"`
 	Observability   ObservabilityConfig     `koanf:"observability"`
+	// Mimedetect configures the MIME resolution stage that sits in
+	// front of registry dispatch — sniff thresholds, CFB-ambiguity
+	// overrides, etc.
+	Mimedetect MimedetectConfig `koanf:"mimedetect"`
 }
 
 type ServerConfig struct {
@@ -125,9 +153,33 @@ type TLSServerConfig struct {
 type RoutingConfig struct {
 	// DefaultEngine references a key in Engines. The named engine MUST
 	// be enabled; cross-field validation in Validate() enforces this.
-	DefaultEngine string            `koanf:"default_engine" validate:"required"`
-	Facade        FacadeConfig      `koanf:"facade"`
-	Passthrough   PassthroughConfig `koanf:"passthrough"`
+	DefaultEngine string `koanf:"default_engine" validate:"required"`
+	// Strategy selects how the registry picks an engine for a given
+	// facade + request hint. Empty value resolves to
+	// `mime_then_extension` at registry construction time, which is
+	// also the bootstrap default — that combination preserves v0.4.x
+	// MIME-only behaviour whenever no engine declares an `extensions`
+	// list. See internal/engine/routing_strategy.go for semantics.
+	Strategy    RoutingStrategy   `koanf:"strategy" validate:"omitempty,oneof=mime extension mime_then_extension extension_then_mime"`
+	Facade      FacadeConfig      `koanf:"facade"`
+	Passthrough PassthroughConfig `koanf:"passthrough"`
+}
+
+// MimedetectConfig configures the MIME resolution layer.
+//
+// ExtensionOverrides extends or replaces the built-in CFB-disambiguation
+// table that maps a filename extension (lowercase, leading dot — e.g.,
+// ".msg") to a canonical MIME type. Operator-supplied entries are
+// merged on top of the built-in defaults, so listing only the keys you
+// care about is safe; listing a key that already exists replaces it.
+//
+// Keys MUST be lowercase, leading-dot, single-suffix
+// (e.g., ".msg" — not "msg" or ".tar.gz"). Values MUST look like a
+// MIME type ("type/subtype"); we don't enforce IANA registration, but
+// the format is checked via regex so a typo fails the bootstrap
+// instead of silently misrouting at request time.
+type MimedetectConfig struct {
+	ExtensionOverrides map[string]string `koanf:"extension_overrides"`
 }
 
 // FacadeConfig controls which client-facing protocols the proxy
@@ -170,10 +222,32 @@ type EngineConfig struct {
 	// AuthScheme adjusts how the API key is rendered. "raw" uses the
 	// key value as-is (e.g., "X-Api-Key: abc123"); "bearer" prepends
 	// "Bearer " (e.g., "Authorization: Bearer abc123").
-	AuthScheme     AuthScheme        `koanf:"auth_scheme" validate:"omitempty,oneof=raw bearer"`
-	RequestTimeout time.Duration     `koanf:"request_timeout"`
-	HealthPath     string            `koanf:"health_path"`
-	MimeTypes      []string          `koanf:"mime_types"`
+	AuthScheme AuthScheme `koanf:"auth_scheme" validate:"omitempty,oneof=raw bearer"`
+	// AuthHeaders is the multi-stamp auth list. When non-empty it
+	// supplements the singular AuthHeader/APIKeyEnv/AuthScheme triple
+	// — every entry here AND the singular form (if also set) get
+	// stamped on every outbound request. Use this when a backend
+	// requires multiple credential headers (X-Api-Key +
+	// Authorization, X-Tenant-Token + X-Api-Key, etc.). Header names
+	// are deduplicated case-insensitively at config-load time; a
+	// duplicate fails the bootstrap so silent overrides cannot happen.
+	//
+	// Migration: an old single-header config remains valid forever.
+	// applyEngineDefaults synthesises a one-element AuthHeaders slice
+	// from the singular fields when the slice is empty so adapters
+	// can read AuthHeaders uniformly without case-splitting.
+	AuthHeaders    []AuthHeaderConfig `koanf:"auth_headers" validate:"omitempty,dive"`
+	RequestTimeout time.Duration      `koanf:"request_timeout"`
+	HealthPath     string             `koanf:"health_path"`
+	MimeTypes      []string           `koanf:"mime_types"`
+	// Extensions is the case-insensitive filename-extension allowlist
+	// consulted when routing.strategy enables the extension phase
+	// (`extension`, `mime_then_extension`, `extension_then_mime`).
+	// Values may include or omit the leading dot; the registry
+	// normalises both to ".pdf" form. Empty list means the engine
+	// abstains from extension dispatch — operator opt-in,
+	// symmetric with the mime_types allowlist semantics.
+	Extensions     []string          `koanf:"extensions"`
 	Paths          EnginePathsConfig `koanf:"paths"`
 	ForwardOptions map[string]string `koanf:"forward_options"`
 	HTTP           HTTPClientConfig  `koanf:"http"`
@@ -185,17 +259,37 @@ type EngineConfig struct {
 	Observability EngineObservabilityConfig `koanf:"observability"`
 }
 
+// AuthHeaderConfig is one entry in the multi-stamp auth list. Each
+// entry stamps an INDEPENDENT outbound HTTP header; the engine
+// adapter walks the slice in order and applies each.
+//
+// Fields:
+//   - Header: outbound header name (regex-validated against
+//     `authHeaderRE`, same charset as the singular AuthHeader).
+//   - APIKeyEnv: env var name to read the credential from.
+//   - APIKey: resolved at startup by resolveSecrets; never YAML-borne.
+//   - Scheme: "raw" | "bearer"; empty defaults to "raw" (matches the
+//     singular AuthScheme default).
+type AuthHeaderConfig struct {
+	Header    string     `koanf:"header" validate:"required"`
+	APIKeyEnv string     `koanf:"api_key_env" validate:"required"`
+	APIKey    Secret     `koanf:"-"`
+	Scheme    AuthScheme `koanf:"scheme" validate:"omitempty,oneof=raw bearer"`
+}
+
 // EngineObservabilityConfig overrides ObservabilityConfig.Upstream
 // fields for a single engine. Each pointer-typed field is "unset =
 // inherit global". We use *bool / *int instead of zero-value sentinels
 // so that a user can explicitly disable an engine's upstream logging
 // even when the global default has it on.
 type EngineObservabilityConfig struct {
-	Enabled          *bool   `koanf:"enabled"`
-	BodySnippetBytes *int    `koanf:"body_snippet_bytes"`
-	Level4xx         *string `koanf:"level_4xx"`
-	Level5xx         *string `koanf:"level_5xx"`
-	BodyLogBytes     *int    `koanf:"body_log_bytes"`
+	Enabled              *bool   `koanf:"enabled"`
+	BodySnippetBytes     *int    `koanf:"body_snippet_bytes"`
+	Level4xx             *string `koanf:"level_4xx"`
+	Level5xx             *string `koanf:"level_5xx"`
+	BodyLogBytes         *int    `koanf:"body_log_bytes"`
+	FullCapture          *bool   `koanf:"full_capture"`
+	FullCaptureBodyBytes *int    `koanf:"full_capture_body_bytes"`
 }
 
 // EnginePathsConfig overrides per-compat default paths. When a field
@@ -396,6 +490,24 @@ type UpstreamLogConfig struct {
 	// contents to the log stream — keep small and prefer ephemeral
 	// debugging sessions.
 	BodyLogBytes int `koanf:"body_log_bytes" validate:"gte=0"`
+	// FullCapture turns on per-request audit logging that emits a
+	// dedicated `request_full_capture` log line carrying the full
+	// inbound + outbound request/response surface. DEFAULT OFF —
+	// enabling this in production WILL leak PII / secrets to logs;
+	// the redactor strips known credential headers
+	// (Authorization, X-Api-Key, the configured ProxyAPIKeyHeader,
+	// every engine's configured auth_header) but cannot detect
+	// secrets embedded in bodies. Run with a short-lived debug log
+	// sink, never the primary log stream. Every captured line carries
+	// `sensitive_capture: true` so log shippers can route it
+	// separately.
+	FullCapture bool `koanf:"full_capture"`
+	// FullCaptureBodyBytes is the truncation cap applied to captured
+	// request + response bodies. 0 keeps bodies redacted entirely
+	// (only headers + status + size are logged). Effective max is
+	// 64 KiB regardless of operator setting — the capture pipeline
+	// hard-caps to keep one bad upload from filling the log shipper.
+	FullCaptureBodyBytes int `koanf:"full_capture_body_bytes" validate:"gte=0,lte=65536"`
 }
 
 type MetricsConfig struct {
@@ -419,13 +531,20 @@ func Default() *Config {
 			Listen:            "0.0.0.0:8080",
 			ReadTimeout:       30 * time.Second,
 			ReadHeaderTimeout: 10 * time.Second,
-			WriteTimeout:      5 * time.Minute,
-			IdleTimeout:       120 * time.Second,
-			RequestTimeout:    5 * time.Minute,
-			MaxHeaderBytes:    1 << 20,
-			MaxBodyBytes:      500 << 20,
-			ShutdownGrace:     30 * time.Second,
-			HTTP2:             true,
+			// WriteTimeout MUST exceed RequestTimeout by at least the
+			// 2 s slack enforced in validateTimeoutHierarchy so the
+			// response writer is not torn down mid-stream when a slow
+			// handler exhausts its per-request budget. A 30 s gap
+			// covers TCP teardown + body finalisation under load AND
+			// leaves operators headroom to bump RequestTimeout up to
+			// 5 m 28 s before they have to touch WriteTimeout too.
+			WriteTimeout:   5*time.Minute + 30*time.Second,
+			IdleTimeout:    120 * time.Second,
+			RequestTimeout: 5 * time.Minute,
+			MaxHeaderBytes: 1 << 20,
+			MaxBodyBytes:   500 << 20,
+			ShutdownGrace:  30 * time.Second,
+			HTTP2:          true,
 			TLS: TLSServerConfig{
 				MinVersion: "1.3",
 				ClientAuth: "none",
@@ -433,6 +552,7 @@ func Default() *Config {
 		},
 		Routing: RoutingConfig{
 			DefaultEngine: "",
+			Strategy:      engine.StrategyMimeThenExt,
 			Facade: FacadeConfig{
 				Docling:  DoclingFacadeConfig{Enabled: true, Prefix: "/v1"},
 				External: ExternalFacadeConfig{Enabled: true, Path: "/process"},
@@ -628,6 +748,15 @@ func resolveSecrets(c *Config) {
 		if ec.APIKeyEnv != "" {
 			ec.APIKey = Secret(os.Getenv(ec.APIKeyEnv))
 		}
+		// Multi-stamp: each AuthHeaders entry has its own env var.
+		// Resolve every one; missing env vars surface in AuthWarnings
+		// the same way the singular fields do.
+		for i, ah := range ec.AuthHeaders {
+			if ah.APIKeyEnv != "" {
+				ah.APIKey = Secret(os.Getenv(ah.APIKeyEnv))
+				ec.AuthHeaders[i] = ah
+			}
+		}
 		c.Engines[name] = ec
 	}
 	if c.Security.ProxyAPIKeysEnv != "" {
@@ -687,6 +816,102 @@ func Validate(c *Config) error {
 	if err := validateServerTLS(c); err != nil {
 		return err
 	}
+	if err := validateTimeoutHierarchy(c); err != nil {
+		return err
+	}
+	if err := validateResolvedSecrets(c); err != nil {
+		return err
+	}
+	if err := validateMimedetect(c); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateResolvedSecrets scans every resolved engine credential for
+// bytes outside the visible-ASCII window (0x20..0x7E, plus TAB).
+// Operators sometimes paste a credential into the wrong env var, or
+// the env var picks up a trailing CR/LF from a shell expansion; the
+// outbound HTTP layer would otherwise carry the invalid bytes
+// straight into the engine backend's header parser. CR/LF in
+// particular is the CWE-93 header-injection primitive.
+//
+// We fail the bootstrap rather than silently strip — operators get
+// a clear error pointing at which key is malformed, instead of
+// debugging stochastic 502s in production.
+//
+// Public-engine entries (no env var configured, so APIKey == "") are
+// skipped: empty is fine, that is the no-auth path.
+func validateResolvedSecrets(c *Config) error {
+	for name, ec := range c.Engines {
+		if !ec.Enable {
+			continue
+		}
+		if err := scanAuthValue(name, "api_key", string(ec.APIKey)); err != nil {
+			return err
+		}
+		for i, ah := range ec.AuthHeaders {
+			fieldName := fmt.Sprintf("auth_headers[%d]", i)
+			if err := scanAuthValue(name, fieldName, string(ah.APIKey)); err != nil {
+				return err
+			}
+		}
+	}
+	for i, k := range c.Security.ProxyAPIKeys {
+		fieldName := fmt.Sprintf("security.proxy_api_keys[%d]", i)
+		if err := scanAuthValue("", fieldName, string(k)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanAuthValue rejects any byte outside the visible-ASCII window
+// (0x20..0x7E, plus TAB) in the resolved credential. Returns nil for
+// an empty value — that is the unconfigured / public-engine path
+// which validateResolvedSecrets's caller has already chosen to
+// accept.
+func scanAuthValue(engine, field, val string) error {
+	if val == "" {
+		return nil
+	}
+	for i := 0; i < len(val); i++ {
+		b := val[i]
+		if b == '\t' {
+			continue
+		}
+		if b < 0x20 || b > 0x7E {
+			scope := field
+			if engine != "" {
+				scope = fmt.Sprintf("engines.%s.%s", engine, field)
+			}
+			return fmt.Errorf("%s: resolved credential contains a non-printable byte at offset %d (0x%02x); CR/LF or stray control bytes in env vars are rejected to prevent header injection",
+				scope, i, b)
+		}
+	}
+	return nil
+}
+
+// validateMimedetect enforces the format of the operator-supplied
+// extension override map. Both halves of every entry must look right
+// at startup — a typo here translates to a silent routing
+// misbehaviour at request time, which is exactly what the override
+// map was meant to fix in the first place.
+func validateMimedetect(c *Config) error {
+	for k, v := range c.Mimedetect.ExtensionOverrides {
+		if !extensionOverrideKeyRE.MatchString(k) {
+			return fmt.Errorf(
+				"mimedetect.extension_overrides: invalid key %q; want lowercase, leading-dot, single-segment extension like %q",
+				k, ".msg",
+			)
+		}
+		if !mimeValueRE.MatchString(v) {
+			return fmt.Errorf(
+				"mimedetect.extension_overrides[%q]: invalid MIME %q; want a bare %q form without parameters",
+				k, v, "type/subtype",
+			)
+		}
+	}
 	return nil
 }
 
@@ -706,6 +931,27 @@ func validateAuthHeaders(c *Config) error {
 		}
 		if ec.AuthHeader != "" && !authHeaderRE.MatchString(ec.AuthHeader) {
 			return fmt.Errorf("engines.%s.auth_header %q: invalid header name; must match %s", name, ec.AuthHeader, authHeaderRE)
+		}
+		// Multi-stamp validation: each entry needs a valid header
+		// regex; the resolved set (singular + multi) must dedup
+		// case-insensitively. Duplicates would silently overwrite
+		// each other on the wire (http.Header.Set semantics) — fail
+		// the bootstrap so the operator sees the conflict.
+		seen := make(map[string]string, 1+len(ec.AuthHeaders))
+		if ec.AuthHeader != "" {
+			seen[strings.ToLower(ec.AuthHeader)] = ec.AuthHeader
+		}
+		for i, ah := range ec.AuthHeaders {
+			if !authHeaderRE.MatchString(ah.Header) {
+				return fmt.Errorf("engines.%s.auth_headers[%d].header %q: invalid header name; must match %s",
+					name, i, ah.Header, authHeaderRE)
+			}
+			key := strings.ToLower(ah.Header)
+			if prev, dup := seen[key]; dup {
+				return fmt.Errorf("engines.%s.auth_headers: duplicate header %q (also declared as %q); each header name may appear once across auth_header + auth_headers",
+					name, ah.Header, prev)
+			}
+			seen[key] = ah.Header
 		}
 	}
 	return nil
@@ -781,6 +1027,29 @@ func acceptedFacades(compat CompatType) []string {
 // so the canonical compat_type → facade mapping lives in this package.
 func AcceptedFacades(compat CompatType) []string { return acceptedFacades(compat) }
 
+// EffectiveAuthSpecs returns the flattened auth-header list the
+// adapter should walk on every outbound request. The singular
+// AuthHeader/APIKeyEnv/AuthScheme triple is prepended (when set);
+// AuthHeaders entries follow in declared order. Adapters iterate the
+// result and stamp each header — the multi-stamp contract.
+//
+// Result MAY be empty (engine has no auth configured at all); MAY
+// contain duplicate header names if validateAuthHeaders is not
+// invoked first (it is, at config load).
+func (e EngineConfig) EffectiveAuthSpecs() []AuthHeaderConfig {
+	specs := make([]AuthHeaderConfig, 0, 1+len(e.AuthHeaders))
+	if e.AuthHeader != "" {
+		specs = append(specs, AuthHeaderConfig{
+			Header:    e.AuthHeader,
+			APIKeyEnv: e.APIKeyEnv,
+			APIKey:    e.APIKey,
+			Scheme:    e.AuthScheme,
+		})
+	}
+	specs = append(specs, e.AuthHeaders...)
+	return specs
+}
+
 // ResolveUpstream merges the per-engine observability override on top
 // of the global upstream defaults. Each EngineObservabilityConfig
 // field is "nil = inherit global". The returned value is what the
@@ -802,6 +1071,12 @@ func (e EngineConfig) ResolveUpstream(global UpstreamLogConfig) UpstreamLogConfi
 	}
 	if e.Observability.BodyLogBytes != nil {
 		out.BodyLogBytes = *e.Observability.BodyLogBytes
+	}
+	if e.Observability.FullCapture != nil {
+		out.FullCapture = *e.Observability.FullCapture
+	}
+	if e.Observability.FullCaptureBodyBytes != nil {
+		out.FullCaptureBodyBytes = *e.Observability.FullCaptureBodyBytes
 	}
 	return out
 }
@@ -837,6 +1112,15 @@ func (c *Config) AuthWarnings() []string {
 				name, ec.APIKeyEnv,
 			))
 		}
+		// Multi-stamp: same checks per entry.
+		for i, ah := range ec.AuthHeaders {
+			if ah.APIKeyEnv != "" && ah.APIKey == "" {
+				out = append(out, fmt.Sprintf(
+					"engine %q auth_headers[%d] references api_key_env=%q but the environment variable is empty; this stamp will be skipped at runtime",
+					name, i, ah.APIKeyEnv,
+				))
+			}
+		}
 	}
 	return out
 }
@@ -866,6 +1150,60 @@ func validateTasksConfig(c *Config) error {
 		if w < 0 {
 			return fmt.Errorf("tasks.queue_weights[%q] must be non-negative", q)
 		}
+	}
+	return nil
+}
+
+// validateTimeoutHierarchy enforces the operator-facing invariant
+// that the proxy's timeout knobs are layered correctly:
+//
+//	max(engines.*.request_timeout) ≤ server.request_timeout
+//	server.request_timeout         ≤ server.write_timeout − slack
+//
+// When the hierarchy inverts, the proxy still RUNS, but the chi
+// `mw.Timeout(server.request_timeout)` cancels the context before
+// a slower engine's per-engine timeout can fire — that turns a
+// healthy-but-slow backend into a cancelled-by-proxy failure, which
+// the breaker counts as a transport error and TRIPS, taking the
+// engine offline. Operators don't realise: they see breaker open,
+// they don't see "I configured my timeouts in the wrong order".
+//
+// We fail the bootstrap with a precise diff so the operator can fix
+// the YAML rather than debug a stochastic breaker trip in
+// production. The 2 s slack between request_timeout and write_timeout
+// covers TCP teardown + body finalisation under load; smaller deltas
+// race the http.Server.WriteTimeout fire against the in-flight
+// response stream.
+//
+// Engines with `RequestTimeout == 0` are skipped — the adapter
+// inherits `DefaultRequestTimeout` (120 s) which is bounded.
+func validateTimeoutHierarchy(c *Config) error {
+	const writeTimeoutSlack = 2 * time.Second
+
+	var maxEngine time.Duration
+	var maxEngineName string
+	for name, ec := range c.Engines {
+		if !ec.Enable {
+			continue
+		}
+		if ec.RequestTimeout > maxEngine {
+			maxEngine = ec.RequestTimeout
+			maxEngineName = name
+		}
+	}
+
+	if maxEngine > 0 && c.Server.RequestTimeout > 0 && maxEngine > c.Server.RequestTimeout {
+		return fmt.Errorf(
+			"timeout hierarchy: engines.%s.request_timeout=%s exceeds server.request_timeout=%s; the chi Timeout middleware would cancel the context before the engine's own ceiling fires, tripping the breaker on a healthy backend",
+			maxEngineName, maxEngine, c.Server.RequestTimeout,
+		)
+	}
+	if c.Server.WriteTimeout > 0 && c.Server.RequestTimeout > 0 &&
+		c.Server.RequestTimeout+writeTimeoutSlack > c.Server.WriteTimeout {
+		return fmt.Errorf(
+			"timeout hierarchy: server.request_timeout=%s requires server.write_timeout ≥ %s (current %s); without the %s slack the response writer is torn down mid-stream",
+			c.Server.RequestTimeout, c.Server.RequestTimeout+writeTimeoutSlack, c.Server.WriteTimeout, writeTimeoutSlack,
+		)
 	}
 	return nil
 }

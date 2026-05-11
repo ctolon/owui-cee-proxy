@@ -119,19 +119,28 @@ type Engine interface {
 type Registry interface {
 	Get(name Name) (Engine, error)
 	Default() Engine
-	// Pick returns the engine that should handle a request whose first
-	// file carries the given MIME type and arrived via facade. Each
-	// non-default enabled engine is checked in registration order;
-	// the first one whose Capabilities include the facade AND whose
-	// configured patterns match the MIME wins. The default engine is
-	// returned only when it itself accepts the facade — otherwise
-	// ErrNoEngineForFacade is returned via PickWithError; the
-	// convenience Pick returns the default unconditionally and lets
-	// the caller's request fail naturally.
+	// Pick is the legacy MIME-only shim retained for callers that
+	// haven't migrated to PickRoute. Internally delegates to
+	// PickRoute with an empty filename and the configured strategy.
+	// Falls back to default on no-match (permissive form).
 	Pick(facade Facade, mime string) Engine
-	// PickWithError is the strict form. It returns ErrNoEngineForFacade
-	// if no enabled engine answers the facade.
+	// PickWithError is the legacy strict shim — returns
+	// ErrNoEngineForFacade when no engine accepts the facade.
 	PickWithError(facade Facade, mime string) (Engine, error)
+	// PickRoute is the modern dispatcher. It consults BOTH the MIME
+	// allowlist and the filename-extension allowlist according to
+	// the registry's configured RoutingStrategy. Returns the engine
+	// or ErrNoEngineForFacade.
+	PickRoute(facade Facade, hint PickHint) (Engine, error)
+	// PickRouteVerbose returns the engine AND the matcher (MIME |
+	// extension | default) that won the dispatch. Surface this in
+	// observability log lines (`pick_source` field) so operators
+	// can audit routing decisions from one record.
+	PickRouteVerbose(facade Facade, hint PickHint) (Engine, PickSource, error)
+	// Strategy returns the registry's configured routing strategy.
+	// Handlers stamp it into the request-scoped log context so the
+	// access log can carry `routing_strategy` alongside `pick_source`.
+	Strategy() RoutingStrategy
 	Names() []Name
 }
 
@@ -142,12 +151,16 @@ var (
 	ErrNoEngineForFacade = errors.New("engine: no enabled engine accepts the requested facade")
 )
 
-// RegistryEntry pairs an engine with the MIME patterns it claims.
-// Patterns may be exact ("application/pdf") or top-level wildcards
-// ("image/*"). Matching is case-insensitive.
+// RegistryEntry pairs an engine with the MIME + extension allowlists
+// that govern when it gets picked. MimeTypes may be exact
+// ("application/pdf") or top-level wildcards ("image/*"). Extensions
+// are exact, leading-dot, lowercased (operator input is normalised
+// at compile time). Empty list = engine abstains from that phase of
+// dispatch — symmetrical to v0.2.x's empty-MimeTypes contract.
 type RegistryEntry struct {
-	Engine    Engine
-	MimeTypes []string
+	Engine     Engine
+	MimeTypes  []string
+	Extensions []string
 }
 
 // staticRegistry is an immutable Registry. Use NewRegistry to construct.
@@ -160,19 +173,24 @@ type staticRegistry struct {
 	order []Name
 	// pickOrder pre-computes the non-default engines in the order
 	// Pick() must scan them — alphabetical, default omitted.
-	pickOrder []namedPattern
+	pickOrder []namedRoute
+	// strategy is resolved at construction (empty → mime_then_extension).
+	strategy RoutingStrategy
 }
 
-// namedPattern bundles an engine with its compiled MIME rules so Pick
-// avoids a second map lookup per candidate.
-type namedPattern struct {
+// namedRoute bundles an engine with its compiled MIME + extension
+// rules so PickRoute avoids a second map lookup per candidate.
+type namedRoute struct {
 	engine   Engine
-	patterns []mimePattern
+	mimePats []mimePattern
+	extPats  []extPattern
 }
 
 // NewRegistry returns a Registry whose contents are fixed at construction
-// time. defaultEngine MUST be present in entries.
-func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name) (Registry, error) {
+// time. defaultEngine MUST be present in entries. strategy=="" resolves
+// to StrategyMimeThenExt (the operator-friendly default that preserves
+// v0.2.x behaviour when no engine declares an `extensions` allowlist).
+func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name, strategy RoutingStrategy) (Registry, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("engine: at least one engine must be registered")
 	}
@@ -183,11 +201,13 @@ func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name) (Registry, 
 
 	engines := make(map[Name]Engine, len(entries))
 	mimeMap := make(map[Name][]mimePattern, len(entries))
+	extMap := make(map[Name][]extPattern, len(entries))
 	nonDefault := make([]Name, 0, len(entries))
 
 	for n, e := range entries {
 		engines[n] = e.Engine
 		mimeMap[n] = compilePatterns(e.MimeTypes)
+		extMap[n] = compileExtensions(e.Extensions)
 		if n == defaultEngine {
 			continue
 		}
@@ -196,11 +216,12 @@ func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name) (Registry, 
 	stringSort(nonDefault)
 	order := append(append([]Name{}, nonDefault...), defaultEngine)
 
-	pickOrder := make([]namedPattern, 0, len(nonDefault))
+	pickOrder := make([]namedRoute, 0, len(nonDefault))
 	for _, n := range nonDefault {
-		pickOrder = append(pickOrder, namedPattern{
+		pickOrder = append(pickOrder, namedRoute{
 			engine:   engines[n],
-			patterns: mimeMap[n],
+			mimePats: mimeMap[n],
+			extPats:  extMap[n],
 		})
 	}
 
@@ -210,6 +231,7 @@ func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name) (Registry, 
 		defName:   defaultEngine,
 		order:     order,
 		pickOrder: pickOrder,
+		strategy:  ResolveStrategy(strategy),
 	}, nil
 }
 
@@ -223,46 +245,136 @@ func (s *staticRegistry) Get(name Name) (Engine, error) {
 
 func (s *staticRegistry) Default() Engine { return s.def }
 
+func (s *staticRegistry) Strategy() RoutingStrategy { return s.strategy }
+
+// Pick (legacy) — MIME-only shim. Delegates to PickRoute with empty
+// filename; permissive form falls back to default on no-match.
 func (s *staticRegistry) Pick(facade Facade, mime string) Engine {
-	if eng, err := s.PickWithError(facade, mime); err == nil {
+	if eng, err := s.PickRoute(facade, PickHint{MIME: mime}); err == nil {
 		return eng
 	}
-	// Permissive form: fall back to default even if it does not declare
-	// the facade. Calls that need strict 4xx behaviour use
-	// PickWithError. This keeps test fixtures simple.
 	return s.def
 }
 
+// PickWithError (legacy) — strict MIME-only shim.
 func (s *staticRegistry) PickWithError(facade Facade, mime string) (Engine, error) {
-	mime = canonicalMIME(mime)
-	// Phase 1: scan non-default engines that answer the facade.
-	for i := range s.pickOrder {
-		np := &s.pickOrder[i]
-		if !np.engine.Capabilities().AcceptsFacade(facade) {
-			continue
-		}
-		if mime == "" {
-			// no MIME hint → skip non-default candidates; let default
-			// handle (matches the v0.1.x pre-Capabilities semantics).
-			continue
-		}
-		for j := range np.patterns {
-			if np.patterns[j].matches(mime) {
-				return np.engine, nil
+	return s.PickRoute(facade, PickHint{MIME: mime})
+}
+
+// PickRoute is the modern dispatcher. Delegates to PickRouteVerbose
+// and discards the PickSource for callers that don't need it.
+func (s *staticRegistry) PickRoute(facade Facade, hint PickHint) (Engine, error) {
+	eng, _, err := s.PickRouteVerbose(facade, hint)
+	return eng, err
+}
+
+// PickRouteVerbose drives the 4-strategy dispatch. The decision tree:
+//
+//  1. Build the phase sequence from s.strategy:
+//     mime                 → [mime]
+//     extension            → [ext]
+//     mime_then_extension  → [mime, ext]   // default
+//     extension_then_mime  → [ext, mime]
+//  2. Each phase walks pickOrder (non-default engines, alphabetical)
+//     and returns the first match. Phases short-circuit — once a
+//     matcher claims the request, no later phase runs.
+//  3. If no phase matched, fall back to the default engine when it
+//     accepts the facade; otherwise ErrNoEngineForFacade.
+//
+// Empty hint (no MIME and no filename) never claims at any phase →
+// the request goes straight to the default. This preserves the
+// "source mode falls back to default" semantics convert.go relies on.
+func (s *staticRegistry) PickRouteVerbose(facade Facade, hint PickHint) (Engine, PickSource, error) {
+	mime := canonicalMIME(hint.MIME)
+	ext := strings.ToLower(filepathExt(hint.Filename))
+
+	phases := strategyPhases(s.strategy)
+	for _, ph := range phases {
+		switch ph {
+		case phaseMime:
+			if mime == "" {
+				continue
+			}
+			for i := range s.pickOrder {
+				np := &s.pickOrder[i]
+				if !np.engine.Capabilities().AcceptsFacade(facade) {
+					continue
+				}
+				for j := range np.mimePats {
+					if np.mimePats[j].matches(mime) {
+						return np.engine, PickSourceMIME, nil
+					}
+				}
+			}
+		case phaseExt:
+			if ext == "" {
+				continue
+			}
+			for i := range s.pickOrder {
+				np := &s.pickOrder[i]
+				if !np.engine.Capabilities().AcceptsFacade(facade) {
+					continue
+				}
+				for j := range np.extPats {
+					if np.extPats[j].matches(ext) {
+						return np.engine, PickSourceExtension, nil
+					}
+				}
 			}
 		}
 	}
-	// Phase 2: default engine, only if it accepts this facade.
+	// Final fallback: default engine, only if it accepts the facade.
 	if s.def.Capabilities().AcceptsFacade(facade) {
-		return s.def, nil
+		return s.def, PickSourceDefault, nil
 	}
-	return nil, ErrNoEngineForFacade
+	return nil, PickSourceDefault, ErrNoEngineForFacade
+}
+
+// dispatchPhase enumerates the phases PickRouteVerbose runs in order.
+// Kept as a typed int constant set (rather than a closure list) so
+// the inner switch stays inlineable on the hot path.
+type dispatchPhase int
+
+const (
+	phaseMime dispatchPhase = iota + 1
+	phaseExt
+)
+
+func strategyPhases(s RoutingStrategy) []dispatchPhase {
+	switch s {
+	case StrategyMime:
+		return []dispatchPhase{phaseMime}
+	case StrategyExtension:
+		return []dispatchPhase{phaseExt}
+	case StrategyExtThenMime:
+		return []dispatchPhase{phaseExt, phaseMime}
+	case StrategyMimeThenExt:
+		fallthrough
+	default:
+		return []dispatchPhase{phaseMime, phaseExt}
+	}
 }
 
 func (s *staticRegistry) Names() []Name {
 	out := make([]Name, len(s.order))
 	copy(out, s.order)
 	return out
+}
+
+// filepathExt is a tiny local wrapper around path/filepath.Ext.
+// Keeping it in this file avoids a path/filepath import sprawl
+// across the package (only Pick reads filename extensions). Returns
+// "" for empty input or when the basename has no dot.
+func filepathExt(name string) string {
+	for i := len(name) - 1; i >= 0; i-- {
+		switch name[i] {
+		case '/', '\\':
+			return ""
+		case '.':
+			return name[i:]
+		}
+	}
+	return ""
 }
 
 // canonicalMIME strips parameters (e.g., "; charset=utf-8") and

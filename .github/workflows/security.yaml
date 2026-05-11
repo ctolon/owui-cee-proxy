@@ -28,7 +28,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: gosec
-        uses: securego/gosec@master
+        uses: securego/gosec@4a3bd8af174872c778439083ded7adbf3747e770 # v2.26.1
         with:
           args: ./...
 
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: aquasecurity/trivy-action@master
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           ignore-unfixed: true
@@ -67,7 +67,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: Build image
         run: docker build -t scan-target:local -f deployments/docker/Dockerfile .
-      - uses: aquasecurity/trivy-action@master
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scan-target:local
           ignore-unfixed: true
@@ -107,7 +107,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
       - run: docker build -t scan-target:local -f deployments/docker/Dockerfile .
-      - uses: erzz/dockle-action@v1
+      - uses: erzz/dockle-action@e8a7c41f36f1236ca3282b298d425ffbfdb2e922 # v1
         with:
           image: scan-target:local
           failure-threshold: WARN
@@ -118,7 +118,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: bridgecrewio/checkov-action@master
+      - uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
         with:
           directory: deployments
           framework: helm,kubernetes
