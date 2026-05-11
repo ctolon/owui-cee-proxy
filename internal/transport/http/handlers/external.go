@@ -39,8 +39,8 @@ type External struct {
 }
 
 func (e *External) Process(w http.ResponseWriter, r *http.Request) {
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "" {
+	declaredCT := r.Header.Get("Content-Type")
+	if declaredCT == "" {
 		http.Error(w, "missing Content-Type", http.StatusBadRequest)
 		return
 	}
@@ -58,6 +58,19 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = sr.Close() }()
+
+	// Resolve effective MIME — generic / empty declared types fall
+	// back to a magic-byte sniff over the spool head, restored
+	// afterwards so the adapter still streams the full body. Pinned
+	// down here BEFORE engine selection so a client sending
+	// application/octet-stream + a PDF actually routes to the PDF
+	// engine, not the default catch-all.
+	resolved, srcerr := peekAndResolveMIME(declaredCT, sr)
+	if srcerr != nil {
+		http.Error(w, "mime detect failed", http.StatusBadRequest)
+		return
+	}
+	contentType := resolved.MIME
 
 	req := &engine.ConvertRequest{
 		Facade:    engine.FacadeExternal,
@@ -81,6 +94,7 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	ctx = mw.WithFilename(ctx, filename)
 	ctx = mw.WithFileCount(ctx, 1)
 	ctx = mw.WithMimeType(ctx, contentType)
+	mw.WithMimeSource(ctx, string(resolved.Source), declaredCT)
 
 	resp, err := eng.Convert(ctx, req)
 	if err != nil {
