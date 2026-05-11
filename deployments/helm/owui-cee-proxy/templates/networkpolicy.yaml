@@ -13,6 +13,21 @@ spec:
     - Ingress
     - Egress
   ingress:
+    # ALWAYS allow port 8080 from the kubelet probe network.
+    # Without this rule, enabling networkPolicy with the default
+    # empty ingressFrom emits a zero-rule ingress block → full
+    # deny → kubelet liveness/readiness probes 503 → pod
+    # CrashLoopBackOff within ~30 s.
+    #
+    # The default selector targets the kube-system namespace
+    # because every common CNI runs its kubelet probe path
+    # through there; operators tighten via .Values.networkPolicy
+    # .probeSources when they know their exact node-pool / CNI.
+    - from:
+        {{- toYaml (default (list (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" "kube-system")))) .Values.networkPolicy.probeSources) | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 8080
     {{- with .Values.networkPolicy.ingressFrom }}
     - from:
         {{- toYaml . | nindent 8 }}
