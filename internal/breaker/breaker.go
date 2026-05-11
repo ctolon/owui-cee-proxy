@@ -43,9 +43,10 @@ func New(name string, cfg config.BreakerConfig, onChange StateChangeFunc) *Break
 
 // StateValue maps a gobreaker state string to the numeric gauge
 // encoding the project uses across dashboards.
-//   closed   = 0
-//   half-open = 1
-//   open     = 2
+//
+//	closed   = 0
+//	half-open = 1
+//	open     = 2
 //
 // Returns -1 for unknown values so an operator alerts on
 // breaker_state == -1 (means an upstream library upgrade introduced

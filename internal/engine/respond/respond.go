@@ -14,8 +14,8 @@ package respond
 // Docling facade. Matches the upstream Docling Serve schema so
 // OpenWebUI's Pydantic decoder accepts the response.
 type DoclingError struct {
-	Status string          `json:"status"`
-	Errors []ErrorDetail   `json:"errors"`
+	Status string        `json:"status"`
+	Errors []ErrorDetail `json:"errors"`
 }
 
 // ErrorDetail is a single error entry inside DoclingError.Errors.

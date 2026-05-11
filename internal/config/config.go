@@ -243,30 +243,30 @@ type RateLimitConfig struct {
 }
 
 type SecurityConfig struct {
-	ProxyAPIKeysEnv   string         `koanf:"proxy_api_keys_env"`
-	ProxyAPIKeyHeader string         `koanf:"proxy_api_key_header"`
-	ProxyAPIKeys      []Secret       `koanf:"-"`
-	RequireAPIKey     bool           `koanf:"require_api_key"`
-	TrustedProxies    []string       `koanf:"trusted_proxies"`
-	CORS              CORSConfig     `koanf:"cors"`
-	SSRF              SSRFConfig     `koanf:"ssrf"`
+	ProxyAPIKeysEnv   string     `koanf:"proxy_api_keys_env"`
+	ProxyAPIKeyHeader string     `koanf:"proxy_api_key_header"`
+	ProxyAPIKeys      []Secret   `koanf:"-"`
+	RequireAPIKey     bool       `koanf:"require_api_key"`
+	TrustedProxies    []string   `koanf:"trusted_proxies"`
+	CORS              CORSConfig `koanf:"cors"`
+	SSRF              SSRFConfig `koanf:"ssrf"`
 }
 
 // SSRFConfig tunes the /v1/convert/source policy.
 //
-//   DNSCacheTTL   — how long to remember successful DNS resolutions.
-//                   0 disables caching (every request hits the
-//                   resolver). 60s is a good default: short enough
-//                   that an attacker who poisons a record can't keep
-//                   the proxy stuck on a stale IP for long, long
-//                   enough that bursty workloads from the same host
-//                   amortise the lookup.
-//   DNSCacheMax   — max entries before LRU-ish eviction (oldest by
-//                   expiry). Default 256.
-//   BlockedCIDRs  — extra CIDRs to add to the built-in deny list.
-//                   These are VALIDATED at Load() time so a typo
-//                   like "10.0.0.0/333" fails fast instead of
-//                   panicking at request time.
+//	DNSCacheTTL   — how long to remember successful DNS resolutions.
+//	                0 disables caching (every request hits the
+//	                resolver). 60s is a good default: short enough
+//	                that an attacker who poisons a record can't keep
+//	                the proxy stuck on a stale IP for long, long
+//	                enough that bursty workloads from the same host
+//	                amortise the lookup.
+//	DNSCacheMax   — max entries before LRU-ish eviction (oldest by
+//	                expiry). Default 256.
+//	BlockedCIDRs  — extra CIDRs to add to the built-in deny list.
+//	                These are VALIDATED at Load() time so a typo
+//	                like "10.0.0.0/333" fails fast instead of
+//	                panicking at request time.
 type SSRFConfig struct {
 	DNSCacheTTL  time.Duration `koanf:"dns_cache_ttl"`
 	DNSCacheMax  int           `koanf:"dns_cache_max" validate:"gte=0"`
@@ -305,15 +305,15 @@ type ObservabilityConfig struct {
 
 // HealthConfig controls the /readyz probe behaviour.
 //
-//   MaxParallel — how many engine probes to fan out concurrently.
-//                 The previous hard-coded value of 8 throttled
-//                 deployments with more engines into serial probes,
-//                 risking kubelet timeout. Default 16 covers most
-//                 realistic engine counts; bump for >16-engine
-//                 deployments.
-//   Timeout     — overall ceiling for the readiness probe. Each
-//                 engine's Health() inherits a derived deadline.
-//                 Default 5s.
+//	MaxParallel — how many engine probes to fan out concurrently.
+//	              The previous hard-coded value of 8 throttled
+//	              deployments with more engines into serial probes,
+//	              risking kubelet timeout. Default 16 covers most
+//	              realistic engine counts; bump for >16-engine
+//	              deployments.
+//	Timeout     — overall ceiling for the readiness probe. Each
+//	              engine's Health() inherits a derived deadline.
+//	              Default 5s.
 type HealthConfig struct {
 	MaxParallel int           `koanf:"max_parallel" validate:"gte=0"`
 	Timeout     time.Duration `koanf:"timeout"`
@@ -515,8 +515,8 @@ func DefaultEngineConfig() EngineConfig {
 
 // DefaultConfigPath returns the YAML config path the binary should
 // load when the operator didn't pass `-config`. Order of resolution:
-//   1. OWUI_PROXY_CONFIG env var (matches the loader's prefix scheme)
-//   2. configs/config.example.yaml (repo-relative fallback for dev)
+//  1. OWUI_PROXY_CONFIG env var (matches the loader's prefix scheme)
+//  2. configs/config.example.yaml (repo-relative fallback for dev)
 //
 // All env-var access for proxy startup MUST flow through this package
 // per the CLAUDE.md invariant ("don't call os.Getenv outside
@@ -681,24 +681,11 @@ func Validate(c *Config) error {
 	if err := validateSSRFConfig(c); err != nil {
 		return err
 	}
-	if c.Tasks.Enabled && c.Tasks.RedisURL == "" {
-		return fmt.Errorf("tasks.enabled=true but %s env is empty", c.Tasks.RedisURLEnv)
+	if err := validateTasksConfig(c); err != nil {
+		return err
 	}
-	if c.Tasks.Enabled {
-		if c.Tasks.MaxTotalBytes > 0 && c.Tasks.MaxBlobBytes > c.Tasks.MaxTotalBytes {
-			return fmt.Errorf("tasks.max_blob_bytes (%d) must be <= max_total_bytes (%d)", c.Tasks.MaxBlobBytes, c.Tasks.MaxTotalBytes)
-		}
-		if c.Tasks.TaskTimeout < 0 {
-			return fmt.Errorf("tasks.task_timeout must be non-negative")
-		}
-		for q, w := range c.Tasks.QueueWeights {
-			if w < 0 {
-				return fmt.Errorf("tasks.queue_weights[%q] must be non-negative", q)
-			}
-		}
-	}
-	if c.Server.TLS.Enabled && (c.Server.TLS.CertFile == "" || c.Server.TLS.KeyFile == "") {
-		return fmt.Errorf("server.tls.enabled=true requires cert_file and key_file")
+	if err := validateServerTLS(c); err != nil {
+		return err
 	}
 	return nil
 }
@@ -857,6 +844,43 @@ func (c *Config) AuthWarnings() []string {
 // validateEnginePaths enforces that docling-external engines declare
 // both endpoint paths (or rely on built-in defaults — declared empty
 // means use the adapter default).
+// validateTasksConfig pulls the async-task validation out of
+// Validate() so each helper stays under the cyclomatic-complexity
+// budget. Only meaningful when tasks.enabled=true; otherwise the
+// fields are dormant and not asserted.
+func validateTasksConfig(c *Config) error {
+	if !c.Tasks.Enabled {
+		return nil
+	}
+	if c.Tasks.RedisURL == "" {
+		return fmt.Errorf("tasks.enabled=true but %s env is empty", c.Tasks.RedisURLEnv)
+	}
+	if c.Tasks.MaxTotalBytes > 0 && c.Tasks.MaxBlobBytes > c.Tasks.MaxTotalBytes {
+		return fmt.Errorf("tasks.max_blob_bytes (%d) must be <= max_total_bytes (%d)",
+			c.Tasks.MaxBlobBytes, c.Tasks.MaxTotalBytes)
+	}
+	if c.Tasks.TaskTimeout < 0 {
+		return fmt.Errorf("tasks.task_timeout must be non-negative")
+	}
+	for q, w := range c.Tasks.QueueWeights {
+		if w < 0 {
+			return fmt.Errorf("tasks.queue_weights[%q] must be non-negative", q)
+		}
+	}
+	return nil
+}
+
+// validateServerTLS checks the server-side TLS coherence. Split out
+// to keep Validate() under the cyclomatic budget. The cert+key
+// pairing rule is the only one that matters here; struct-level
+// validator tags handle the enum/range constraints.
+func validateServerTLS(c *Config) error {
+	if c.Server.TLS.Enabled && (c.Server.TLS.CertFile == "" || c.Server.TLS.KeyFile == "") {
+		return fmt.Errorf("server.tls.enabled=true requires cert_file and key_file")
+	}
+	return nil
+}
+
 // validateSSRFConfig parses every operator-supplied blocked CIDR
 // at startup so a typo fails the bootstrap instead of panicking at
 // the first /v1/convert/source request. The built-in blocked CIDR

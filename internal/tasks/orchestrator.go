@@ -205,7 +205,8 @@ func (o *Orchestrator) Enqueue(ctx context.Context, p *Payload, apiKey string) (
 		timeout = 5 * time.Minute
 	}
 	t := asynq.NewTask(TypeConvert, body)
-	info, err := o.client.EnqueueContext(ctx, t,
+	info, err := o.client.EnqueueContext(
+		ctx, t,
 		asynq.MaxRetry(o.cfg.Retry),
 		asynq.Retention(o.cfg.Retention),
 		asynq.Timeout(timeout),

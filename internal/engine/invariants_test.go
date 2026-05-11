@@ -29,7 +29,7 @@ import (
 func TestInvariant_NoNameChecksInAdapters(t *testing.T) {
 	t.Parallel()
 	roots := []string{
-		filepath.Join("compat"),
+		"compat",
 		filepath.Join("..", "transport", "http", "handlers"),
 		filepath.Join("..", "transport", "http", "reverseproxy"),
 	}
@@ -43,7 +43,13 @@ func TestInvariant_NoNameChecksInAdapters(t *testing.T) {
 
 	for _, root := range roots {
 		fset := token.NewFileSet()
-		pkgs, err := parser.ParseDir(fset, root, func(info fs.FileInfo) bool {
+		// parser.ParseDir is "deprecated since Go 1.25" in favour of
+		// golang.org/x/tools/go/packages; that alternative parses with
+		// build-tag awareness and full type info. For this invariant
+		// guard we explicitly want the FILE list at the root and
+		// nothing else (no transitive deps, no type info), so the
+		// simpler API stays the right tool.
+		pkgs, err := parser.ParseDir(fset, root, func(info fs.FileInfo) bool { //nolint:staticcheck // SA1019: see comment above.
 			return !strings.HasSuffix(info.Name(), "_test.go")
 		}, parser.ParseComments)
 		require.NoError(t, err, "parse %s", root)
@@ -118,4 +124,3 @@ func isLikelyEngineName(expr ast.Expr) bool {
 	}
 	return false
 }
-

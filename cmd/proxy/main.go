@@ -16,7 +16,6 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/version"
 )
 
-
 func main() {
 	// Delegate to run so deferred cleanups (signal stop, etc.) actually
 	// fire — calling os.Exit directly from main would skip them, which
@@ -60,4 +59,3 @@ func run() int {
 	}
 	return 0
 }
-

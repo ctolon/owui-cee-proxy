@@ -221,7 +221,10 @@ func TestAccessLog_WithSilenceLogCtxDropsEvenNonListedPaths(t *testing.T) {
 // rare test setups.
 func TestIsLogSilenced_NilCtx(t *testing.T) {
 	t.Parallel()
-	require.False(t, IsLogSilenced(nil))
+	// staticcheck flags nil-Context arguments at compile time; the
+	// whole point of THIS test is to prove IsLogSilenced doesn't
+	// panic on the nil-ctx path. nolint surfaces the intent.
+	require.False(t, IsLogSilenced(nil)) //nolint:staticcheck // SA1012: defensive nil-ctx test.
 	require.False(t, IsLogSilenced(context.Background()))
 	require.True(t, IsLogSilenced(WithSilenceLog(context.Background())))
 }

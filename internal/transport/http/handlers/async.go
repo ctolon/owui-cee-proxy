@@ -89,7 +89,8 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 			writeJSON(w, http.StatusBadRequest, respond.NewDoclingError(err.Error()))
 			return
 		}
-		writeJSON(w, http.StatusServiceUnavailable,
+		writeJSON(
+			w, http.StatusServiceUnavailable,
 			respond.NewDoclingError(fmt.Sprintf("enqueue: %v", err)),
 		)
 		return

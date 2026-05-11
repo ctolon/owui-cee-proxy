@@ -22,13 +22,13 @@ import (
 //   - Level         : verbosity threshold
 //   - Format        : json | console
 //   - Timezone      : IANA name | "UTC" | "Local" ("" = UTC). Bad
-//                     values fall back to UTC silently (we never
-//                     crash the proxy on a logging config typo).
+//     values fall back to UTC silently (we never
+//     crash the proxy on a logging config typo).
 //   - TimeFormat    : "RFC3339Nano" (default), "RFC3339", "unix",
-//                     "unix_ms", "unix_micro", or any Go layout
-//                     literal (e.g., "2006-01-02 15:04:05Z07:00").
+//     "unix_ms", "unix_micro", or any Go layout
+//     literal (e.g., "2006-01-02 15:04:05Z07:00").
 //   - FieldNames    : remap zerolog's "level"/"message"/"time"/"error"
-//                     for log shippers that expect different keys.
+//     for log shippers that expect different keys.
 //   - StaticFields  : map appended to every log line via With().
 //   - Sampling      : BurstSampler{5/sec} when true.
 //   - AddCaller     : include file:line of each call.

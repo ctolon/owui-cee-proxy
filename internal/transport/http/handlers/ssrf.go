@@ -64,9 +64,9 @@ type SSRFMetrics interface {
 type nopSSRFMetrics struct{}
 
 func (nopSSRFMetrics) RecordRejection(SSRFRejectReason) {}
-func (nopSSRFMetrics) RecordDNSCacheHit()                {}
-func (nopSSRFMetrics) RecordDNSCacheMiss()               {}
-func (nopSSRFMetrics) RecordDNSCacheBypass()             {}
+func (nopSSRFMetrics) RecordDNSCacheHit()               {}
+func (nopSSRFMetrics) RecordDNSCacheMiss()              {}
+func (nopSSRFMetrics) RecordDNSCacheBypass()            {}
 
 // SSRFLogger is the structured log sink for rejection events. nil
 // means "don't log". A typical wiring uses the same proxy zerolog
@@ -361,10 +361,10 @@ func classifyIP(ip net.IP) SSRFRejectReason {
 // evicts the oldest entry by lastInserted timestamp. Adequate at the
 // max-256 scale we target — overhead of a true LRU isn't worth it.
 type dnsCache struct {
-	mu         sync.Mutex
-	ttl        time.Duration
-	max        int
-	entries    map[string]dnsCacheEntry
+	mu      sync.Mutex
+	ttl     time.Duration
+	max     int
+	entries map[string]dnsCacheEntry
 }
 
 type dnsCacheEntry struct {

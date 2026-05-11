@@ -120,7 +120,7 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 // Each per-engine httpclient.Client is wired with:
 //   - AuthMetrics  → authutil.Apply records auth-stamping outcomes
 //   - Instrument() → outbound RoundTripper logs every request at debug
-//                    and records EngineUpstreamStatus on the response
+//     and records EngineUpstreamStatus on the response
 //
 // Tests bypass app.go and construct adapters directly, so the
 // metric/log seams degrade to Nop when not wired (see httpclient.Client.Auth).

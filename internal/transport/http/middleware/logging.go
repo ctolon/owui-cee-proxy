@@ -20,16 +20,17 @@ import (
 // returns.
 //
 // Timing fields:
-//   upstreamStart  — set by StartUpstream when the adapter dispatches
-//                    to the engine backend
-//   upstreamDur    — set by EndUpstream once the adapter has the
-//                    response (or an error); zero means "engine call
-//                    never happened" (request rejected upstream)
-//   upstreamStatus — backend HTTP status; 0 means "no response /
-//                    transport error"
-//   ttfb           — wall-clock time from the start of AccessLog to
-//                    the first WriteHeader (captures handler time
-//                    spent assembling the response before bytes flow)
+//
+//	upstreamStart  — set by StartUpstream when the adapter dispatches
+//	                 to the engine backend
+//	upstreamDur    — set by EndUpstream once the adapter has the
+//	                 response (or an error); zero means "engine call
+//	                 never happened" (request rejected upstream)
+//	upstreamStatus — backend HTTP status; 0 means "no response /
+//	                 transport error"
+//	ttfb           — wall-clock time from the start of AccessLog to
+//	                 the first WriteHeader (captures handler time
+//	                 spent assembling the response before bytes flow)
 type requestMeta struct {
 	mu             sync.Mutex
 	engine         string
@@ -202,11 +203,12 @@ func engineFrom(ctx context.Context) (string, string) {
 // "stdouttan hangi dosya hangi engine'e yönlendirilmiş anlayabilmeliyim".
 //
 // Emitted timing fields (all milliseconds, rounded to nearest int):
-//   total_ms             — wall-clock from middleware entry to handler return
-//   time_to_first_byte_ms — middleware entry → first WriteHeader/Write
-//   upstream_ms          — adapter's StartUpstream → EndUpstream window
-//                          (0 if no upstream call took place)
-//   upstream_status      — backend HTTP status (0 = no response)
+//
+//	total_ms             — wall-clock from middleware entry to handler return
+//	time_to_first_byte_ms — middleware entry → first WriteHeader/Write
+//	upstream_ms          — adapter's StartUpstream → EndUpstream window
+//	                       (0 if no upstream call took place)
+//	upstream_status      — backend HTTP status (0 = no response)
 //
 // silencePaths is the operator-supplied allowlist of paths whose
 // per-request log lines should be dropped (typical: /healthz, /readyz,

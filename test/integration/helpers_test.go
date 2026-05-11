@@ -78,26 +78,6 @@ func (c *logCapture) findEvent(name string) map[string]any {
 	return nil
 }
 
-// findAllEvents returns every event log line whose "event" matches.
-// Useful when the same event fires multiple times (e.g., one
-// outbound_engine_request per file in a batched call).
-func (c *logCapture) findAllEvents(name string) []map[string]any {
-	out := []map[string]any{}
-	for _, line := range bytes.Split(c.Bytes(), []byte("\n")) {
-		if len(line) == 0 {
-			continue
-		}
-		var m map[string]any
-		if err := json.Unmarshal(line, &m); err != nil {
-			continue
-		}
-		if ev, _ := m["event"].(string); ev == name {
-			out = append(out, m)
-		}
-	}
-	return out
-}
-
 // newProxyServerWithLogCapture builds the proxy with a parallel
 // zerolog.Logger that writes to a returned logCapture sink. Use this
 // when the test needs to assert observability fields (auth header

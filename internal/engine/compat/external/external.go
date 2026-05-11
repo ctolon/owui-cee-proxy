@@ -199,8 +199,8 @@ func ApplyAuth(h http.Header, cfg config.EngineConfig) {
 // SafeFilename and JoinURL forward to internal/engine/compatutil so the
 // implementation lives in exactly one place. Kept exported because
 // external_test.go and the doclingexternal composite reference them.
-func SafeFilename(name string) string         { return compatutil.SafeFilename(name) }
-func JoinURL(base, p string) (string, error)  { return compatutil.JoinURL(base, p) }
+func SafeFilename(name string) string        { return compatutil.SafeFilename(name) }
+func JoinURL(base, p string) (string, error) { return compatutil.JoinURL(base, p) }
 
 func jsonError(status int, msg string) *engine.ConvertResponse {
 	body := mustMarshalJSON(respond.NewExternalError(msg))

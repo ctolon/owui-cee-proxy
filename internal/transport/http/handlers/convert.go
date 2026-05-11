@@ -105,7 +105,8 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 			Str("engine", string(eng.Name())).
 			Str("engine_url", eng.URL()).
 			Msg("engine convert failed")
-		writeJSON(w, http.StatusBadGateway,
+		writeJSON(
+			w, http.StatusBadGateway,
 			respond.NewDoclingError(fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID)),
 		)
 		return

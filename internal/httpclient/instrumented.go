@@ -53,9 +53,9 @@ func (nopUpstreamRecorder) RecordUpstreamStatus(string, int) {}
 //   - auth_scheme        : "raw" | "bearer" | ""
 //   - auth_key_present   : true when a non-empty key was attached
 //   - auth_key_len       : length of the key as it appeared on the wire
-//                          (Bearer prefix excluded). 0 when no key.
+//     (Bearer prefix excluded). 0 when no key.
 //   - body_snippet_b64   : first BodyLogBytes of the request body,
-//                          base64-encoded. Empty when BodyLogBytes=0.
+//     base64-encoded. Empty when BodyLogBytes=0.
 //
 // Header values are NEVER logged. The proxy's contract is "I show you
 // that I tried to send auth, never what I sent."
