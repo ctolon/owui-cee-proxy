@@ -115,10 +115,13 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	ctx = mw.WithPickDecision(ctx, string(pickSrc), string(e.Registry.Strategy()))
 	mw.WithMimeSource(ctx, string(resolved.Source), declaredCT)
 
+	traceID, spanID := mw.TraceFieldsFrom(ctx)
 	if e.Logger.GetLevel() <= zerolog.DebugLevel {
 		e.Logger.Debug().
 			Str("event", "engine_pick_decision").
 			Str("request_id", req.RequestID).
+			Str("trace_id", traceID).
+			Str("span_id", spanID).
 			Str("engine", string(eng.Name())).
 			Str("engine_url", eng.URL()).
 			Str("pick_source", string(pickSrc)).
@@ -134,6 +137,8 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 			Err(err).
 			Str("event", "engine_convert_failed").
 			Str("request_id", req.RequestID).
+			Str("trace_id", traceID).
+			Str("span_id", spanID).
 			Str("engine", string(eng.Name())).
 			Str("engine_url", eng.URL()).
 			Msg("external facade engine convert failed")

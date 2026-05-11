@@ -89,20 +89,29 @@ Verified locally: `go test -race -count=1 ./...` green;
 
 **All P0 carry-over items closed.** The original 11-item P0 table is exhausted across PRs #13 (security-hardening), #14 (timeout + envelope), #15 (supply-chain), and this PR (#16). What remains is the P1 / P2 backlog plus the roadmap themes. Next sprint candidates: C-12..C-32 (P1 — see the table below).
 
-### P1 (release after P0)
+### Closed in `feat/p1-reliability-observability` (v0.5.0 + 1)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-12 | Backend | `docling.convertFile` now closes `pr` with the error when `http.NewRequestWithContext` fails after the producer goroutine spawned. Pre-fix the goroutine blocked forever on `io.Copy` into a never-read pipe. Pinned by `TestDocling_ConvertFile_NoLeakOnEarlyReturn` using a NUL-byte URL trigger + `runtime.NumGoroutine` snapshot. |
+| C-14 | QA | `internal/tasks/orchestrator_test.go` lifted the long-standing `t.Skip("requires Redis")` ban. New `newOrchestratorWithMiniredis` helper backs three coverage tests: `TestOrchestrator_EnqueueSaveResultRoundtrip` (full persistence lifecycle), `TestOrchestrator_TokenBindingRejectsCrossTenant` (security invariant — tenant A's token must not resolve under tenant B's apiKey or an empty caller), `TestOrchestrator_IdempotencyResolveAndRecord` (C-20 dedupe contract). asynq.Inspector path stays integration-only because miniredis can't perfectly model asynq's Lua-script queue ops. |
+| C-18 | Observability | `mw.TraceFieldsFrom(ctx)` helper pulls `trace.SpanFromContext` → `(TraceID, SpanID)` strings; AccessLog `request_completed`, `engine_pick_decision`, `engine_convert_failed` all now stamp `trace_id` + `span_id` for Tempo/Jaeger joins. Defensive against nil ctx and non-recording spans (returns "" cleanly). Pinned by `TestAccessLog_TraceFieldsPropagated` + non-traced-path counterpart. |
+| C-20 | API | Async `submit` honours `Idempotency-Key` header. New `Orchestrator.ResolveIdempotent` + `RecordIdempotent` helpers use Redis `SETNX` keyed on `sha256(apiKey)` + `sha256(idem)`. TTL matches `ResultTTL`. Retries within the window resolve the prior token without re-enqueueing. SETNX-loser sees winner's token. Cross-tenant isolation enforced by apiKey-prefix in the key. Pinned by `TestOrchestrator_IdempotencyResolveAndRecord` (5 sub-cases). |
+
+### Closed in `feat/p1-perf-tracing-contracts`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-15 | QA | `enginetest.RunContractTests` tightened: URL idempotency, every advertised facade exercised (not just the first), Health on cancelled ctx MUST surface `context.Canceled` / `context.DeadlineExceeded` / a "context" substring (was: any non-empty error string — a tautology), Convert response StatusCode > 0 on nil err, response Body safe to `Close()` twice. Earlier version was "a probe, not a contract" — almost any adapter return shape passed. |
+| C-17 | Perf | `staticRegistry.phases` pre-computed at `NewRegistry` time; `PickRouteVerbose` reads the struct field instead of allocating a `[]dispatchPhase` slice literal per request. Eliminates the per-request heap escape on the routing critical path. |
+| C-19 | Observability | `internal/httpclient/client.go` wraps the per-engine `*http.Transport` with `otelhttp.NewTransport` so outbound requests carry W3C `traceparent` / `tracestate` / `baggage` headers; backends continue the proxy's trace span tree end-to-end. Propagator passed explicitly (W3C TraceContext + Baggage) rather than reading the global, so the wrap fires correctly in unit tests too. New `Client.InnerTransport()` accessor for the unwrapped `*http.Transport` so existing tests can introspect transport knobs. Pinned by `TestNew_OtelHTTPTransportPropagatesTraceparent`. |
+
+### P1 (release after P0) — remaining
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|
-| C-12 | Backend | `docling.convertFile` leaks the producer goroutine when `http.NewRequestWithContext` errors after the pipe was already constructed. | Defer `pw.CloseWithError(err)` on early error paths. |
 | C-13 | Backend | `mw.WithMimeSource` returned-context is ignored in some call sites; helper signature lies about what it does. | Rename mutating helpers `Record*`; or chain ctx everywhere. |
-| C-14 | QA | `internal/tasks/orchestrator.go` lifecycle is `t.Skip`'d in unit tests; covered only via integration. | Wire `miniredis`; lift the skip. Covers ~30% of the codebase. |
-| C-15 | QA | Contract test `enginetest.RunContractTests` is a probe, not a contract — accepts almost any return shape from `Convert`. | Strengthen: per-facade plumbing, `Body.Close()`-twice safety, `RequestID` propagation, status > 0 assertion. |
 | C-16 | Perf | `spoolPart` always allocates `make([]byte, 8MiB+1)` regardless of file size. 800 MiB heap pressure at 100 concurrent uploads. | Allocate `min(content_length_hint, threshold+1)`. |
-| C-17 | Perf | `staticRegistry.strategyPhases` returns a slice literal that escapes to heap on every dispatch. | Pre-compute `s.phases` once at construction. |
-| C-18 | Observability | Logs carry `request_id` but never `trace_id`/`span_id`. Tempo/Jaeger can't join. | Pull `trace.SpanFromContext` and stamp `trace_id`/`span_id` on every event. |
-| C-19 | Observability | Outbound `*http.Transport` not wrapped with `otelhttp.NewTransport`. Backends can't continue traces. | Add wrap in `httpclient.New`. |
-| C-20 | API | No `Idempotency-Key` support. Retries duplicate engine work; async submit mints fresh tokens. | Stripe-style `Idempotency-Key`; Redis `SETNX`; reuse on collision. |
-| C-21 | DevOps | No `-validate` CLI flag. Operators can't dry-run a YAML before `helm upgrade`. | 10-line addition to `cmd/proxy/main.go`. Wire as Helm pre-upgrade hook. |
 | C-22 | Reliability | `/readyz` is all-or-nothing — one flaky engine kills the whole pod. | Tier the probe: default-engine + Redis required, others surface degraded. |
 | C-23 | Reliability | Async `Enqueue` does 4 sequential Redis round-trips inside the request goroutine. Slow Redis blocks every async submit. | Pipeline via `redis.MULTI`; or single Lua script. |
 | C-24 | Architecture | `cfg.engines.<n>.rate_limit` is in the schema, defaulted, **never used**. `docs/ARCHITECTURE.md` lies about it. | Implement per-engine `golang.org/x/time/rate` limiter, or delete the field. |

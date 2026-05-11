@@ -149,6 +149,15 @@ func (a *Adapter) convertFile(ctx context.Context, req *engine.ConvertRequest) (
 
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, pr)
 	if err != nil {
+		// The producer goroutine spawned above will block on
+		// io.Copy(fw, f.Body) until SOMEONE drains pr. Without this
+		// CloseWithError it would block forever — a cold-path leak
+		// the CLAUDE.md performance budget "0 goroutine leaks under
+		// soak" misses because the trigger is malformed targets, not
+		// load. Closing pr propagates an error into the next pw
+		// write and the goroutine unwinds via its existing
+		// pw.CloseWithError defer.
+		_ = pr.CloseWithError(err)
 		return nil, err
 	}
 	hreq.Header.Set("Content-Type", mw.FormDataContentType())

@@ -124,7 +124,16 @@ func (o *Orchestrator) HealthCheck() func(ctx context.Context) error {
 }
 
 // Redis key helpers.
-func tokenKey(token string) string  { return "owui-cee:token:" + token }
+func tokenKey(token string) string { return "owui-cee:token:" + token }
+
+// idemKey is the Redis key used to memoise an idempotent submit. The
+// (caller-fingerprint, idempotency-key) tuple is hashed so neither
+// value lands raw in Redis — a dump of the keyspace leaks no
+// credential material and no caller-chosen identifiers.
+func idemKey(apiKeyFP, idemKey string) string {
+	sum := sha256.Sum256([]byte(idemKey))
+	return "owui-cee:idem:" + apiKeyFP + ":" + hex.EncodeToString(sum[:])
+}
 func queueKey(taskID string) string { return "owui-cee:queue:" + taskID }
 func resultKey(id string) string    { return "owui-cee:result:" + id }
 
@@ -396,6 +405,65 @@ func (o *Orchestrator) SaveResult(ctx context.Context, id, contentType string, b
 		return err
 	}
 	return o.redis.Set(ctx, resultKey(id)+":ct", contentType, ttl).Err()
+}
+
+// ResolveIdempotent looks up a previously-recorded submission keyed
+// by (apiKey fingerprint, Idempotency-Key). Returns the stored token
+// when the key matches, or empty/false when no prior submission was
+// recorded.
+//
+// Treat empty `idem` as "no idempotency-key sent" — the caller skips
+// the dedupe entirely. Empty `apiKey` is also tolerated (anonymous
+// public engines) but produces a fingerprint of "" which is shared
+// across all anonymous callers — operators running without
+// require_api_key SHOULD NOT rely on idempotency dedupe in
+// multi-tenant scenarios.
+func (o *Orchestrator) ResolveIdempotent(ctx context.Context, idem, apiKey string) (string, bool, error) {
+	if idem == "" {
+		return "", false, nil
+	}
+	v, err := o.redis.Get(ctx, idemKey(keyFromAPIKey(apiKey), idem)).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("idem lookup: %w", err)
+	}
+	return v, true, nil
+}
+
+// RecordIdempotent atomically reserves the (apiKey, idem) tuple to
+// the issued task token. SETNX semantics: if a concurrent submit
+// already recorded a different token, we return that token instead
+// so the second caller sees the SAME task as the first. TTL equals
+// ResultTTL so the dedupe window matches the period during which a
+// client can still poll/fetch the original result.
+//
+// Returns the EFFECTIVE token: usually `token`, but the prior token
+// when a race lost the SETNX. Callers MUST honour the returned
+// value (use it as the response payload).
+func (o *Orchestrator) RecordIdempotent(ctx context.Context, idem, apiKey, token string) (string, error) {
+	if idem == "" {
+		return token, nil
+	}
+	ttl := o.cfg.ResultTTL
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	key := idemKey(keyFromAPIKey(apiKey), idem)
+	ok, err := o.redis.SetNX(ctx, key, token, ttl).Result()
+	if err != nil {
+		return token, fmt.Errorf("idem record: %w", err)
+	}
+	if ok {
+		return token, nil
+	}
+	// SETNX raced — read the winner.
+	v, err := o.redis.Get(ctx, key).Result()
+	if err != nil {
+		return token, fmt.Errorf("idem read-after-lost-race: %w", err)
+	}
+	return v, nil
 }
 
 // LoadBlob retrieves a blob persisted at Enqueue time.
