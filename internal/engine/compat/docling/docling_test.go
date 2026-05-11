@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -351,4 +352,47 @@ func TestApplyAuth_TableDriven(t *testing.T) {
 			require.Equal(t, tc.wantValue, h.Get(tc.wantHeader))
 		})
 	}
+}
+
+// TestDocling_ConvertFile_NoLeakOnEarlyReturn pins C-12 from the
+// FAANG review: when http.NewRequestWithContext fails AFTER the
+// producer goroutine has been spawned (rare cold-path, e.g.,
+// malformed URL with control bytes), the goroutine MUST exit
+// instead of blocking forever on io.Copy into a never-read pipe.
+//
+// The trigger here is a URL containing a NUL byte — net/url rejects
+// it inside http.NewRequestWithContext. Pre-fix, the producer
+// goroutine would sit on io.Copy(fw, f.Body) until process exit;
+// post-fix, pr.CloseWithError unwinds it before the function
+// returns.
+//
+// Detection: snapshot runtime.NumGoroutine() before + after a small
+// settle window. A leaked goroutine survives past the settle and
+// fails the assertion.
+func TestDocling_ConvertFile_NoLeakOnEarlyReturn(t *testing.T) {
+	// Don't t.Parallel — the goroutine-count assertion is sensitive
+	// to siblings.
+	a := newDoclingAdapter(t, "http://valid-base.invalid/\x00ctrl", nil)
+	req := &engine.ConvertRequest{
+		Files: []engine.FileBlob{{
+			Filename:    "x.pdf",
+			ContentType: "application/pdf",
+			Body:        strings.NewReader("dummy body that the producer would block writing"),
+		}},
+	}
+
+	// Let any background fixtures from earlier subtests settle.
+	time.Sleep(50 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	_, err := a.Convert(context.Background(), req)
+	require.Error(t, err, "control-byte URL MUST fail http.NewRequestWithContext")
+
+	// Give pr.CloseWithError time to propagate to the producer
+	// goroutine's next pw.Write call.
+	time.Sleep(200 * time.Millisecond)
+	after := runtime.NumGoroutine()
+	require.LessOrEqual(t, after, before+1,
+		"convertFile early-return path MUST NOT leak the producer goroutine (before=%d after=%d)",
+		before, after)
 }
