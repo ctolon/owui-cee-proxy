@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	"github.com/ctolon/owui-cee-proxy/internal/tasks"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
@@ -23,6 +24,11 @@ type Async struct {
 	// APIKeyHeader is the configured proxy API-key header name. Used to
 	// bind a task token to the caller's key fingerprint.
 	APIKeyHeader string
+	// Resolver carries the merged (built-in + operator override)
+	// extension map so the async multipart parse runs the same MIME
+	// resolution contract as the sync convert handler. Composition
+	// root passes the same instance to all three handlers.
+	Resolver *mimedetect.Resolver
 }
 
 // maxBlobBytes returns the per-blob cap from the orchestrator config
@@ -43,11 +49,20 @@ func (a *Async) SubmitSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
+	// Baseline observability stamp — see Convert.handle for the rationale.
+	// Async submit has its own collection of early-return paths
+	// (orchestrator nil, payload parse failure, oversized blob, source-
+	// without-HTTPSources support) that the access log must still
+	// attribute to *some* engine.
+	defaultEng := a.Registry.Default()
+	r = r.WithContext(mw.WithEngine(r.Context(), string(defaultEng.Name()), defaultEng.URL()))
+	r = r.WithContext(mw.WithPickDecision(r.Context(), string(engine.PickSourceDefault), string(a.Registry.Strategy())))
+
 	if a.Orchestrator == nil {
 		http.Error(w, "async tasks not enabled", http.StatusNotImplemented)
 		return
 	}
-	payload, cleanup, err := tasks.PayloadFromRequest(r, source, a.maxBlobBytes())
+	payload, cleanup, err := tasks.PayloadFromRequest(r, source, a.maxBlobBytes(), a.Resolver)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, respond.NewDoclingError(err.Error()))
 		return
@@ -57,8 +72,16 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	// Async endpoints belong to the docling facade.
 	payload.Facade = string(engine.FacadeDocling)
 	eng := a.Registry.Default()
+	pickSrc := engine.PickSourceDefault
 	if !source && len(payload.BlobKeys) > 0 {
-		eng = a.Registry.Pick(engine.FacadeDocling, payload.BlobKeys[0].ContentType)
+		picked, src, perr := a.Registry.PickRouteVerbose(engine.FacadeDocling, engine.PickHint{
+			MIME:     payload.BlobKeys[0].ContentType,
+			Filename: payload.BlobKeys[0].Filename,
+		})
+		if perr == nil {
+			eng = picked
+			pickSrc = src
+		}
 	}
 
 	// M14 (capability-based): reject source mode early when the chosen
@@ -74,6 +97,12 @@ func (a *Async) submit(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 
 	ctx := mw.WithEngine(r.Context(), string(eng.Name()), eng.URL())
+	ctx = mw.WithPickDecision(ctx, string(pickSrc), string(a.Registry.Strategy()))
+	if !source && len(payload.BlobKeys) > 0 {
+		ctx = mw.WithFilename(ctx, payload.BlobKeys[0].Filename)
+		ctx = mw.WithMimeType(ctx, payload.BlobKeys[0].ContentType)
+		ctx = mw.WithFileCount(ctx, len(payload.BlobKeys))
+	}
 	payload.Engine = string(eng.Name())
 	payload.RequestID = mw.IDFrom(ctx)
 

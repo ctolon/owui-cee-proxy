@@ -66,6 +66,20 @@ func (r *healthStubRegistry) PickWithError(_ engine.Facade, _ string) (engine.En
 
 func (r *healthStubRegistry) Names() []engine.Name { return r.order }
 
+// PickRoute/PickRouteVerbose/Strategy satisfy the modern Registry
+// interface for the readiness suite; tests don't exercise dispatch.
+func (r *healthStubRegistry) PickRoute(_ engine.Facade, _ engine.PickHint) (engine.Engine, error) {
+	return r.engines[r.order[0]], nil
+}
+
+func (r *healthStubRegistry) PickRouteVerbose(_ engine.Facade, _ engine.PickHint) (engine.Engine, engine.PickSource, error) {
+	return r.engines[r.order[0]], engine.PickSourceDefault, nil
+}
+
+func (r *healthStubRegistry) Strategy() engine.RoutingStrategy {
+	return engine.StrategyMimeThenExt
+}
+
 func TestReadiness_RunsHealthChecksConcurrently(t *testing.T) {
 	t.Parallel()
 	delay := 400 * time.Millisecond

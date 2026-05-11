@@ -46,7 +46,7 @@ func newRegistry(t *testing.T, def engine.Name, names ...engine.Name) engine.Reg
 	for _, n := range names {
 		entries[n] = engine.RegistryEntry{Engine: &stubEngine{name: n}}
 	}
-	reg, err := engine.NewRegistry(entries, def)
+	reg, err := engine.NewRegistry(entries, def, "")
 	if err != nil {
 		t.Fatalf("registry: %v", err)
 	}

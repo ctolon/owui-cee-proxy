@@ -19,6 +19,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
@@ -46,6 +47,13 @@ type Convert struct {
 	// given engine name. Nil = upstream-error logging disabled, which
 	// matches v0.1.x behaviour and keeps existing tests green.
 	UpstreamLog func(engineName string) config.UpstreamLogConfig
+	// Resolver is the per-process MIME resolver carrying the merged
+	// (built-in + operator override) extension map. Required — the
+	// composition root constructs it from cfg.Mimedetect and injects
+	// here. Nil is treated as a misconfiguration; the handler panics
+	// at first request to fail loud rather than silently degrade to
+	// the no-overrides default.
+	Resolver *mimedetect.Resolver
 }
 
 func (c *Convert) File(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +65,17 @@ func (c *Convert) Source(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
+	// Baseline observability stamp: even if buildRequest fails (malformed
+	// multipart, bad JSON, ...) we want the access-log line to carry
+	// non-empty engine + engine_url + routing_strategy. The default
+	// engine is the catch-all; later code overwrites these fields if a
+	// different engine wins dispatch. This fixes the reported "engine
+	// and engine_url come back empty in routing" symptom on 4xx exit
+	// paths.
+	defaultEng := c.Registry.Default()
+	r = r.WithContext(mw.WithEngine(r.Context(), string(defaultEng.Name()), defaultEng.URL()))
+	r = r.WithContext(mw.WithPickDecision(r.Context(), string(engine.PickSourceDefault), string(c.Registry.Strategy())))
+
 	req, cleanup, err := c.buildRequest(r, source)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, respond.NewDoclingError(err.Error()))
@@ -64,17 +83,23 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 	defer cleanup()
 
-	// MIME-based engine routing: the first file's Content-Type drives the
-	// pick. Source-mode requests fall back to the default engine because
-	// no MIME hint is available without dereferencing the URL.
-	//
-	// M13: this fallback is INTENTIONAL — source mode skips MIME-based
-	// dispatch and always uses the default engine. Operators rely on the
-	// log line below to debug "why didn't my Tika rule fire?".
+	// Engine routing: routing.strategy controls whether dispatch uses
+	// the MIME allowlist, the extension allowlist, or both phases in
+	// sequence. The FIRST file's MIME + filename drive the pick.
+	// Source-mode requests have no upload signal, so they always fall
+	// through to PickSourceDefault — that's by design (M13).
 	req.Facade = engine.FacadeDocling
-	eng := c.Registry.Default()
+	eng := defaultEng
+	pickSrc := engine.PickSourceDefault
 	if !source && len(req.Files) > 0 {
-		eng = c.Registry.Pick(engine.FacadeDocling, req.Files[0].ContentType)
+		picked, src, perr := c.Registry.PickRouteVerbose(engine.FacadeDocling, engine.PickHint{
+			MIME:     req.Files[0].ContentType,
+			Filename: req.Files[0].Filename,
+		})
+		if perr == nil {
+			eng = picked
+			pickSrc = src
+		}
 	} else if source {
 		c.Logger.Info().
 			Str("event", "source_mode_default_engine").
@@ -83,6 +108,7 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 			Msg("source mode invoked; routing to default engine (MIME-based dispatch unavailable)")
 	}
 	ctx := mw.WithEngine(r.Context(), string(eng.Name()), eng.URL())
+	ctx = mw.WithPickDecision(ctx, string(pickSrc), string(c.Registry.Strategy()))
 
 	if len(req.Files) > 0 {
 		ctx = mw.WithFilename(ctx, req.Files[0].Filename)
@@ -90,6 +116,22 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 		ctx = mw.WithMimeType(ctx, req.Files[0].ContentType)
 	}
 	req.RequestID = mw.IDFrom(ctx)
+
+	// One-shot debug record so operators can audit per-request routing
+	// without joining the access-log line against a separate trace.
+	// Kept at debug level — production-noisy by design.
+	if c.Logger.GetLevel() <= zerolog.DebugLevel && len(req.Files) > 0 {
+		c.Logger.Debug().
+			Str("event", "engine_pick_decision").
+			Str("request_id", req.RequestID).
+			Str("engine", string(eng.Name())).
+			Str("engine_url", eng.URL()).
+			Str("pick_source", string(pickSrc)).
+			Str("routing_strategy", string(c.Registry.Strategy())).
+			Str("mime_type", req.Files[0].ContentType).
+			Str("filename", req.Files[0].Filename).
+			Msg("engine pick decision")
+	}
 
 	resp, err := eng.Convert(ctx, req)
 	if err != nil {
@@ -140,10 +182,10 @@ func (c *Convert) buildRequest(r *http.Request, source bool) (*engine.ConvertReq
 	if source {
 		return c.buildSourceRequest(r)
 	}
-	return buildFileRequest(r)
+	return c.buildFileRequest(r)
 }
 
-func buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
+func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
 		return nil, noop, fmt.Errorf("parse content-type: %w", err)
@@ -192,14 +234,32 @@ func buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 			closers = append(closers, sr)
 
 			// Resolve effective MIME: declared wins when specific; fall
-			// back to magic-byte sniff when client sent
-			// application/octet-stream or empty. Fixes the user-reported
-			// "default engine catches PDFs because Content-Type is
-			// generic" routing bug.
-			resolved, srcerr := peekAndResolveMIME(declaredCT, sr)
+			// back to magic-byte sniff (and finally filename extension)
+			// when client sent application/octet-stream or empty. Fixes
+			// the user-reported "default engine catches PDFs because
+			// Content-Type is generic" routing bug AND the .msg CFB
+			// disambiguation bug — both flow through the same Resolver.
+			resolved, srcerr := peekAndResolveMIME(declaredCT, part.FileName(), sr, c.Resolver)
 			if srcerr != nil {
 				cleanup()
 				return nil, noop, fmt.Errorf("mime detect %q: %w", part.FileName(), srcerr)
+			}
+
+			// Per-part debug breadcrumb. Operators reading a debug
+			// log timeline want to know exactly when each upload
+			// piece arrived, how big it was, whether it spilled to
+			// disk, and how the MIME got resolved. All in one event.
+			if c.Logger.GetLevel() <= zerolog.DebugLevel {
+				c.Logger.Debug().
+					Str("event", "multipart_part_received").
+					Str("request_id", mw.IDFrom(r.Context())).
+					Str("filename", part.FileName()).
+					Str("declared_content_type", declaredCT).
+					Str("resolved_mime", resolved.MIME).
+					Str("mime_source", string(resolved.Source)).
+					Int64("size_bytes", sr.Size()).
+					Bool("spilled_to_disk", sr.Size() > spoolThresholdDefault).
+					Msg("multipart part received")
 			}
 
 			req.Files = append(req.Files, engine.FileBlob{

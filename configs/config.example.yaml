@@ -48,6 +48,18 @@ routing:
   # Patterns may be exact ("application/pdf") or top-level wildcards
   # ("image/*"). Matching is case-insensitive and ignores params.
   default_engine: "docling"
+
+  # strategy controls how the registry picks an engine for a given
+  # facade + (mime, filename) request hint. One of:
+  #   mime                  — pick by MIME allowlist only (v0.2.x behaviour)
+  #   extension             — pick by filename-extension allowlist only
+  #   mime_then_extension   — MIME first; extension fallback (DEFAULT,
+  #                            preserves v0.4.x routing when no engine
+  #                            declares an `extensions` list)
+  #   extension_then_mime   — extension first; MIME fallback
+  # Empty value resolves to `mime_then_extension`.
+  strategy: "mime_then_extension"
+
   facade:
     docling:
       enabled: true
@@ -74,6 +86,11 @@ engines:
     # (the default is the catch-all). It is honored for non-default
     # enabled engines.
     mime_types: []
+    # extensions is the filename-extension allowlist consulted when
+    # routing.strategy includes the extension phase. Case-insensitive;
+    # the leading dot is optional. Empty = engine abstains from
+    # extension dispatch (symmetric with empty mime_types).
+    extensions: []
     forward_options: {}
     http:
       max_idle_conns: 256
@@ -236,3 +253,31 @@ observability:
     otlp_endpoint: "http://otel-collector:4318"
     sample_ratio: 0.1
     service_name: "owui-cee-proxy"
+
+# mimedetect tunes the MIME resolution stage that runs in front of
+# registry dispatch. Operators rarely need to touch this — the
+# built-in defaults handle the legacy Office CFB family + email +
+# tabular formats already.
+mimedetect:
+  # extension_overrides extends or replaces the built-in extension →
+  # MIME map. Keys MUST be lowercase, leading-dot, single-segment
+  # (e.g., ".epub"). Values MUST be a bare type/subtype MIME
+  # (parameters rejected). Operator entries replace built-in entries
+  # on key collision.
+  #
+  # Built-in defaults:
+  #   .msg  → application/vnd.ms-outlook
+  #   .doc  → application/msword
+  #   .xls  → application/vnd.ms-excel
+  #   .ppt  → application/vnd.ms-powerpoint
+  #   .docx → application/vnd.openxmlformats-officedocument.wordprocessingml.document
+  #   .xlsx → application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+  #   .pptx → application/vnd.openxmlformats-officedocument.presentationml.presentation
+  #   .eml  → message/rfc822
+  #   .csv  → text/csv
+  #   .tsv  → text/tab-separated-values
+  extension_overrides: {}
+  # Example — register an additional format:
+  # extension_overrides:
+  #   ".epub": "application/epub+zip"
+  #   ".rtf":  "application/rtf"

@@ -107,3 +107,75 @@ func FormatHeaderValue(cfg config.EngineConfig) string {
 	}
 	return string(cfg.APIKey)
 }
+
+// ApplyMulti is the multi-stamp variant of Apply. It walks
+// cfg.EffectiveAuthSpecs() — singular AuthHeader (if set) plus every
+// AuthHeaders entry — and stamps each independent header on h. Per-
+// entry Outcome is recorded through the metrics seam exactly like
+// Apply, so a dashboard can attribute attached/missing_key/no_auth
+// per stamp rather than collapsing to a single counter.
+//
+// Returns the slice of Outcomes in the same order as the resolved
+// specs. Empty input → single OutcomeNoAuth recorded (matches the
+// public-engine path of Apply).
+func ApplyMulti(h http.Header, engineName string, cfg config.EngineConfig, m AuthMetrics) []Outcome {
+	specs := cfg.EffectiveAuthSpecs()
+	if len(specs) == 0 {
+		m.RecordAuthAttempt(engineName, "", OutcomeNoAuth)
+		return []Outcome{OutcomeNoAuth}
+	}
+	outcomes := make([]Outcome, 0, len(specs))
+	for _, spec := range specs {
+		outcomes = append(outcomes, applySpec(h, engineName, spec, m))
+	}
+	return outcomes
+}
+
+// applySpec applies a single stamp; shared between ApplyMulti and a
+// future single-spec call site if Apply migrates. Records exactly one
+// Outcome via m, mirroring Apply's contract.
+func applySpec(h http.Header, engineName string, spec config.AuthHeaderConfig, m AuthMetrics) Outcome {
+	scheme := string(spec.Scheme)
+	if spec.Header == "" && spec.APIKey == "" {
+		m.RecordAuthAttempt(engineName, scheme, OutcomeNoAuth)
+		return OutcomeNoAuth
+	}
+	if spec.APIKey == "" || spec.Header == "" {
+		m.RecordAuthAttempt(engineName, scheme, OutcomeMissingKey)
+		return OutcomeMissingKey
+	}
+	value := string(spec.APIKey)
+	if spec.Scheme == config.AuthSchemeBearer {
+		value = "Bearer " + value
+	}
+	h.Set(spec.Header, value)
+	m.RecordAuthAttempt(engineName, scheme, OutcomeAttached)
+	return OutcomeAttached
+}
+
+// FormatHeaderValuesMulti returns every (header → value) pair that
+// ApplyMulti would set, WITHOUT mutating any http.Header. Used by
+// the passthrough reverseproxy whose Rewrite closure builds its own
+// outbound headers.
+//
+// Skips entries whose key is missing — matching ApplyMulti's
+// fail-closed semantics. Returns an empty map when no auth is
+// configured.
+func FormatHeaderValuesMulti(cfg config.EngineConfig) map[string]string {
+	specs := cfg.EffectiveAuthSpecs()
+	if len(specs) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(specs))
+	for _, spec := range specs {
+		if spec.Header == "" || spec.APIKey == "" {
+			continue
+		}
+		val := string(spec.APIKey)
+		if spec.Scheme == config.AuthSchemeBearer {
+			val = "Bearer " + val
+		}
+		out[spec.Header] = val
+	}
+	return out
+}
