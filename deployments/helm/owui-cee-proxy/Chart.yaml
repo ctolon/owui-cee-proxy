@@ -5,8 +5,8 @@ description: |
   traffic with a single Docling-compatible facade, plus per-engine
   passthrough mounts.
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.7.0
+appVersion: "0.7.0"
 home: https://github.com/ctolon/owui-cee-proxy
 sources:
   - https://github.com/ctolon/owui-cee-proxy
