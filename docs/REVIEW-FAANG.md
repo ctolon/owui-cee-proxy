@@ -191,13 +191,18 @@ list + roadmap themes.)
 | C-37 | QA | New tests for `bodylimit`, `ratelimit`, `timeout`, and `recover` middlewares. 15 unit tests cover the cap-enforce path (under/over/disabled), counter context propagation, token-bucket burst behaviour (allow/reject/refill), context-deadline propagation + firing, and the panic recovery contract (stack as string per C-39, recorder hits + counter, nil-recorder fallback, legacy variadic form). Closes the only zero-coverage middleware files left in the package. |
 | C-43 | Helm | Both raw kustomize overlays now demonstrate TLS termination via a kubernetes.io/tls Secret named `owui-cee-proxy-tls`. `overlays/gateway-api-envoy/gateway.yaml` gains an HTTPS listener (`port: 443`, `tls.mode: Terminate`, `certificateRefs[0].name`); the existing HTTPRoute attaches to BOTH listeners by default (no `sectionName`). `overlays/ingress-nginx/ingress.yaml` gains the matching `spec.tls[]` stanza + a commented `ssl-redirect` annotation. Operators wiring cert-manager (or any external cert pipeline) reuse the same Secret name across overlays. Strict-HTTPS recipe documented inline (sectionName + RequestRedirect filter). |
 
+### Closed in `feat/p2-async-external-spool` (v0.7.0 + 4)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-38 | Backend | New `internal/spool/` package consolidates the two drift-prone copies of the multipart spool: the sync-path version (`handlers/spool.go`, which carried the C-16 geometric-growth fix + O_TMPFILE + Seek) and the async-path version (`tasks/spool.go`, which still allocated `make([]byte, threshold+1)` regardless of file size). Public API: `spool.Part(r, threshold, maxBytes) → *spool.Reader`, `spool.ErrTooLarge`, `spool.ThresholdDefault`, `spool.InitialBuf`. Build-tagged `openSpoolFile` moves with the package so the Linux O_TMPFILE preference applies on both code paths. handlers/ and tasks/ each lose ~110 lines; the `bytes.Buffer`-grow path is now the canonical one (the older fixed pre-alloc is gone). Existing tests carried over verbatim under the new package name. |
+
 ### P2 (backlog) — remaining
 
 A subset, ordered by likely ROI:
 
 - **C-33** `EnginePathsConfig` is a per-compat grab-bag struct that N×M-explodes; replace with `Paths map[string]string` per-engine. [Plugin SDK]
 - **C-35** No OpenAPI/AsyncAPI spec — the single largest UX gap for client teams. [API design]
-- **C-38** Tasks duplicate spool implementation (`tasks/spool.go` vs `handlers/spool.go`) — unify into `internal/spool/`. [Backend]
 - **C-45** Async path supports only docling facade (`/v1/convert/*/async`); external `/process/async` is missing — facade asymmetry. [API design]
 
 ---

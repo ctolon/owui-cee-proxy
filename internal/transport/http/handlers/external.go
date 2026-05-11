@@ -14,6 +14,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
+	"github.com/ctolon/owui-cee-proxy/internal/spool"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
@@ -62,9 +63,9 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	filename := decodeFilename(r.Header.Get("X-Filename"))
 
 	// Spool the request body to memory or disk based on size.
-	sr, err := spoolPart(r.Body, int64(spoolThresholdDefault), e.MaxBytes)
+	sr, err := spool.Part(r.Body, int64(spool.ThresholdDefault), e.MaxBytes)
 	if err != nil {
-		if errors.Is(err, ErrSpoolTooLarge) {
+		if errors.Is(err, spool.ErrTooLarge) {
 			writeJSON(w, http.StatusRequestEntityTooLarge, respond.NewExternalError("request body too large"))
 			return
 		}
