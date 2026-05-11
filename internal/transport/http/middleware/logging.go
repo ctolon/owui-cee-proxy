@@ -141,20 +141,27 @@ func MimeTypeFrom(ctx context.Context) string {
 	return ""
 }
 
-// WithMimeSource records (a) how the resolved MIME was chosen
+// RecordMimeSource records (a) how the resolved MIME was chosen
 // (`declared` | `sniffed` | `sniffed_then_extension` | `extension` |
 // `fallback`) and (b) the original declared value the client sent.
 // Both surface as separate access-log fields so an operator can tell
 // "client sent application/octet-stream, we sniffed application/pdf,
 // routed to docling" in one log line.
-func WithMimeSource(ctx context.Context, source, declared string) context.Context {
+//
+// Verb prefix `Record` (instead of `With`) is deliberate: this helper
+// MUTATES the requestMeta the context already carries and returns
+// nothing. The earlier `WithMimeSource(ctx) context.Context`
+// signature lied — callers that ignored the returned ctx still
+// observed the mutation through the pointer, which made it
+// indistinguishable from a context-chaining helper. Renaming closes
+// that ambiguity (C-13 from REVIEW-FAANG.md).
+func RecordMimeSource(ctx context.Context, source, declared string) {
 	if m := metaFrom(ctx); m != nil {
 		m.mu.Lock()
 		m.mimeSource = source
 		m.mimeDeclared = declared
 		m.mu.Unlock()
 	}
-	return ctx
 }
 
 // WithPickDecision records WHY a particular engine was picked:

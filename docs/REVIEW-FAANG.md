@@ -106,11 +106,20 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-17 | Perf | `staticRegistry.phases` pre-computed at `NewRegistry` time; `PickRouteVerbose` reads the struct field instead of allocating a `[]dispatchPhase` slice literal per request. Eliminates the per-request heap escape on the routing critical path. |
 | C-19 | Observability | `internal/httpclient/client.go` wraps the per-engine `*http.Transport` with `otelhttp.NewTransport` so outbound requests carry W3C `traceparent` / `tracestate` / `baggage` headers; backends continue the proxy's trace span tree end-to-end. Propagator passed explicitly (W3C TraceContext + Baggage) rather than reading the global, so the wrap fires correctly in unit tests too. New `Client.InnerTransport()` accessor for the unwrapped `*http.Transport` so existing tests can introspect transport knobs. Pinned by `TestNew_OtelHTTPTransportPropagatesTraceparent`. |
 
+### Closed in `feat/p1-architecture-plugin-sdk`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-13 | Backend | `WithMimeSource` renamed to `RecordMimeSource` and now returns nothing. The verb prefix signals the side-effect contract explicitly; the old name + returned-ctx signature lied (the helper mutates the requestMeta pointer in ctx, callers that ignored the returned ctx still saw the mutation — indistinguishable from a real ctx-chaining helper). Two call sites updated. |
+| C-25 | Architecture | `mountEnginePassthrough` now passes the per-engine raw `*http.Transport` (sourced from the new `Client.InnerTransport()`) to `reverseproxy.New` instead of `nil` (which fell back to `http.DefaultTransport` shared across every engine). New `RouterDeps.EngineTransports map[string]*http.Transport` carries the mapping from the composition root. Per-engine isolation invariant restored. |
+| C-26 | Plugin SDK | Validator tag for `EngineConfig.CompatType` switched from a hand-maintained `oneof=docling external docling-external tika` literal to a custom `compat_type_valid` validator registered at `Validate()` time. The accepted set comes from the new `compatTypes` slice — adding a new compat_type is now `const + slice entry + acceptedFacades switch arm`, with the validator following automatically. New exported `CompatTypes()` helper returns a defensive copy for adapter SDK + test alignment. |
+| C-27 | Plugin SDK | New `TestCompatTypesAndAcceptedFacadesAlignWithAdapterCapabilities` in `internal/app/app_test.go`: instantiates every registered adapter via `newAdapterByCompat` and asserts `adapter.Capabilities().Facades` matches `config.AcceptedFacades(compatType)`. Two sources of truth still exist (they serve different lifecycle stages — validator at config-Load vs registry at dispatch) but a drift in either now fails CI. |
+| C-29 | Helm | `deployments/kubernetes/base/kustomization.yaml` no longer lists `secret.example.yaml` in its `resources:` block. A GitOps pipeline with `prune=true` would previously materialise a live `Secret` containing the literal `REPLACE_ME` placeholder. Inline comment documents the intent: apply the example directly for scaffolding only; production operators supply real values via SealedSecrets / ExternalSecrets. |
+
 ### P1 (release after P0) — remaining
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|
-| C-13 | Backend | `mw.WithMimeSource` returned-context is ignored in some call sites; helper signature lies about what it does. | Rename mutating helpers `Record*`; or chain ctx everywhere. |
 | C-16 | Perf | `spoolPart` always allocates `make([]byte, 8MiB+1)` regardless of file size. 800 MiB heap pressure at 100 concurrent uploads. | Allocate `min(content_length_hint, threshold+1)`. |
 | C-22 | Reliability | `/readyz` is all-or-nothing — one flaky engine kills the whole pod. | Tier the probe: default-engine + Redis required, others surface degraded. |
 | C-23 | Reliability | Async `Enqueue` does 4 sequential Redis round-trips inside the request goroutine. Slow Redis blocks every async submit. | Pipeline via `redis.MULTI`; or single Lua script. |

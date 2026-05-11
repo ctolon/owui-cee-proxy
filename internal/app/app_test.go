@@ -9,7 +9,9 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ctolon/owui-cee-proxy/internal/breaker"
 	"github.com/ctolon/owui-cee-proxy/internal/config"
+	"github.com/ctolon/owui-cee-proxy/internal/httpclient"
 )
 
 // TestLogEngineBootstrap_EmitsEnabledEnginesOnly is the contract pin
@@ -95,4 +97,63 @@ func TestStatusValuesAdapter_NopOnEmptyMetrics(t *testing.T) {
 		(&upstreamStatusAdapter{m: nil}).RecordUpstreamStatus("e", 200)
 		(&ssrfMetricsAdapter{m: nil}).RecordRejection("metadata_ip")
 	})
+}
+
+// TestCompatTypesAndAcceptedFacadesAlignWithAdapterCapabilities
+// pins C-27: the per-compat_type facade mapping has two sources of
+// truth — `config.AcceptedFacades(compat)` (used by validator + log
+// bootstrap) and `adapter.Capabilities().Facades` (used by registry
+// dispatch). They MUST agree. This regression test instantiates
+// every registered adapter and asserts the two views match.
+//
+// Adding a new compat_type without updating BOTH sources will fail
+// this test at the next CI run — the drift the agent flagged is
+// closed by gating, not by code unification (kept the SoT split
+// because they serve different lifecycle stages).
+func TestCompatTypesAndAcceptedFacadesAlignWithAdapterCapabilities(t *testing.T) {
+	t.Parallel()
+	c, err := httpclient.New(config.EngineConfig{
+		URL:            "http://stub.example",
+		RequestTimeout: 1 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("httpclient: %v", err)
+	}
+	br := breaker.New("stub", config.BreakerConfig{
+		MaxRequests:                  1,
+		Interval:                     1 * time.Second,
+		Timeout:                      1 * time.Second,
+		ConsecutiveFailuresThreshold: 1,
+	}, nil)
+
+	for _, ct := range config.CompatTypes() {
+		ct := ct
+		t.Run(string(ct), func(t *testing.T) {
+			t.Parallel()
+			ec := config.EngineConfig{
+				CompatType: ct,
+				URL:        "http://stub.example",
+			}
+			ad, err := newAdapterByCompat("stub", ec, c, br)
+			if err != nil {
+				t.Fatalf("newAdapterByCompat(%s): %v", ct, err)
+			}
+			gotCaps := ad.Capabilities().Facades
+			want := config.AcceptedFacades(ct)
+			if len(gotCaps) != len(want) {
+				t.Fatalf("compat=%s: adapter facades %v, config.AcceptedFacades %v",
+					ct, gotCaps, want)
+			}
+			gotStr := make(map[string]bool, len(gotCaps))
+			for _, f := range gotCaps {
+				gotStr[string(f)] = true
+			}
+			for _, f := range want {
+				if !gotStr[f] {
+					t.Errorf("compat=%s: config.AcceptedFacades has %q but adapter Capabilities does not",
+						ct, f)
+				}
+			}
+		})
+	}
 }

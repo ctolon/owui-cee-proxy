@@ -77,6 +77,33 @@ const (
 	CompatTika            CompatType = "tika"
 )
 
+// compatTypes is THE registered set of compat_type values the proxy
+// recognises. The custom validator (registered in Validate) reads
+// off this slice, the bootstrap log enumerates it, and
+// acceptedFacades's switch is structurally coupled to it. Adding a
+// new compat_type is now THREE single-line edits: one const above,
+// one entry here, one acceptedFacades arm — the validator tag no
+// longer needs hand-syncing.
+//
+// (C-26 from REVIEW-FAANG.md: previously the validator tag carried a
+// duplicate `oneof=docling external docling-external tika` literal
+// that drifted from the Compat* consts on every new compat type.)
+var compatTypes = []CompatType{
+	CompatDocling,
+	CompatExternal,
+	CompatDoclingExternal,
+	CompatTika,
+}
+
+// CompatTypes returns a defensive copy of the registered compat_type
+// set. Adapter packages and enginetest contracts consult this to
+// stay in lockstep with the validator's allowed list.
+func CompatTypes() []CompatType {
+	out := make([]CompatType, len(compatTypes))
+	copy(out, compatTypes)
+	return out
+}
+
 // AuthScheme controls how an API key is rendered on outbound
 // requests. Typed for the same reason as CompatType — switch arms
 // against a misspelled scheme literal would otherwise silently
@@ -211,7 +238,12 @@ type PassthroughConfig struct {
 type EngineConfig struct {
 	Enable bool `koanf:"enable"`
 	// CompatType selects the adapter wire-protocol family.
-	CompatType CompatType `koanf:"compat_type" validate:"required_if=Enable true,omitempty,oneof=docling external docling-external tika"`
+	// CompatType selects the adapter wire-protocol family.
+	// `compat_type_valid` is the custom validator (registered in
+	// Validate) that consults the compatTypes slice — keeps the
+	// allowed-list in lockstep with the Compat* consts without a
+	// hand-maintained tag literal.
+	CompatType CompatType `koanf:"compat_type" validate:"required_if=Enable true,omitempty,compat_type_valid"`
 	URL        string     `koanf:"url" validate:"required_if=Enable true,omitempty,url"`
 	APIKeyEnv  string     `koanf:"api_key_env"`
 	APIKey     Secret     `koanf:"-"`
@@ -789,6 +821,19 @@ func splitAndTrim(s string) []string {
 // Validate runs struct validation and cross-field rules.
 func Validate(c *Config) error {
 	v := validator.New(validator.WithRequiredStructEnabled())
+	// compat_type_valid: registered before v.Struct(c) so the
+	// EngineConfig.CompatType tag resolves at struct-validation
+	// time. The set of accepted values comes from compatTypes (the
+	// SoT for the validator) — no hand-maintained `oneof=` literal.
+	_ = v.RegisterValidation("compat_type_valid", func(fl validator.FieldLevel) bool {
+		val := CompatType(fl.Field().String())
+		for _, c := range compatTypes {
+			if val == c {
+				return true
+			}
+		}
+		return false
+	})
 	if err := v.Struct(c); err != nil {
 		return fmt.Errorf("config validation: %w", err)
 	}

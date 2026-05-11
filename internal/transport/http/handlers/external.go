@@ -113,7 +113,7 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	ctx = mw.WithFileCount(ctx, 1)
 	ctx = mw.WithMimeType(ctx, contentType)
 	ctx = mw.WithPickDecision(ctx, string(pickSrc), string(e.Registry.Strategy()))
-	mw.WithMimeSource(ctx, string(resolved.Source), declaredCT)
+	mw.RecordMimeSource(ctx, string(resolved.Source), declaredCT)
 
 	traceID, spanID := mw.TraceFieldsFrom(ctx)
 	if e.Logger.GetLevel() <= zerolog.DebugLevel {
