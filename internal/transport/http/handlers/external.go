@@ -13,6 +13,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
@@ -54,7 +55,7 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 
 	declaredCT := r.Header.Get("Content-Type")
 	if declaredCT == "" {
-		http.Error(w, "missing Content-Type", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, respond.NewExternalError("missing Content-Type"))
 		return
 	}
 
@@ -64,10 +65,10 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	sr, err := spoolPart(r.Body, int64(spoolThresholdDefault), e.MaxBytes)
 	if err != nil {
 		if errors.Is(err, ErrSpoolTooLarge) {
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			writeJSON(w, http.StatusRequestEntityTooLarge, respond.NewExternalError("request body too large"))
 			return
 		}
-		http.Error(w, "read body failed", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, respond.NewExternalError("read body failed"))
 		return
 	}
 	defer func() { _ = sr.Close() }()
@@ -80,7 +81,7 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	// routes to the PDF engine, not the default catch-all.
 	resolved, srcerr := peekAndResolveMIME(declaredCT, filename, sr, e.Resolver)
 	if srcerr != nil {
-		http.Error(w, "mime detect failed", http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, respond.NewExternalError("mime detect failed"))
 		return
 	}
 	contentType := resolved.MIME
@@ -102,7 +103,8 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 		Filename: filename,
 	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("no engine for external facade: %v", err), http.StatusNotImplemented)
+		writeJSON(w, http.StatusNotImplemented,
+			respond.NewExternalError(fmt.Sprintf("no engine for external facade: %v", err)))
 		return
 	}
 
@@ -135,7 +137,8 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 			Str("engine", string(eng.Name())).
 			Str("engine_url", eng.URL()).
 			Msg("external facade engine convert failed")
-		http.Error(w, fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID), http.StatusBadGateway)
+		writeJSON(w, http.StatusBadGateway, respond.NewExternalError(
+			fmt.Sprintf("engine %s failed (request_id=%s)", eng.Name(), req.RequestID)))
 		return
 	}
 	if e.UpstreamLog != nil {

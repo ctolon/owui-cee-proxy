@@ -531,13 +531,20 @@ func Default() *Config {
 			Listen:            "0.0.0.0:8080",
 			ReadTimeout:       30 * time.Second,
 			ReadHeaderTimeout: 10 * time.Second,
-			WriteTimeout:      5 * time.Minute,
-			IdleTimeout:       120 * time.Second,
-			RequestTimeout:    5 * time.Minute,
-			MaxHeaderBytes:    1 << 20,
-			MaxBodyBytes:      500 << 20,
-			ShutdownGrace:     30 * time.Second,
-			HTTP2:             true,
+			// WriteTimeout MUST exceed RequestTimeout by at least the
+			// 2 s slack enforced in validateTimeoutHierarchy so the
+			// response writer is not torn down mid-stream when a slow
+			// handler exhausts its per-request budget. A 30 s gap
+			// covers TCP teardown + body finalisation under load AND
+			// leaves operators headroom to bump RequestTimeout up to
+			// 5 m 28 s before they have to touch WriteTimeout too.
+			WriteTimeout:   5*time.Minute + 30*time.Second,
+			IdleTimeout:    120 * time.Second,
+			RequestTimeout: 5 * time.Minute,
+			MaxHeaderBytes: 1 << 20,
+			MaxBodyBytes:   500 << 20,
+			ShutdownGrace:  30 * time.Second,
+			HTTP2:          true,
 			TLS: TLSServerConfig{
 				MinVersion: "1.3",
 				ClientAuth: "none",
@@ -807,6 +814,9 @@ func Validate(c *Config) error {
 		return err
 	}
 	if err := validateServerTLS(c); err != nil {
+		return err
+	}
+	if err := validateTimeoutHierarchy(c); err != nil {
 		return err
 	}
 	if err := validateResolvedSecrets(c); err != nil {
@@ -1140,6 +1150,60 @@ func validateTasksConfig(c *Config) error {
 		if w < 0 {
 			return fmt.Errorf("tasks.queue_weights[%q] must be non-negative", q)
 		}
+	}
+	return nil
+}
+
+// validateTimeoutHierarchy enforces the operator-facing invariant
+// that the proxy's timeout knobs are layered correctly:
+//
+//	max(engines.*.request_timeout) ≤ server.request_timeout
+//	server.request_timeout         ≤ server.write_timeout − slack
+//
+// When the hierarchy inverts, the proxy still RUNS, but the chi
+// `mw.Timeout(server.request_timeout)` cancels the context before
+// a slower engine's per-engine timeout can fire — that turns a
+// healthy-but-slow backend into a cancelled-by-proxy failure, which
+// the breaker counts as a transport error and TRIPS, taking the
+// engine offline. Operators don't realise: they see breaker open,
+// they don't see "I configured my timeouts in the wrong order".
+//
+// We fail the bootstrap with a precise diff so the operator can fix
+// the YAML rather than debug a stochastic breaker trip in
+// production. The 2 s slack between request_timeout and write_timeout
+// covers TCP teardown + body finalisation under load; smaller deltas
+// race the http.Server.WriteTimeout fire against the in-flight
+// response stream.
+//
+// Engines with `RequestTimeout == 0` are skipped — the adapter
+// inherits `DefaultRequestTimeout` (120 s) which is bounded.
+func validateTimeoutHierarchy(c *Config) error {
+	const writeTimeoutSlack = 2 * time.Second
+
+	var maxEngine time.Duration
+	var maxEngineName string
+	for name, ec := range c.Engines {
+		if !ec.Enable {
+			continue
+		}
+		if ec.RequestTimeout > maxEngine {
+			maxEngine = ec.RequestTimeout
+			maxEngineName = name
+		}
+	}
+
+	if maxEngine > 0 && c.Server.RequestTimeout > 0 && maxEngine > c.Server.RequestTimeout {
+		return fmt.Errorf(
+			"timeout hierarchy: engines.%s.request_timeout=%s exceeds server.request_timeout=%s; the chi Timeout middleware would cancel the context before the engine's own ceiling fires, tripping the breaker on a healthy backend",
+			maxEngineName, maxEngine, c.Server.RequestTimeout,
+		)
+	}
+	if c.Server.WriteTimeout > 0 && c.Server.RequestTimeout > 0 &&
+		c.Server.RequestTimeout+writeTimeoutSlack > c.Server.WriteTimeout {
+		return fmt.Errorf(
+			"timeout hierarchy: server.request_timeout=%s requires server.write_timeout ≥ %s (current %s); without the %s slack the response writer is torn down mid-stream",
+			c.Server.RequestTimeout, c.Server.RequestTimeout+writeTimeoutSlack, c.Server.WriteTimeout, writeTimeoutSlack,
+		)
 	}
 	return nil
 }

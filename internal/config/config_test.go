@@ -478,6 +478,71 @@ mimedetect:
 	require.Contains(t, err.Error(), "extension_overrides")
 }
 
+// TestValidateTimeoutHierarchy_RejectsEngineExceedingServerTimeout
+// pins the C-2 invariant: an engine's request_timeout MUST NOT
+// exceed server.request_timeout. The chi mw.Timeout(server.request_
+// timeout) would otherwise cancel the context before the engine's
+// own deadline fires, surfacing as a transport error to the breaker
+// and tripping a healthy backend.
+func TestValidateTimeoutHierarchy_RejectsEngineExceedingServerTimeout(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Server.RequestTimeout = 60 * time.Second
+	c.Server.WriteTimeout = 70 * time.Second
+	c.Engines["main"] = EngineConfig{
+		Enable:         true,
+		CompatType:     CompatDocling,
+		URL:            "http://docling.local",
+		AuthHeader:     "X-Api-Key",
+		APIKey:         "k",
+		RequestTimeout: 5 * time.Minute, // exceeds 60 s
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timeout hierarchy")
+	require.Contains(t, err.Error(), "engines.main.request_timeout")
+}
+
+// TestValidateTimeoutHierarchy_RejectsWriteTimeoutBelowSlack pins
+// the second half of the invariant: server.write_timeout MUST be at
+// least 2 s above server.request_timeout so the response writer
+// does not tear down mid-stream when a slow handler exhausts its
+// per-request budget.
+func TestValidateTimeoutHierarchy_RejectsWriteTimeoutBelowSlack(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Server.RequestTimeout = 60 * time.Second
+	c.Server.WriteTimeout = 60 * time.Second // no slack
+	c.Engines["main"] = EngineConfig{
+		Enable: true, CompatType: CompatDocling, URL: "http://docling.local",
+		AuthHeader: "X-Api-Key", APIKey: "k", RequestTimeout: 30 * time.Second,
+	}
+	err := Validate(c)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timeout hierarchy")
+	require.Contains(t, err.Error(), "write_timeout")
+}
+
+// TestValidateTimeoutHierarchy_AcceptsCorrectHierarchy verifies the
+// happy path: engine ≤ server.request ≤ server.write − slack.
+func TestValidateTimeoutHierarchy_AcceptsCorrectHierarchy(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.Routing.DefaultEngine = "main"
+	c.Routing.Facade.External.Enabled = false
+	c.Server.RequestTimeout = 60 * time.Second
+	c.Server.WriteTimeout = 5 * time.Minute
+	c.Engines["main"] = EngineConfig{
+		Enable: true, CompatType: CompatDocling, URL: "http://docling.local",
+		AuthHeader: "X-Api-Key", APIKey: "k", RequestTimeout: 30 * time.Second,
+	}
+	require.NoError(t, Validate(c))
+}
+
 // TestValidateResolvedSecrets_RejectsCRLFInResolvedAPIKey pins the
 // C-4 fix. An env-var value that picks up a stray CR/LF (typical
 // when an operator pastes a multi-line secret) must fail the
