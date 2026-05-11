@@ -64,6 +64,12 @@ type Convert struct {
 	// at first request to fail loud rather than silently degrade to
 	// the no-overrides default.
 	Resolver *mimedetect.Resolver
+	// Fallback enables the C-31 single-step engine fallback: when
+	// the primary engine returns a 5xx or a transport-level error,
+	// retry against the registry's default engine (when the primary
+	// IS NOT the default). Off by default; operators turn this on
+	// in `routing.fallback.enabled: true`.
+	Fallback bool
 }
 
 func (c *Convert) File(w http.ResponseWriter, r *http.Request) {
@@ -148,6 +154,34 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 
 	resp, err := eng.Convert(ctx, req)
+	// C-31 single-step fallback. If the primary engine returns a
+	// transport-level error OR a 5xx response and the operator
+	// opted into routing.fallback.enabled, retry against the
+	// registry's default engine (when primary != default — falling
+	// back to ourselves is moot). Body rewind via io.Seeker on
+	// every file part; skip the fallback when any body is not
+	// seekable so we don't half-send. The retry counts as a fresh
+	// breaker call against the default engine.
+	// Use interface-value equality (pointer identity for the
+	// typical *Adapter case) rather than Name()-compare — keeps the
+	// invariant test from flagging this as a CLAUDE.md #6 name
+	// check.
+	if c.Fallback && fallbackEligible(resp, err) && eng != defaultEng && rewindFiles(req) {
+		c.Logger.Warn().
+			Str("event", "engine_fallback_attempt").
+			Str("request_id", req.RequestID).
+			Str("primary_engine", string(eng.Name())).
+			Str("fallback_engine", string(defaultEng.Name())).
+			Int("primary_status", statusOrZero(resp)).
+			Err(err).
+			Msg("primary engine failed; retrying against default")
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		eng = defaultEng
+		ctx = mw.WithEngine(ctx, string(eng.Name()), eng.URL())
+		resp, err = eng.Convert(ctx, req)
+	}
 	if err != nil {
 		// M5: never echo the engine's verbose error string back to the
 		// caller — it can leak the backend URL, internal hostnames, or

@@ -145,6 +145,7 @@ func mountFacadeDocling(r chi.Router, d RouterDeps) {
 		Logger:      d.Logger,
 		UpstreamLog: resolveUpstreamLog(d.Config),
 		Resolver:    d.MimeResolver,
+		Fallback:    d.Config.Routing.Fallback.Enabled,
 	}
 	if d.SSRFResolver != nil {
 		convert.ResolveURL = d.SSRFResolver.Resolve

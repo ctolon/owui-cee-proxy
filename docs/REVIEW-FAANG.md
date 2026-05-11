@@ -132,7 +132,26 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-23 | Reliability | `Orchestrator.Enqueue` now uses `redis.Pipeline()` twice: once for the N blob SETs (1 RTT instead of N) and once for the post-Enqueue token-binding + queue-mapping pair (1 RTT instead of 2). Net: a 3-blob async submit drops from 6 sequential Redis round-trips to 3 (1 for blobs, 1 for asynq, 1 for token+queue). Slow-Redis no longer single-threads the request goroutine. |
 | C-28 | Security | API-key fingerprints now use HMAC-SHA-256 with a per-process pepper (configurable via `security.proxy_api_key_fingerprint_pepper_env`) instead of plain SHA-256. Orchestrator carries the pepper via `WithFingerprintPepper`; empty pepper falls back to the legacy plain SHA-256 path for backward-compat with existing deployments. A Redis exfil can no longer recover API keys via offline rainbow-table — the attacker also needs to steal the pepper. Pinned by `TestOrchestrator_FingerprintPepperHMAC`. |
 
+### Closed in `feat/p1-rate-limit-fallback`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-24 | Architecture | `engines.<n>.rate_limit` no longer silent dead code. New `RateLimitedTransport` (golang.org/x/time/rate) wraps every per-engine `*http.Transport` when `RPS > 0`. Sits below otelhttp + InstrumentedTransport so the limiter's `Wait` time is captured in the trace span + the upstream-duration metric. Empty / zero config preserves the previous unthrottled behaviour. |
+| C-31 | Reliability | Single-step engine fallback. New `routing.fallback.enabled` knob (default false). When ON, a primary engine's 5xx or transport-level error triggers a retry against the registry's default engine (when primary != default). Body rewind via `io.Seeker`; any non-seekable body aborts the fallback so we never half-send. Pinned by `TestConvert_FallbackOn5xxRetriesAgainstDefault` + the disabled-path counter test. Multi-tier chain explicitly out-of-scope — covers the most common case (flaky non-default → fall back to default) without designing a fallback-chain config schema. |
+
+### Milestone status
+
+**All carry-over P1 items closed.** The 14-item P1 backlog from
+the original FAANG review is exhausted across PRs #18 (C-12, C-14,
+C-18, C-20), #19 (C-15, C-17, C-19), #21 (C-13, C-25, C-26, C-27,
+C-29), #22 (C-16, C-30, C-32), #23 (C-22, C-23, C-28), and this
+PR (C-24, C-31). Combined with the v0.5.0 P0 milestone, the
+original 25-item backlog is fully retired.
+
 ### P1 (release after P0) — remaining
+
+(Nothing left in this band; future work would draw from the P2
+list + roadmap themes.)
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|

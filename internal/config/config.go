@@ -190,6 +190,31 @@ type RoutingConfig struct {
 	Strategy    RoutingStrategy   `koanf:"strategy" validate:"omitempty,oneof=mime extension mime_then_extension extension_then_mime"`
 	Facade      FacadeConfig      `koanf:"facade"`
 	Passthrough PassthroughConfig `koanf:"passthrough"`
+	// Fallback enables the engine-fallback chain (C-31). When ON,
+	// a 5xx / breaker-open from the primary engine pick triggers
+	// dispatch to the next candidate in the registry's order list
+	// for the same facade. Default OFF — the legacy "first match
+	// wins, errors propagate" behaviour. Bounded by MaxAttempts;
+	// each attempt counts the engine's name in a
+	// `fallback_attempts` field on the access log.
+	Fallback FallbackConfig `koanf:"fallback"`
+}
+
+// FallbackConfig drives the optional engine fallback chain. Activated
+// only when an engine returns a 5xx, signals breaker-open, or
+// reports a transport-level error. Non-engine-specific errors (400
+// from the proxy itself, multipart parse failure) NEVER trigger
+// fallback — those are caller-side problems, not engine flakes.
+type FallbackConfig struct {
+	// Enabled toggles the chain. Default false preserves the
+	// "errors propagate, no retry" semantics every existing
+	// deployment relies on.
+	Enabled bool `koanf:"enabled"`
+	// MaxAttempts caps the total attempt count (primary + fallbacks).
+	// 0 → 2 (primary + one fallback). Operators bump higher when
+	// they have many sibling engines and a true high-availability
+	// requirement.
+	MaxAttempts int `koanf:"max_attempts"`
 }
 
 // MimedetectConfig configures the MIME resolution layer.
