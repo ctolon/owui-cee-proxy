@@ -460,3 +460,91 @@ func TestConvert_StrategyExtensionThenMime(t *testing.T) {
 	require.EqualValues(t, 1, msgHits.Load(), "extension_then_mime: extension wins")
 	require.EqualValues(t, 0, pdfHits.Load())
 }
+
+// TestConvert_FallbackOn5xxRetriesAgainstDefault pins C-31: when
+// the primary engine returns a 5xx AND Convert.Fallback is enabled
+// AND primary != default, the handler rewinds the file body and
+// retries against the default engine. The fallback engine's
+// successful response IS the response the caller sees.
+func TestConvert_FallbackOn5xxRetriesAgainstDefault(t *testing.T) {
+	t.Parallel()
+	defaultHits, primaryHits := &atomic.Int32{}, &atomic.Int32{}
+	d := &recordingEngine{name: "default-eng", hits: defaultHits}
+	primary := &fallback5xxEngine{name: "primary-eng", hits: primaryHits}
+
+	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
+		"default-eng": {Engine: d},
+		"primary-eng": {Engine: primary, MimeTypes: []string{"application/pdf"}},
+	}, "default-eng", engine.StrategyMimeThenExt)
+	require.NoError(t, err)
+
+	h := &Convert{Registry: registry, Fallback: true}
+	srv := httptest.NewServer(http.HandlerFunc(h.File))
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "x", "application/pdf")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", ct)
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"fallback to default MUST recover the 5xx into a 200")
+	require.EqualValues(t, 1, primaryHits.Load(), "primary should be hit ONCE")
+	require.EqualValues(t, 1, defaultHits.Load(), "default should be hit ONCE on fallback")
+}
+
+// TestConvert_FallbackDisabledLeaves5xxAlone — when Fallback is off,
+// a primary 5xx propagates unchanged.
+func TestConvert_FallbackDisabledLeaves5xxAlone(t *testing.T) {
+	t.Parallel()
+	d := &recordingEngine{name: "default-eng", hits: &atomic.Int32{}}
+	primary := &fallback5xxEngine{name: "primary-eng", hits: &atomic.Int32{}}
+
+	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
+		"default-eng": {Engine: d},
+		"primary-eng": {Engine: primary, MimeTypes: []string{"application/pdf"}},
+	}, "default-eng", engine.StrategyMimeThenExt)
+	require.NoError(t, err)
+
+	h := &Convert{Registry: registry, Fallback: false}
+	srv := httptest.NewServer(http.HandlerFunc(h.File))
+	defer srv.Close()
+
+	body, ct := buildMultipart(t, "x", "application/pdf")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", ct)
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"fallback disabled → primary 5xx propagates")
+}
+
+// fallback5xxEngine is a stub that always returns 500. Combined with
+// recordingEngine for the default, the fallback test asserts the
+// retry path.
+type fallback5xxEngine struct {
+	name engine.Name
+	hits *atomic.Int32
+}
+
+func (e *fallback5xxEngine) Name() engine.Name { return e.name }
+func (e *fallback5xxEngine) URL() string       { return "http://" + string(e.name) + ".test" }
+func (e *fallback5xxEngine) Capabilities() engine.EngineCapabilities {
+	return engine.EngineCapabilities{Facades: []engine.Facade{engine.FacadeDocling}, HTTPSources: true}
+}
+
+func (e *fallback5xxEngine) Convert(_ context.Context, _ *engine.ConvertRequest) (*engine.ConvertResponse, error) {
+	e.hits.Add(1)
+	return &engine.ConvertResponse{
+		StatusCode: http.StatusInternalServerError,
+		Body:       io.NopCloser(strings.NewReader(`{"error":"primary down"}`)),
+	}, nil
+}
+
+func (e *fallback5xxEngine) Health(_ context.Context) error { return nil }
