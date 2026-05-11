@@ -30,6 +30,16 @@ import (
 // a single malicious upload.
 const maxFilePartBytes = 0
 
+// maxFormFieldBytes caps a single non-file multipart form-field value
+// (the `options[*]` knobs the facades accept). Without this cap the
+// caller can stuff a 499 MiB form field under the 500 MiB BodyLimit
+// and ask the proxy to materialise it as `string(buf)`. At 100
+// concurrent uploads that is 50 GiB of heap pressure — past the 512
+// MiB ceiling documented in CLAUDE.md. The 1 MiB limit covers every
+// realistic engine option (Docling Serve's largest known knob is a
+// JSON pipeline config under 4 KiB) and rejects abusive inputs.
+const maxFormFieldBytes = 1 << 20
+
 // Convert handles the Docling-compatible facade endpoints
 // (/v1/convert/file and /v1/convert/source) by parsing the request,
 // dispatching to the configured default engine, and streaming the
@@ -277,12 +287,20 @@ func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, fun
 			}
 			continue
 		}
-		// Form-field part: assume small, read into memory.
-		buf, err := io.ReadAll(part)
+		// Form-field part: capped at maxFormFieldBytes so a hostile
+		// client cannot stuff a near-BodyLimit-sized form field and
+		// have us materialise it as a string in memory. Reading one
+		// extra byte lets us distinguish "exactly at cap" from
+		// "exceeded cap" without re-buffering.
+		buf, err := io.ReadAll(io.LimitReader(part, int64(maxFormFieldBytes)+1))
 		_ = part.Close()
 		if err != nil {
 			cleanup()
 			return nil, noop, fmt.Errorf("read part %q: %w", part.FormName(), err)
+		}
+		if len(buf) > maxFormFieldBytes {
+			cleanup()
+			return nil, noop, fmt.Errorf("form field %q exceeds %d bytes", part.FormName(), maxFormFieldBytes)
 		}
 		req.Options[part.FormName()] = string(buf)
 	}

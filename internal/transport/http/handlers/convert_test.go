@@ -233,6 +233,44 @@ func TestConvert_ResolveURLOverride(t *testing.T) {
 	require.EqualValues(t, 1, d.hits.Load(), "engine must run when custom resolver passes")
 }
 
+// TestConvert_FormFieldExceedsCapRejected pins the C-6 DoS defence:
+// a non-file form-field part larger than maxFormFieldBytes (1 MiB)
+// MUST fail the request with 400. Without the cap a hostile client
+// could submit a 499 MiB form field under the 500 MiB BodyLimit and
+// force the proxy to materialise it as a string.
+func TestConvert_FormFieldExceedsCapRejected(t *testing.T) {
+	t.Parallel()
+	d := &recordingEngine{name: "default-eng", hits: &atomic.Int32{}}
+	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
+		"default-eng": {Engine: d},
+	}, "default-eng", engine.StrategyMimeThenExt)
+	require.NoError(t, err)
+
+	h := &Convert{Registry: registry}
+	srv := httptest.NewServer(http.HandlerFunc(h.File))
+	defer srv.Close()
+
+	// Build a multipart with ONE file part (small) + ONE form-field
+	// part that overflows the 1 MiB cap by 1 byte.
+	buf := &bytes.Buffer{}
+	mw := multipart.NewWriter(buf)
+	require.NoError(t, mw.WriteField("dummy", strings.Repeat("A", (1<<20)+1)))
+	fw, err := mw.CreateFormFile("files", "x.txt")
+	require.NoError(t, err)
+	_, _ = fw.Write([]byte("hi"))
+	require.NoError(t, mw.Close())
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, buf)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"oversized form field MUST 400 before reaching the engine")
+}
+
 func buildMultipart(t *testing.T, body, contentType string) (io.Reader, string) {
 	t.Helper()
 	return buildMultipartNamed(t, body, contentType, "x")

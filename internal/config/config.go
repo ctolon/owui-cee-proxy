@@ -809,8 +809,75 @@ func Validate(c *Config) error {
 	if err := validateServerTLS(c); err != nil {
 		return err
 	}
+	if err := validateResolvedSecrets(c); err != nil {
+		return err
+	}
 	if err := validateMimedetect(c); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateResolvedSecrets scans every resolved engine credential for
+// bytes outside the visible-ASCII window (0x20..0x7E, plus TAB).
+// Operators sometimes paste a credential into the wrong env var, or
+// the env var picks up a trailing CR/LF from a shell expansion; the
+// outbound HTTP layer would otherwise carry the invalid bytes
+// straight into the engine backend's header parser. CR/LF in
+// particular is the CWE-93 header-injection primitive.
+//
+// We fail the bootstrap rather than silently strip — operators get
+// a clear error pointing at which key is malformed, instead of
+// debugging stochastic 502s in production.
+//
+// Public-engine entries (no env var configured, so APIKey == "") are
+// skipped: empty is fine, that is the no-auth path.
+func validateResolvedSecrets(c *Config) error {
+	for name, ec := range c.Engines {
+		if !ec.Enable {
+			continue
+		}
+		if err := scanAuthValue(name, "api_key", string(ec.APIKey)); err != nil {
+			return err
+		}
+		for i, ah := range ec.AuthHeaders {
+			fieldName := fmt.Sprintf("auth_headers[%d]", i)
+			if err := scanAuthValue(name, fieldName, string(ah.APIKey)); err != nil {
+				return err
+			}
+		}
+	}
+	for i, k := range c.Security.ProxyAPIKeys {
+		fieldName := fmt.Sprintf("security.proxy_api_keys[%d]", i)
+		if err := scanAuthValue("", fieldName, string(k)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanAuthValue rejects any byte outside the visible-ASCII window
+// (0x20..0x7E, plus TAB) in the resolved credential. Returns nil for
+// an empty value — that is the unconfigured / public-engine path
+// which validateResolvedSecrets's caller has already chosen to
+// accept.
+func scanAuthValue(engine, field, val string) error {
+	if val == "" {
+		return nil
+	}
+	for i := 0; i < len(val); i++ {
+		b := val[i]
+		if b == '\t' {
+			continue
+		}
+		if b < 0x20 || b > 0x7E {
+			scope := field
+			if engine != "" {
+				scope = fmt.Sprintf("engines.%s.%s", engine, field)
+			}
+			return fmt.Errorf("%s: resolved credential contains a non-printable byte at offset %d (0x%02x); CR/LF or stray control bytes in env vars are rejected to prevent header injection",
+				scope, i, b)
+		}
 	}
 	return nil
 }
