@@ -37,6 +37,8 @@ type requestMeta struct {
 	engineURL      string
 	filename       string
 	mimeType       string
+	mimeSource     string // "declared" | "sniffed" | "fallback"
+	mimeDeclared   string // the original Content-Type the client sent
 	fileCount      int
 	upstreamStart  time.Time
 	upstreamDur    time.Duration
@@ -109,6 +111,22 @@ func MimeTypeFrom(ctx context.Context) string {
 		return m.mimeType
 	}
 	return ""
+}
+
+// WithMimeSource records (a) how the resolved MIME was chosen
+// (`declared` | `sniffed` | `fallback`) and (b) the original
+// declared value the client sent. Both surface as separate
+// access-log fields so an operator can tell "client sent
+// application/octet-stream, we sniffed application/pdf, routed to
+// docling" in one log line.
+func WithMimeSource(ctx context.Context, source, declared string) context.Context {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		m.mimeSource = source
+		m.mimeDeclared = declared
+		m.mu.Unlock()
+	}
+	return ctx
 }
 
 // StartUpstream records the moment an adapter begins dispatching to
@@ -248,6 +266,7 @@ func AccessLog(logger zerolog.Logger, silencePaths ...string) func(http.Handler)
 
 			meta.mu.Lock()
 			engineName, engineURL := meta.engine, meta.engineURL
+			mimeSource, mimeDeclared := meta.mimeSource, meta.mimeDeclared
 			filename, fileCount := meta.filename, meta.fileCount
 			mimeType := meta.mimeType
 			upstreamDur, upstreamStatus := meta.upstreamDur, meta.upstreamStatus
@@ -277,6 +296,8 @@ func AccessLog(logger zerolog.Logger, silencePaths ...string) func(http.Handler)
 				Str("engine_url", engineURL).
 				Str("filename", filename).
 				Str("mime_type", mimeType).
+				Str("mime_source", mimeSource).
+				Str("mime_declared", mimeDeclared).
 				Int("file_count", fileCount).
 				Msg("request_completed")
 		})
