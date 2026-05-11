@@ -78,6 +78,11 @@ func NewRouter(d RouterDeps) (http.Handler, error) {
 		Timeout:             d.Config.Observability.Health.Timeout,
 		MaxParallel:         d.Config.Observability.Health.MaxParallel,
 		Metrics:             d.HealthMetrics,
+		// Tiered readiness: default engine + Redis (when tasks are
+		// enabled) are load-bearing. Non-default engines surface
+		// as `degraded` in the body without flipping the pod 503.
+		// (C-22 from REVIEW-FAANG.md.)
+		Required: requiredReadinessNames(d.Config),
 	}
 	r.Get("/healthz", health.Liveness)
 	r.Get("/readyz", health.Readiness)
@@ -180,6 +185,21 @@ func mountFacadeExternal(r chi.Router, d RouterDeps) {
 		Resolver:    d.MimeResolver,
 	}
 	r.Put(processPath, ext.Process)
+}
+
+// requiredReadinessNames returns the set of probe names whose health
+// is load-bearing for the pod's readiness — the default engine plus
+// "redis" when tasks are enabled. Non-required probes degrade the
+// surface area without flipping the pod 503 (C-22).
+func requiredReadinessNames(cfg *config.Config) map[string]struct{} {
+	out := map[string]struct{}{}
+	if cfg.Routing.DefaultEngine != "" {
+		out[cfg.Routing.DefaultEngine] = struct{}{}
+	}
+	if cfg.Tasks.Enabled {
+		out["redis"] = struct{}{}
+	}
+	return out
 }
 
 // buildRedactHeaderList collects every header name that should be

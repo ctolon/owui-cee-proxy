@@ -369,13 +369,23 @@ type RateLimitConfig struct {
 }
 
 type SecurityConfig struct {
-	ProxyAPIKeysEnv   string     `koanf:"proxy_api_keys_env"`
-	ProxyAPIKeyHeader string     `koanf:"proxy_api_key_header"`
-	ProxyAPIKeys      []Secret   `koanf:"-"`
-	RequireAPIKey     bool       `koanf:"require_api_key"`
-	TrustedProxies    []string   `koanf:"trusted_proxies"`
-	CORS              CORSConfig `koanf:"cors"`
-	SSRF              SSRFConfig `koanf:"ssrf"`
+	ProxyAPIKeysEnv   string   `koanf:"proxy_api_keys_env"`
+	ProxyAPIKeyHeader string   `koanf:"proxy_api_key_header"`
+	ProxyAPIKeys      []Secret `koanf:"-"`
+	RequireAPIKey     bool     `koanf:"require_api_key"`
+	// ProxyAPIKeyFingerprintPepperEnv names the env var holding a
+	// per-process secret HMAC'd into caller-API-key fingerprints
+	// stored in Redis. With this set, an attacker who exfils Redis
+	// cannot recover the API keys via offline rainbow tables
+	// against the fingerprint — they would need to ALSO steal the
+	// pepper from the proxy process. Empty value (the legacy
+	// default) falls back to plain SHA-256 fingerprints, which
+	// keeps existing deployments working. (C-28 from REVIEW-FAANG.md.)
+	ProxyAPIKeyFingerprintPepperEnv string     `koanf:"proxy_api_key_fingerprint_pepper_env"`
+	ProxyAPIKeyFingerprintPepper    Secret     `koanf:"-"`
+	TrustedProxies                  []string   `koanf:"trusted_proxies"`
+	CORS                            CORSConfig `koanf:"cors"`
+	SSRF                            SSRFConfig `koanf:"ssrf"`
 }
 
 // SSRFConfig tunes the /v1/convert/source policy.
@@ -803,6 +813,9 @@ func resolveSecrets(c *Config) {
 	}
 	if c.Tasks.RedisURLEnv != "" {
 		c.Tasks.RedisURL = Secret(os.Getenv(c.Tasks.RedisURLEnv))
+	}
+	if c.Security.ProxyAPIKeyFingerprintPepperEnv != "" {
+		c.Security.ProxyAPIKeyFingerprintPepper = Secret(os.Getenv(c.Security.ProxyAPIKeyFingerprintPepperEnv))
 	}
 }
 

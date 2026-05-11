@@ -71,6 +71,9 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 			&taskLifecycleAdapter{m: metrics},
 			&queueDepthAdapter{m: metrics},
 		)
+		// HMAC pepper (C-28). Empty when unconfigured → orchestrator
+		// keeps the legacy plain-SHA-256 fingerprint path.
+		orch.WithFingerprintPepper([]byte(cfg.Security.ProxyAPIKeyFingerprintPepper))
 		redisHealth = orch.HealthCheck()
 		worker, err = tasks.NewWorker(cfg.Tasks, orch, registry, logger)
 		if err != nil {

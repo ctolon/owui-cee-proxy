@@ -124,6 +124,14 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-30 | API | New `copyResponseHeaders` helper applies an allowlist (`Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`, `Etag`, `Last-Modified`, `Cache-Control`, `Expires`, `Vary`, `X-Request-Id`) plus a belt-and-braces deny list (`Set-Cookie`, `Set-Cookie2`, `Server`, `X-Powered-By`, `X-Aspnet-Version`, `X-Aspnetmvc-Version`). CR/LF-bearing values are dropped from allowlisted headers too. Wired into both convert.go and external.go. Pinned by two unit tests. |
 | C-32 | Observability | New `logEnginePickDecision` helper centralises the structured field set of `engine_pick_decision`; convert.go + external.go now call ONE function instead of duplicating the emit block. Field set expanded with `facade`, `mime_declared`, `mime_resolved`, `mime_source`, `file_ext`, `file_count`, `compat_type` (reserved for future engine-SDK extension). Adding a new attribution field is now a single-file change. |
 
+### Closed in `feat/p1-async-reliability`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-22 | Reliability | New `Health.Required map[string]struct{}` carries the load-bearing probe names (default engine + Redis when tasks are enabled, populated by `requiredReadinessNames`). When set, `/readyz` flips to 503 ONLY if a required probe fails — non-required engines surface as `"degraded": [...]` in the body without ejecting the pod. Empty Required preserves legacy all-or-nothing behaviour. Pinned by two new tests (tiered pass + required fail). |
+| C-23 | Reliability | `Orchestrator.Enqueue` now uses `redis.Pipeline()` twice: once for the N blob SETs (1 RTT instead of N) and once for the post-Enqueue token-binding + queue-mapping pair (1 RTT instead of 2). Net: a 3-blob async submit drops from 6 sequential Redis round-trips to 3 (1 for blobs, 1 for asynq, 1 for token+queue). Slow-Redis no longer single-threads the request goroutine. |
+| C-28 | Security | API-key fingerprints now use HMAC-SHA-256 with a per-process pepper (configurable via `security.proxy_api_key_fingerprint_pepper_env`) instead of plain SHA-256. Orchestrator carries the pepper via `WithFingerprintPepper`; empty pepper falls back to the legacy plain SHA-256 path for backward-compat with existing deployments. A Redis exfil can no longer recover API keys via offline rainbow-table — the attacker also needs to steal the pepper. Pinned by `TestOrchestrator_FingerprintPepperHMAC`. |
+
 ### P1 (release after P0) — remaining
 
 | ID  | Lens | Finding | Recommended action |
