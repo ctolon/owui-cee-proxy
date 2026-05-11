@@ -104,6 +104,7 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 		HealthMetrics:    &healthMetricsAdapter{m: metrics},
 		MimeResolver:     mimeResolver,
 		EngineTransports: engineTransports,
+		PanicRecorder:    &panicRecorderAdapter{m: metrics},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("router: %w", err)
@@ -355,6 +356,26 @@ func (h *healthMetricsAdapter) RecordHealthProbe(engineName, status string, dur 
 	if h.m.HealthProbeDuration != nil {
 		h.m.HealthProbeDuration.WithLabelValues(engineName).Observe(dur.Seconds())
 	}
+}
+
+// panicRecorderAdapter bridges mw.PanicRecorder onto the
+// PanicsTotal counter. Nil metrics → no-op; the Recover middleware
+// still emits its structured log line.
+type panicRecorderAdapter struct{ m *observability.Metrics }
+
+func (p *panicRecorderAdapter) RecordPanic(path string) {
+	if p.m == nil || p.m.PanicsTotal == nil {
+		return
+	}
+	// chi's RoutePattern is preferable to the raw URL.Path but isn't
+	// available from the panic site; we accept the raw path here.
+	// Cardinality is bounded in practice by the route patterns
+	// chi exposes plus the literal "" for 404s (chi calls Recover
+	// AFTER its router, so a 404 has already been resolved).
+	if path == "" {
+		path = "unknown"
+	}
+	p.m.PanicsTotal.WithLabelValues(path).Inc()
 }
 
 // upstreamStatusAdapter bridges httpclient.UpstreamStatusRecorder to
