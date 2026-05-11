@@ -14,6 +14,9 @@ import (
 	"os"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/propagation"
+
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/authutil"
 )
@@ -52,12 +55,24 @@ type Client struct {
 	HTTP           *http.Client
 	RequestTimeout time.Duration
 	BaseURL        string
+	// innerTransport is the raw *http.Transport before any
+	// otelhttp.NewTransport / instrumented wrap. Tests + introspection
+	// helpers reach the underlying knobs (MaxIdleConns, dialer,
+	// ResponseHeaderTimeout) through `InnerTransport()` rather than
+	// asserting against c.HTTP.Transport's concrete type, which would
+	// break the moment another wrapper layer is added.
+	innerTransport *http.Transport
 	// authMetrics is the seam adapters use to report auth-stamping
 	// outcomes to the metrics layer. Nil-safe: callers MUST go through
 	// Auth() rather than reading the field directly so they always
 	// get a usable AuthMetrics (Nop when nothing was injected).
 	authMetrics authutil.AuthMetrics
 }
+
+// InnerTransport returns the raw *http.Transport without OTel or
+// instrumented wrapper layers. Test-only API; production code paths
+// dial through c.HTTP.Transport which is the wrapped form.
+func (c *Client) InnerTransport() *http.Transport { return c.innerTransport }
 
 // Auth returns the configured AuthMetrics hook, falling back to a Nop
 // implementation when none was injected. Adapters call this on every
@@ -115,13 +130,36 @@ func New(cfg config.EngineConfig) (*Client, error) {
 		DisableCompression:    cfg.HTTP.DisableCompression,
 		TLSClientConfig:       tlsConf,
 	}
+	// Wrap the per-engine transport in otelhttp.NewTransport so
+	// outbound requests carry W3C `traceparent` + `tracestate` +
+	// `baggage` headers — the engine backend then continues the
+	// trace started by the proxy's inbound otelhttp middleware,
+	// producing one end-to-end span tree in Tempo / Jaeger. The
+	// hand-rolled InstrumentedTransport stays downstream of this
+	// wrap (added later via Instrument()) so existing Prometheus
+	// counters continue to fire; OTel just adds the propagation
+	// layer.
+	//
+	// Pass the propagator explicitly rather than reading
+	// otel.GetTextMapPropagator() so this wrap fires correctly even
+	// when SetupTracing has not run (unit tests, dev cycles with
+	// observability disabled). production tracing.go ALSO sets the
+	// global to the same composite; tests need not.
+	// (C-19, P1 observability review.)
+	rt := otelhttp.NewTransport(
+		transport,
+		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{}, propagation.Baggage{},
+		)),
+	)
 	return &Client{
 		HTTP: &http.Client{
-			Transport: transport,
+			Transport: rt,
 			Timeout:   0, // we use per-request context deadlines instead
 		},
 		RequestTimeout: requestTimeout,
 		BaseURL:        cfg.URL,
+		innerTransport: transport,
 	}, nil
 }
 

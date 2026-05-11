@@ -176,6 +176,13 @@ type staticRegistry struct {
 	pickOrder []namedRoute
 	// strategy is resolved at construction (empty → mime_then_extension).
 	strategy RoutingStrategy
+	// phases is the strategy's dispatch-phase sequence (mime,
+	// extension, or both in either order), pre-computed at
+	// construction so PickRouteVerbose does not allocate a fresh
+	// slice on every request. Each routing decision reads a struct
+	// field instead — the per-request slice literal that previously
+	// escaped to heap is eliminated. (C-17, P1 perf review.)
+	phases []dispatchPhase
 }
 
 // namedRoute bundles an engine with its compiled MIME + extension
@@ -225,13 +232,15 @@ func NewRegistry(entries map[Name]RegistryEntry, defaultEngine Name, strategy Ro
 		})
 	}
 
+	resolvedStrategy := ResolveStrategy(strategy)
 	return &staticRegistry{
 		engines:   engines,
 		def:       defEntry.Engine,
 		defName:   defaultEngine,
 		order:     order,
 		pickOrder: pickOrder,
-		strategy:  ResolveStrategy(strategy),
+		strategy:  resolvedStrategy,
+		phases:    strategyPhases(resolvedStrategy),
 	}, nil
 }
 
@@ -288,8 +297,7 @@ func (s *staticRegistry) PickRouteVerbose(facade Facade, hint PickHint) (Engine,
 	mime := canonicalMIME(hint.MIME)
 	ext := strings.ToLower(filepathExt(hint.Filename))
 
-	phases := strategyPhases(s.strategy)
-	for _, ph := range phases {
+	for _, ph := range s.phases {
 		switch ph {
 		case phaseMime:
 			if mime == "" {
