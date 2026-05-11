@@ -16,6 +16,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/version"
 )
 
+
 func main() {
 	// Delegate to run so deferred cleanups (signal stop, etc.) actually
 	// fire — calling os.Exit directly from main would skip them, which
@@ -28,7 +29,7 @@ func run() int {
 		cfgPath     string
 		showVersion bool
 	)
-	flag.StringVar(&cfgPath, "config", envOr("OWUI_PROXY_CONFIG", "configs/config.example.yaml"), "path to YAML config")
+	flag.StringVar(&cfgPath, "config", config.DefaultConfigPath(), "path to YAML config")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
 
@@ -60,9 +61,3 @@ func run() int {
 	return 0
 }
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}

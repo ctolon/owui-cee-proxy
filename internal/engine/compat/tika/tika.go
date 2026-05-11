@@ -15,13 +15,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
 
 	"github.com/ctolon/owui-cee-proxy/internal/breaker"
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/authutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	"github.com/ctolon/owui-cee-proxy/internal/httpclient"
+	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
 const (
@@ -44,6 +46,8 @@ func New(name engine.Name, cfg config.EngineConfig, client *httpclient.Client, b
 }
 
 func (a *Adapter) Name() engine.Name { return a.name }
+
+func (a *Adapter) URL() string { return a.cfg.URL }
 
 func (a *Adapter) Capabilities() engine.EngineCapabilities {
 	// Tika has no http_sources equivalent. Both facades are answered
@@ -126,13 +130,7 @@ func (a *Adapter) convertOne(ctx context.Context, f engine.FileBlob) (item, int,
 		r.Header.Set("Content-Type", f.ContentType)
 	}
 	r.Header.Set("Accept", "application/json")
-	if a.cfg.APIKey != "" && a.cfg.AuthHeader != "" {
-		v := string(a.cfg.APIKey)
-		if a.cfg.AuthScheme == "bearer" {
-			v = "Bearer " + v
-		}
-		r.Header.Set(a.cfg.AuthHeader, v)
-	}
+	authutil.Apply(r.Header, string(a.name), a.cfg, a.client.Auth())
 	if v := a.cfg.ForwardOptions["x_tika_pdf_extract_inline_images"]; v == "true" {
 		r.Header.Set("X-Tika-PDFextractInlineImages", "true")
 	}
@@ -159,32 +157,47 @@ func (a *Adapter) do(r *http.Request) (*http.Response, error) {
 	}
 	var raw any
 	var err error
+	mw.StartUpstream(r.Context())
 	if a.breaker != nil {
 		raw, err = a.breaker.Execute(exec)
 	} else {
 		raw, err = exec()
 	}
 	if err != nil {
+		mw.EndUpstream(r.Context(), 0)
 		return nil, err
 	}
-	return raw.(*http.Response), nil
+	resp, ok := raw.(*http.Response)
+	if !ok || resp == nil {
+		mw.EndUpstream(r.Context(), 0)
+		return nil, fmt.Errorf("tika: breaker returned unexpected %T (want *http.Response)", raw)
+	}
+	mw.EndUpstream(r.Context(), resp.StatusCode)
+	return resp, nil
+}
+
+// mustMarshalJSON panics if json.Marshal fails on a fixed-shape
+// input. Adapters use this in their error-response builders where
+// the input is hard-coded and a real Marshal failure indicates a
+// programming error (recursive value, unmarshalable type).
+func mustMarshalJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("tika: encoder marshal of fixed shape failed: %v", err))
+	}
+	return b
 }
 
 // jsonError returns a synthetic ConvertResponse in whichever facade
-// shape the caller expects.
+// shape the caller expects. Typed shapes from internal/engine/respond
+// keep the wire format honest across adapters.
 func jsonError(facade engine.Facade, status int, msg string) *engine.ConvertResponse {
 	var body []byte
 	switch facade {
 	case engine.FacadeExternal:
-		body, _ = json.Marshal(map[string]any{
-			"page_content": "",
-			"metadata":     map[string]any{"error": msg},
-		})
+		body = mustMarshalJSON(respond.NewExternalError(msg))
 	default:
-		body, _ = json.Marshal(map[string]any{
-			"status": "failure",
-			"errors": []map[string]string{{"message": msg}},
-		})
+		body = mustMarshalJSON(respond.NewDoclingError(msg))
 	}
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
@@ -195,14 +208,6 @@ func jsonError(facade engine.Facade, status int, msg string) *engine.ConvertResp
 	}
 }
 
-func joinURL(base, p string) (string, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("invalid url: %w", err)
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	u.Path = strings.TrimRight(u.Path, "/") + p
-	return u.String(), nil
-}
+// joinURL is a thin shim around compatutil.JoinURL; kept package-local
+// so the rest of the file reads naturally with lowercase use.
+func joinURL(base, p string) (string, error) { return compatutil.JoinURL(base, p) }

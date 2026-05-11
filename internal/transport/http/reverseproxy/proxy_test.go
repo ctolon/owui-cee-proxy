@@ -24,7 +24,7 @@ func TestNew_StripsXForwardedFromUntrustedSource(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	rp, err := New(backend.URL, "/svc", "", "", nil, nil) // no trusted proxies
+	rp, err := New(backend.URL, "/svc", "", "", "", nil, nil) // no trusted proxies
 	require.NoError(t, err)
 
 	front := httptest.NewServer(rp)
@@ -58,7 +58,7 @@ func TestNew_PreservesXForwardedFromTrustedSource(t *testing.T) {
 	defer backend.Close()
 
 	// 127.0.0.0/8 covers the loopback that httptest uses.
-	rp, err := New(backend.URL, "/svc", "", "", nil, []string{"127.0.0.0/8"})
+	rp, err := New(backend.URL, "/svc", "", "", "", nil, []string{"127.0.0.0/8"})
 	require.NoError(t, err)
 
 	front := httptest.NewServer(rp)
@@ -128,6 +128,136 @@ func TestRejectTraversal_PassesCleanPaths(t *testing.T) {
 		require.Equal(t, http.StatusNoContent, w.Code, "path %q", p)
 		require.True(t, called, "handler must run for %q", p)
 	}
+}
+
+// TestNew_StampsConfiguredAPIKey covers the native-passthrough auth
+// forwarding path: when an engine is configured with auth_header +
+// api_key_env, requests through /<engine>/* MUST carry that header
+// on the outbound request. This is the passthrough analogue of the
+// per-adapter ApplyAuth coverage and is the path the user most often
+// debugs ("my Bearer key isn't showing up").
+func TestNew_StampsConfiguredAPIKey(t *testing.T) {
+	t.Parallel()
+
+	var seenKey string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenKey = r.Header.Get("X-Api-Key")
+	}))
+	defer backend.Close()
+
+	rp, err := New(backend.URL, "/docling", "X-Api-Key", "secret-from-env", "raw", nil, nil)
+	require.NoError(t, err)
+	front := httptest.NewServer(rp)
+	defer front.Close()
+
+	resp, err := http.Get(front.URL + "/docling/health")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, "secret-from-env", seenKey, "configured api key must reach the backend")
+}
+
+// TestNew_EmptyAPIKeyDoesNotStampHeader pins the symmetrical case to
+// the adapter tests: an unresolved env var must not produce an
+// empty-valued header (some backends 401 on "X-Api-Key:").
+func TestNew_EmptyAPIKeyDoesNotStampHeader(t *testing.T) {
+	t.Parallel()
+
+	var saw bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, saw = r.Header["X-Api-Key"]
+	}))
+	defer backend.Close()
+
+	rp, err := New(backend.URL, "/docling", "X-Api-Key", "", "raw", nil, nil)
+	require.NoError(t, err)
+	front := httptest.NewServer(rp)
+	defer front.Close()
+
+	resp, err := http.Get(front.URL + "/docling/health")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.False(t, saw, "no header must be stamped when apiKey is empty")
+}
+
+// TestNew_StripsInboundAuthorization codifies the security invariant:
+// callers MUST NOT be able to smuggle their own Authorization header
+// onto the engine backend, even on the passthrough path that doesn't
+// otherwise parse the request.
+func TestNew_StripsInboundAuthorization(t *testing.T) {
+	t.Parallel()
+
+	var seenAuth string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+	}))
+	defer backend.Close()
+
+	// Configure the engine's own auth on a DIFFERENT header so we can
+	// be sure the caller's Authorization got dropped (not just
+	// overwritten by the engine's own stamp).
+	rp, err := New(backend.URL, "/docling", "X-Api-Key", "engine-key", "raw", nil, nil)
+	require.NoError(t, err)
+	front := httptest.NewServer(rp)
+	defer front.Close()
+
+	req, err := http.NewRequest("GET", front.URL+"/docling/health", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer caller-smuggled-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Empty(t, seenAuth, "caller-supplied Authorization must be stripped before reaching backend")
+}
+
+// TestNew_AppliesBearerScheme verifies the fix for the passthrough
+// bearer-scheme bug (was: "auth_scheme: bearer + auth_header:
+// Authorization" routed via /<engine>/* sent the raw key, dropping
+// the "Bearer " prefix and silently 401-ing). The passthrough now
+// honours the same scheme semantics as the facade path's
+// authutil.Apply, so the two log/wire shapes match.
+func TestNew_AppliesBearerScheme(t *testing.T) {
+	t.Parallel()
+
+	var seenAuth string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+	}))
+	defer backend.Close()
+
+	rp, err := New(backend.URL, "/docling", "Authorization", "raw-key", "bearer", nil, nil)
+	require.NoError(t, err)
+	front := httptest.NewServer(rp)
+	defer front.Close()
+
+	resp, err := http.Get(front.URL + "/docling/health")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, "Bearer raw-key", seenAuth,
+		"bearer scheme must prepend 'Bearer ' on the passthrough path, matching the facade path")
+}
+
+// TestNew_RawSchemeForwardsLiteralKey is the symmetric coverage for
+// auth_scheme: raw — the literal key should reach the backend
+// without any prefix mangling.
+func TestNew_RawSchemeForwardsLiteralKey(t *testing.T) {
+	t.Parallel()
+
+	var seenAuth string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("X-Api-Key")
+	}))
+	defer backend.Close()
+
+	rp, err := New(backend.URL, "/docling", "X-Api-Key", "raw-key", "raw", nil, nil)
+	require.NoError(t, err)
+	front := httptest.NewServer(rp)
+	defer front.Close()
+
+	resp, err := http.Get(front.URL + "/docling/health")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, "raw-key", seenAuth)
 }
 
 // TestSingleJoin_PathClean is a tight unit check for the M3 belt-and-

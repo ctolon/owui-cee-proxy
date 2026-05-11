@@ -99,8 +99,16 @@ func (c EngineCapabilities) AcceptsFacade(f Facade) bool {
 }
 
 // Engine is implemented by each adapter.
+//
+// URL returns the configured base URL of the backend the adapter is
+// pointed at (the engines.<name>.url from YAML). This is for operator
+// observability ONLY — the proxy's request lifecycle uses it as a log
+// field and span attribute so logs/traces can attribute a particular
+// request to a particular backend. Adapters MUST NOT use URL to make
+// routing decisions; routing is decided by Capabilities + Registry.
 type Engine interface {
 	Name() Name
+	URL() string
 	Capabilities() EngineCapabilities
 	Convert(ctx context.Context, req *ConvertRequest) (*ConvertResponse, error)
 	Health(ctx context.Context) error

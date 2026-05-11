@@ -15,6 +15,7 @@ type fakeEngine struct {
 }
 
 func (f *fakeEngine) Name() Name                       { return f.name }
+func (f *fakeEngine) URL() string                      { return "http://" + string(f.name) + ".test" }
 func (f *fakeEngine) Capabilities() EngineCapabilities { return f.caps }
 func (f *fakeEngine) Convert(_ context.Context, r *ConvertRequest) (*ConvertResponse, error) {
 	if f.convert != nil {

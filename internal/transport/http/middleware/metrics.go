@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -29,7 +28,7 @@ func Metrics(m *observability.Metrics) func(http.Handler) http.Handler {
 
 			engineName, _ := engineFrom(r.Context())
 			route := routeLabelFromContext(r)
-			m.RequestsTotal.WithLabelValues(engineName, route, r.Method, strconv.Itoa(rw.status)).Inc()
+			m.RequestsTotal.WithLabelValues(engineName, route, r.Method, observability.StatusClass(rw.status)).Inc()
 			m.RequestDuration.WithLabelValues(engineName, route, r.Method).Observe(time.Since(start).Seconds())
 			if rw.status >= 500 {
 				m.UpstreamErrors.WithLabelValues(engineName, "5xx").Inc()

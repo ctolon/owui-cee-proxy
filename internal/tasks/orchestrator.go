@@ -15,12 +15,35 @@ import (
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
 )
 
 var ErrNotFound = errors.New("tasks: not found")
+
+// LifecycleRecorder is the observability seam for the async path.
+// Nil-safe (Orchestrator/Worker default to a Nop recorder when not
+// wired) so unit tests don't need to know about metrics. Production
+// wires this to the TaskLifecycle counter.
+type LifecycleRecorder interface {
+	RecordTaskLifecycle(stage, outcome string)
+}
+
+type nopLifecycleRecorder struct{}
+
+func (nopLifecycleRecorder) RecordTaskLifecycle(string, string) {}
+
+// QueueDepthRecorder sets the WorkerQueueDepth gauge once per poll.
+// Nil-safe.
+type QueueDepthRecorder interface {
+	SetQueueDepth(queue string, depth int)
+}
+
+type nopQueueDepthRecorder struct{}
+
+func (nopQueueDepthRecorder) SetQueueDepth(string, int) {}
 
 // Orchestrator is the API-side handle on the asynq client and Redis
 // blob store. The worker side runs in the same binary but on a
@@ -31,7 +54,30 @@ type Orchestrator struct {
 	inspector *asynq.Inspector
 	redis     *redis.Client
 	registry  engine.Registry
+	logger    zerolog.Logger
+	lifecycle LifecycleRecorder
+	queueDep  QueueDepthRecorder
 }
+
+// WithObservability wires the structured logger + metric recorders.
+// Returns the same orchestrator so app.go can chain: NewOrchestrator
+// then WithObservability. Nil arguments fall back to the safe Nops.
+func (o *Orchestrator) WithObservability(logger zerolog.Logger, lc LifecycleRecorder, qd QueueDepthRecorder) *Orchestrator {
+	o.logger = logger
+	if lc == nil {
+		lc = nopLifecycleRecorder{}
+	}
+	if qd == nil {
+		qd = nopQueueDepthRecorder{}
+	}
+	o.lifecycle = lc
+	o.queueDep = qd
+	return o
+}
+
+// Inspector exposes the asynq inspector to the queue-depth poller
+// goroutine the composition root spawns. Returned read-only.
+func (o *Orchestrator) Inspector() *asynq.Inspector { return o.inspector }
 
 func NewOrchestrator(cfg config.TasksConfig, registry engine.Registry) (*Orchestrator, error) {
 	if !cfg.Enabled {
@@ -55,6 +101,8 @@ func NewOrchestrator(cfg config.TasksConfig, registry engine.Registry) (*Orchest
 		inspector: asynq.NewInspector(opt),
 		redis:     redis.NewClient(rOpt),
 		registry:  registry,
+		lifecycle: nopLifecycleRecorder{},
+		queueDep:  nopQueueDepthRecorder{},
 	}, nil
 }
 
@@ -187,7 +235,42 @@ func (o *Orchestrator) Enqueue(ctx context.Context, p *Payload, apiKey string) (
 	if err := o.redis.Set(ctx, queueKey(info.ID), info.Queue, o.cfg.Retention).Err(); err != nil {
 		return "", fmt.Errorf("persist queue mapping: %w", err)
 	}
+
+	o.lifecycle.RecordTaskLifecycle("enqueued", "success")
+	o.logger.Info().
+		Str("event", "task_enqueued").
+		Str("task_id", info.ID).
+		Str("token", token).
+		Str("engine", p.Engine).
+		Str("queue", info.Queue).
+		Str("request_id", p.RequestID).
+		Int("file_count", len(p.BlobKeys)).
+		Msg("async task enqueued")
+
 	return token, nil
+}
+
+// PollQueueDepth fires once per period (driven by the composition
+// root's goroutine) and sets the WorkerQueueDepth gauge for every
+// known queue. Errors from the inspector are logged at debug level
+// (we don't fail the proxy if Redis hiccups for a poll cycle).
+func (o *Orchestrator) PollQueueDepth(ctx context.Context) {
+	queues, err := o.inspector.Queues()
+	if err != nil {
+		o.logger.Debug().Err(err).Msg("queue-depth poll: list queues failed")
+		return
+	}
+	for _, q := range queues {
+		info, err := o.inspector.GetQueueInfo(q)
+		if err != nil {
+			o.logger.Debug().Err(err).Str("queue", q).Msg("queue-depth poll: queue info failed")
+			continue
+		}
+		// Depth = active + pending + scheduled + retry + aggregating.
+		// This is the canonical "still-doing-work" headline number.
+		depth := info.Active + info.Pending + info.Scheduled + info.Retry + info.Aggregating
+		o.queueDep.SetQueueDepth(q, depth)
+	}
 }
 
 // resolveToken returns the internal asynq task ID bound to the caller-

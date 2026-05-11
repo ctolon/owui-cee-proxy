@@ -26,6 +26,14 @@ type RouterDeps struct {
 	Registry     engine.Registry
 	Orchestrator *tasks.Orchestrator
 	RedisHealth  func(context.Context) error
+	// SSRFResolver applies the /v1/convert/source SSRF policy. The
+	// composition root wires this with cache + metrics + logger; if
+	// left nil, mountFacadeDocling falls back to the package's
+	// zero-config Resolver (no cache, no observability).
+	SSRFResolver *handlers.Resolver
+	// HealthMetrics records per-engine readiness probe outcomes +
+	// durations. Nil disables metric recording (tests).
+	HealthMetrics handlers.HealthMetrics
 }
 
 func NewRouter(d RouterDeps) (http.Handler, error) {
@@ -37,10 +45,18 @@ func NewRouter(d RouterDeps) (http.Handler, error) {
 	r.Use(mw.OTel(d.Config.Observability.Tracing.ServiceName))
 	r.Use(mw.GlobalRateLimit(d.Config.RateLimitGlobal.RPS, d.Config.RateLimitGlobal.Burst))
 	r.Use(mw.BodyLimit(d.Config.Server.MaxBodyBytes))
-	r.Use(mw.AccessLog(d.Logger))
+	r.Use(mw.AccessLog(d.Logger, d.Config.Observability.Log.SilencePaths...))
 	r.Use(mw.Metrics(d.Metrics))
 
-	health := &handlers.Health{Registry: d.Registry, Redis: d.RedisHealth, Logger: d.Logger}
+	health := &handlers.Health{
+		Registry:            d.Registry,
+		Redis:               d.RedisHealth,
+		Logger:              d.Logger,
+		SilenceEngineHealth: d.Config.Observability.Log.SilenceEngineHealth,
+		Timeout:             d.Config.Observability.Health.Timeout,
+		MaxParallel:         d.Config.Observability.Health.MaxParallel,
+		Metrics:             d.HealthMetrics,
+	}
 	r.Get("/healthz", health.Liveness)
 	r.Get("/readyz", health.Readiness)
 
@@ -61,31 +77,11 @@ func NewRouter(d RouterDeps) (http.Handler, error) {
 			d.Config.Security.RequireAPIKey,
 		))
 
-		// Docling facade — POST /v1/convert/{file,source} plus async siblings.
 		if d.Config.Routing.Facade.Docling.Enabled {
-			facade := strings.TrimRight(d.Config.Routing.Facade.Docling.Prefix, "/")
-			if facade == "" {
-				facade = "/v1"
-			}
-			convert := &handlers.Convert{Registry: d.Registry}
-			r.Post(facade+"/convert/file", convert.File)
-			r.Post(facade+"/convert/source", convert.Source)
-
-			async := &handlers.Async{Registry: d.Registry, Orchestrator: d.Orchestrator}
-			r.Post(facade+"/convert/file/async", async.SubmitFile)
-			r.Post(facade+"/convert/source/async", async.SubmitSource)
-			r.Get(facade+"/status/poll/{id}", async.Poll)
-			r.Get(facade+"/result/{id}", async.Result)
+			mountFacadeDocling(r, d)
 		}
-
-		// External facade — PUT /process raw + page_content shape.
 		if d.Config.Routing.Facade.External.Enabled {
-			processPath := d.Config.Routing.Facade.External.Path
-			if processPath == "" {
-				processPath = "/process"
-			}
-			ext := &handlers.External{Registry: d.Registry, MaxBytes: d.Config.Server.MaxBodyBytes}
-			r.Put(processPath, ext.Process)
+			mountFacadeExternal(r, d)
 		}
 
 		// Native passthrough mounts: each enabled engine is reachable at
@@ -109,9 +105,50 @@ func NewRouter(d RouterDeps) (http.Handler, error) {
 	return r, nil
 }
 
+// mountFacadeDocling wires the POST /v1/convert/{file,source} sync
+// handlers plus their async siblings. Split out of NewRouter to keep
+// the composition root readable.
+func mountFacadeDocling(r chi.Router, d RouterDeps) {
+	facade := strings.TrimRight(d.Config.Routing.Facade.Docling.Prefix, "/")
+	if facade == "" {
+		facade = "/v1"
+	}
+	convert := &handlers.Convert{
+		Registry:    d.Registry,
+		Logger:      d.Logger,
+		UpstreamLog: resolveUpstreamLog(d.Config),
+	}
+	if d.SSRFResolver != nil {
+		convert.ResolveURL = d.SSRFResolver.Resolve
+	}
+	r.Post(facade+"/convert/file", convert.File)
+	r.Post(facade+"/convert/source", convert.Source)
+
+	async := &handlers.Async{Registry: d.Registry, Orchestrator: d.Orchestrator}
+	r.Post(facade+"/convert/file/async", async.SubmitFile)
+	r.Post(facade+"/convert/source/async", async.SubmitSource)
+	r.Get(facade+"/status/poll/{id}", async.Poll)
+	r.Get(facade+"/result/{id}", async.Result)
+}
+
+// mountFacadeExternal wires the PUT /process external-loader path.
+func mountFacadeExternal(r chi.Router, d RouterDeps) {
+	processPath := d.Config.Routing.Facade.External.Path
+	if processPath == "" {
+		processPath = "/process"
+	}
+	ext := &handlers.External{
+		Registry:    d.Registry,
+		Logger:      d.Logger,
+		MaxBytes:    d.Config.Server.MaxBodyBytes,
+		UpstreamLog: resolveUpstreamLog(d.Config),
+	}
+	r.Put(processPath, ext.Process)
+}
+
 func mountEnginePassthrough(r chi.Router, d RouterDeps, name string, ec config.EngineConfig) error {
 	prefix := "/" + name
-	rp, err := reverseproxy.New(ec.URL, prefix, ec.AuthHeader, string(ec.APIKey), nil, d.Config.Security.TrustedProxies)
+	rp, err := reverseproxy.New(ec.URL, prefix, ec.AuthHeader, string(ec.APIKey), string(ec.AuthScheme), nil, d.Config.Security.TrustedProxies)
 	if err != nil {
 		return err
 	}
@@ -128,4 +165,19 @@ func secretsToStrings(in []config.Secret) []string {
 		out[i] = string(s)
 	}
 	return out
+}
+
+// resolveUpstreamLog returns a closure that, given an engine name,
+// produces the effective UpstreamLogConfig (global default merged
+// with the engine's per-entry override). The handlers cache the
+// closure once; per-request lookups are cheap (map read).
+func resolveUpstreamLog(cfg *config.Config) func(engineName string) config.UpstreamLogConfig {
+	global := cfg.Observability.Upstream
+	return func(engineName string) config.UpstreamLogConfig {
+		ec, ok := cfg.Engines[engineName]
+		if !ok {
+			return global
+		}
+		return ec.ResolveUpstream(global)
+	}
 }

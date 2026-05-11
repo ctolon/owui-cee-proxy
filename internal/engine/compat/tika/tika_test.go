@@ -142,3 +142,101 @@ func TestTika_ContractTests(t *testing.T) {
 	a := newTikaAdapter(t, srv.URL)
 	enginetest.RunContractTests(t, a)
 }
+
+// newTikaAdapterWithCfg builds an adapter with explicit auth knobs;
+// the package-level helper bakes "X-Api-Key/raw" defaults and we
+// need to vary scheme/key for the auth-forwarding suite below.
+func newTikaAdapterWithCfg(t *testing.T, base, key, header, scheme string) *tika.Adapter {
+	t.Helper()
+	cfg := config.EngineConfig{
+		Enable:         true,
+		CompatType:     config.CompatTika,
+		URL:            base,
+		APIKey:         config.Secret(key),
+		AuthHeader:     header,
+		AuthScheme:     config.AuthScheme(scheme),
+		RequestTimeout: 5 * time.Second,
+	}
+	c, err := httpclient.New(cfg)
+	require.NoError(t, err)
+	a, err := tika.New("legacy-tika", cfg, c, nil)
+	require.NoError(t, err)
+	return a
+}
+
+// TestTika_Convert_StampsRawAPIKey covers the common case: raw scheme
+// puts the literal key on the configured header.
+func TestTika_Convert_StampsRawAPIKey(t *testing.T) {
+	t.Parallel()
+	var seenAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"X-TIKA:content":"hi"}`))
+	}))
+	defer srv.Close()
+
+	a := newTikaAdapterWithCfg(t, srv.URL, "tika-token", "X-Api-Key", "raw")
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade: engine.FacadeDocling,
+		Files: []engine.FileBlob{{
+			Filename: "x.txt", ContentType: "text/plain", Body: strings.NewReader("hi"),
+		}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, "tika-token", seenAuth)
+}
+
+// TestTika_Convert_BearerSchemePrependsBearer ensures Tika's inlined
+// auth logic stays in sync with the docling/external siblings — this
+// is a duplicated code path (not a call to ApplyAuth), so a regression
+// here is plausible without this test.
+func TestTika_Convert_BearerSchemePrependsBearer(t *testing.T) {
+	t.Parallel()
+	var seenAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"X-TIKA:content":"hi"}`))
+	}))
+	defer srv.Close()
+
+	a := newTikaAdapterWithCfg(t, srv.URL, "tika-token", "Authorization", "bearer")
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade: engine.FacadeDocling,
+		Files: []engine.FileBlob{{
+			Filename: "x.txt", ContentType: "text/plain", Body: strings.NewReader("hi"),
+		}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, "Bearer tika-token", seenAuth)
+}
+
+// TestTika_Convert_NoAPIKeyDoesNotStamp pins that an unresolved
+// api_key_env doesn't leak as an empty header value.
+func TestTika_Convert_NoAPIKeyDoesNotStamp(t *testing.T) {
+	t.Parallel()
+	var sawAuth bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, sawAuth = r.Header["X-Api-Key"]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"X-TIKA:content":"hi"}`))
+	}))
+	defer srv.Close()
+
+	a := newTikaAdapterWithCfg(t, srv.URL, "", "X-Api-Key", "raw")
+
+	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
+		Facade: engine.FacadeDocling,
+		Files: []engine.FileBlob{{
+			Filename: "x.txt", ContentType: "text/plain", Body: strings.NewReader("hi"),
+		}},
+	})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.False(t, sawAuth, "X-Api-Key must not be sent when APIKey is empty")
+}

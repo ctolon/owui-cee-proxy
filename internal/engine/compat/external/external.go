@@ -18,12 +18,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"github.com/ctolon/owui-cee-proxy/internal/breaker"
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/authutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
 	"github.com/ctolon/owui-cee-proxy/internal/httpclient"
+	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
 const defaultProcessPath = "/process"
@@ -43,6 +46,8 @@ func New(name engine.Name, cfg config.EngineConfig, client *httpclient.Client, b
 }
 
 func (a *Adapter) Name() engine.Name { return a.name }
+
+func (a *Adapter) URL() string { return a.cfg.URL }
 
 func (a *Adapter) Capabilities() engine.EngineCapabilities {
 	return engine.EngineCapabilities{
@@ -112,7 +117,7 @@ func (a *Adapter) callOnce(ctx context.Context, req *engine.ConvertRequest, f en
 		hreq.Header.Set("Content-Type", f.ContentType)
 	}
 	hreq.Header.Set("X-Filename", url.PathEscape(SafeFilename(f.Filename)))
-	ApplyAuth(hreq.Header, a.cfg)
+	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	if req.RequestID != "" {
 		hreq.Header.Set("X-Request-ID", req.RequestID)
 	}
@@ -160,15 +165,22 @@ func (a *Adapter) do(hreq *http.Request) (*engine.ConvertResponse, error) {
 	exec := func() (any, error) { return a.client.HTTP.Do(hreq) }
 	var raw any
 	var err error
+	mw.StartUpstream(hreq.Context())
 	if a.breaker != nil {
 		raw, err = a.breaker.Execute(exec)
 	} else {
 		raw, err = exec()
 	}
 	if err != nil {
+		mw.EndUpstream(hreq.Context(), 0)
 		return nil, err
 	}
-	resp := raw.(*http.Response)
+	resp, ok := raw.(*http.Response)
+	if !ok || resp == nil {
+		mw.EndUpstream(hreq.Context(), 0)
+		return nil, fmt.Errorf("external: breaker returned unexpected %T (want *http.Response)", raw)
+	}
+	mw.EndUpstream(hreq.Context(), resp.StatusCode)
 	return &engine.ConvertResponse{
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header.Clone(),
@@ -176,49 +188,22 @@ func (a *Adapter) do(hreq *http.Request) (*engine.ConvertResponse, error) {
 	}, nil
 }
 
-// ApplyAuth stamps the auth header per the engine config.
+// ApplyAuth is a thin shim around authutil.Apply for callers that
+// don't have an engine name or AuthMetrics handle. Production call
+// sites should prefer authutil.Apply directly so the outcome metric
+// is recorded.
 func ApplyAuth(h http.Header, cfg config.EngineConfig) {
-	if cfg.APIKey == "" || cfg.AuthHeader == "" {
-		return
-	}
-	value := string(cfg.APIKey)
-	if cfg.AuthScheme == "bearer" {
-		value = "Bearer " + value
-	}
-	h.Set(cfg.AuthHeader, value)
+	authutil.Apply(h, "", cfg, authutil.Nop{})
 }
 
-// SafeFilename strips control bytes and any byte outside printable
-// ASCII from a filename. Returns "" for empty / dangerous input.
-func SafeFilename(name string) string {
-	for i := 0; i < len(name); i++ {
-		b := name[i]
-		if b < 0x20 || b > 0x7E {
-			return ""
-		}
-	}
-	return name
-}
-
-// JoinURL composes a URL by appending p to base ensuring exactly one
-// slash between them.
-func JoinURL(base, p string) (string, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("invalid url: %w", err)
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	u.Path = strings.TrimRight(u.Path, "/") + p
-	return u.String(), nil
-}
+// SafeFilename and JoinURL forward to internal/engine/compatutil so the
+// implementation lives in exactly one place. Kept exported because
+// external_test.go and the doclingexternal composite reference them.
+func SafeFilename(name string) string         { return compatutil.SafeFilename(name) }
+func JoinURL(base, p string) (string, error)  { return compatutil.JoinURL(base, p) }
 
 func jsonError(status int, msg string) *engine.ConvertResponse {
-	body, _ := json.Marshal(map[string]any{
-		"page_content": "",
-		"metadata":     map[string]any{"error": msg},
-	})
+	body := mustMarshalJSON(respond.NewExternalError(msg))
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	return &engine.ConvertResponse{
@@ -226,4 +211,15 @@ func jsonError(status int, msg string) *engine.ConvertResponse {
 		Headers:    h,
 		Body:       io.NopCloser(bytes.NewReader(body)),
 	}
+}
+
+// mustMarshalJSON panics on encoding errors for known-shape inputs.
+// Marshaling typed structs from internal/engine/respond cannot fail
+// at runtime; the panic guards against a future contract change.
+func mustMarshalJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("external: encoder marshal of fixed shape failed: %v", err))
+	}
+	return b
 }
