@@ -40,6 +40,13 @@ type RouterDeps struct {
 	// extension→MIME map; Convert, External, and Async share the
 	// same instance so MIME resolution is identical across facades.
 	MimeResolver *mimedetect.Resolver
+	// EngineTransports is the per-engine raw *http.Transport map
+	// keyed on engine name (the YAML map key). The passthrough mount
+	// reaches into this map to reuse the engine's tuned connection
+	// pool / TLS config; falling back to nil → http.DefaultTransport
+	// would share the pool across every engine, violating the
+	// per-engine isolation invariant (C-25 from REVIEW-FAANG.md).
+	EngineTransports map[string]*http.Transport
 }
 
 func NewRouter(d RouterDeps) (http.Handler, error) {
@@ -204,7 +211,19 @@ func buildRedactHeaderList(cfg *config.Config) []string {
 
 func mountEnginePassthrough(r chi.Router, d RouterDeps, name string, ec config.EngineConfig) error {
 	prefix := "/" + name
-	rp, err := reverseproxy.New(ec.URL, prefix, authutil.FormatHeaderValuesMulti(ec), nil, d.Config.Security.TrustedProxies)
+	// Reuse the engine's per-instance *http.Transport (built by
+	// httpclient.New from ec.HTTP — connection pool, TLS, dial
+	// timeouts). Without this, reverseproxy.New(... nil ...) falls
+	// back to http.DefaultTransport which shares its connection pool
+	// across every engine, defeating the per-engine isolation
+	// invariant. (C-25 from REVIEW-FAANG.md.)
+	var tr http.RoundTripper
+	if d.EngineTransports != nil {
+		if t := d.EngineTransports[name]; t != nil {
+			tr = t
+		}
+	}
+	rp, err := reverseproxy.New(ec.URL, prefix, authutil.FormatHeaderValuesMulti(ec), tr, d.Config.Security.TrustedProxies)
 	if err != nil {
 		return err
 	}

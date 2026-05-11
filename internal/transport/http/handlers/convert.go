@@ -289,7 +289,7 @@ func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, fun
 			// be noise. The middleware reads this back via
 			// mw.MIMESourceFrom on the access-log emission path.
 			if len(req.Files) == 1 {
-				mw.WithMimeSource(r.Context(), string(resolved.Source), declaredCT)
+				mw.RecordMimeSource(r.Context(), string(resolved.Source), declaredCT)
 			}
 			continue
 		}
