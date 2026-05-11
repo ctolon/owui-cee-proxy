@@ -92,7 +92,7 @@ jobs:
 
       - id: semver
         name: Compute next semver from squash-merge title
-        uses: mathieudutour/github-tag-action@v6.2
+        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           # Drive the bump from the squash-merge commit's TITLE
@@ -153,12 +153,18 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build + push multi-arch image
+        id: docker_build
         if: steps.semver.outputs.new_tag != ''
         env:
           VERSION: ${{ steps.semver.outputs.new_tag }}
         run: |
           set -euo pipefail
           V="${VERSION#v}"
+          # iidfile lets the next steps reference the exact image
+          # digest the buildx step pushed, so cosign/sbom attach
+          # against the bytes that landed in the registry (not a
+          # name + tag the registry could later remap).
+          IIDFILE="$(mktemp)"
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             --build-arg VERSION="$V" \
@@ -169,8 +175,68 @@ jobs:
             -t "${{ env.IMAGE_GHCR }}:${V}" \
             -t "${{ env.IMAGE_GHCR }}:latest" \
             -f deployments/docker/Dockerfile \
+            --metadata-file "${IIDFILE}.meta" \
             --push \
             .
+          # The metadata file carries containerimage.digest =
+          # sha256:.... — the canonical immutable reference for
+          # both registries (buildx pushes the same manifest to
+          # both, so one digest suffices).
+          DIGEST="$(jq -r '."containerimage.digest"' "${IIDFILE}.meta")"
+          echo "digest=${DIGEST}" >>"$GITHUB_OUTPUT"
+          echo "ghcr_ref=${{ env.IMAGE_GHCR }}@${DIGEST}" >>"$GITHUB_OUTPUT"
+          echo "docker_ref=${{ env.IMAGE_DOCKERHUB }}@${DIGEST}" >>"$GITHUB_OUTPUT"
+
+      # Keyless cosign signing against the exact pushed digest.
+      # OIDC token requested via `id-token: write` (already in the
+      # job's `permissions:` block) is exchanged for a short-lived
+      # Sigstore Fulcio cert. The signature lands in Rekor — anyone
+      # verifying the image can chain it back to this repo +
+      # workflow + commit SHA.
+      - name: Install cosign
+        if: steps.semver.outputs.new_tag != ''
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign container image (keyless)
+        if: steps.semver.outputs.new_tag != ''
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          # Sign on both registries — same digest, two refs, one
+          # certificate. Operators can `cosign verify` against
+          # either ref.
+          cosign sign --yes "${{ steps.docker_build.outputs.ghcr_ref }}"
+          cosign sign --yes "${{ steps.docker_build.outputs.docker_ref }}"
+
+      # CycloneDX SBOM produced via Anchore syft, then attested via
+      # cosign so the SBOM travels with the image as a signed
+      # attestation. Operators / SCA tools fetch via
+      #   cosign download attestation --predicate-type=cyclonedx ...
+      # and verify the same Fulcio cert chain.
+      - name: Generate CycloneDX SBOM
+        if: steps.semver.outputs.new_tag != ''
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.docker_build.outputs.ghcr_ref }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+
+      - name: Attest SBOM
+        if: steps.semver.outputs.new_tag != ''
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            "${{ steps.docker_build.outputs.ghcr_ref }}"
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            "${{ steps.docker_build.outputs.docker_ref }}"
 
       - uses: azure/setup-helm@v4
         if: steps.semver.outputs.new_tag != ''
@@ -195,7 +261,7 @@ jobs:
 
       - name: Generate CHANGELOG.md (git-cliff)
         if: steps.semver.outputs.new_tag != ''
-        uses: orhun/git-cliff-action@v4
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
         with:
           config: cliff.toml
           args: --tag ${{ steps.semver.outputs.new_tag }}
@@ -222,7 +288,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.semver.outputs.new_tag != ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.semver.outputs.new_tag }}
           name: ${{ steps.semver.outputs.new_tag }} — ${{ steps.pr.outputs.title }}

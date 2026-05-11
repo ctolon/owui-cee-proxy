@@ -70,12 +70,18 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-2 | Reliability | `validateTimeoutHierarchy` runs at config Load and rejects inverted timeout knobs (`max(engines.*.request_timeout) > server.request_timeout`, or `server.request_timeout + 2s > server.write_timeout`). The chi `mw.Timeout` cancel was tripping breakers on healthy-but-slow backends; the validator surfaces the misconfig at bootstrap with a precise diff. `Default()` `WriteTimeout` bumped to `5m30s` to honour the new 2 s slack. |
 | C-9 | API | Every `http.Error` call in `external.go` and the async `Poll`/`Result` paths is gone — replaced with `writeJSON(w, status, respond.NewExternalError(...))` (external facade) or `respond.NewDoclingError(...)` (docling facade async). Schema-strict OpenWebUI loaders now see one shape per facade across every status code. `TestExternal_ErrorEnvelope_MissingContentType` pins it. |
 
+### Closed in `feat/supply-chain-hardening`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-7 | DevOps | Every third-party action across `ci.yaml`, `pr-checks.yaml`, `release.yaml`, `security.yaml` is now pinned to an immutable commit SHA (tag retained as a `# vX` comment for readability). `@master` is gone (trivy-action, gosec, checkov); semver-tag floats are also pinned (mathieudutour/github-tag-action, softprops/action-gh-release, amannn/action-semantic-pull-request, orhun/git-cliff-action, golangci/golangci-lint-action, erzz/dockle-action). Renovate now bumps each line atomically. |
+| C-8 | DevOps | `release.yaml` gained three steps after the buildx push: (1) `sigstore/cosign-installer` v4.1.2, (2) `cosign sign --yes` against the exact pushed digest on BOTH GHCR and Docker Hub refs (keyless OIDC via the already-granted `id-token: write`), (3) `anchore/sbom-action` v0.24.0 produces a CycloneDX SBOM that `cosign attest` pins to the digest as a typed predicate. Operators verify with `cosign verify` + `cosign download attestation --predicate-type=cyclonedx`. The buildx step now writes a metadata file so the digest is canonical and immutable (no tag re-resolution race). |
+| C-21 | DX | `cmd/proxy/main.go` gained `-validate` flag: loads + validates the config and exits 0 (safe to roll) / 2 (stop the rollout) without binding ports. Designed for Helm pre-upgrade hooks; smoke-tested locally against `configs/config.minimal.yaml`. The DX review's earlier "tasks.enabled=true in example.yaml without REDIS_URL" anti-example surfaces immediately with the new flag — operator-visible regression test. |
+
 ### P0 (carry-over)
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|
-| C-7 | DevOps | CI workflow pins four security-critical actions to `@master` (`trivy-action`, `gosec`, `checkov`). Supply-chain compromise lands in release pipeline. | Pin every third-party action to immutable commit SHA; Renovate manages bumps. |
-| C-8 | DevOps | Release pipeline pushes `${VERSION}` and `:latest` to two registries with **no cosign signing, no SBOM attestation, no SLSA provenance**. | Wire `sigstore/cosign-installer` + `cosign sign --yes` keyless OIDC; push CycloneDX SBOM as cosign attestation. |
 | C-10 | Helm | `templates/networkpolicy.yaml` produces a full-deny ingress block when `ingressFrom: []` (the default). NetworkPolicy enabled → pod CrashLoopBackOff. | Always emit an allow rule for the kubelet probe port. |
 | C-11 | Helm | `templates/deployment.yaml` `preStop` uses `/bin/sh` which doesn't exist in distroless static — exec fails, in-flight requests get reset during rolling updates. | Replace with `httpGet` preStop or remove and rely on graceful drain. |
 
