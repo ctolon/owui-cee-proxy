@@ -159,3 +159,61 @@ func TestReadiness_FailureSurfacesAcrossOtherProbes(t *testing.T) {
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
+
+// TestReadiness_TieredKeepsPodReadyWhenOnlyNonRequiredFails pins
+// C-22: when Health.Required is populated, a non-required engine's
+// failure surfaces as `degraded` in the body but does NOT flip the
+// overall response to 503. Operators stay in rotation despite the
+// flaky non-default engine.
+func TestReadiness_TieredKeepsPodReadyWhenOnlyNonRequiredFails(t *testing.T) {
+	t.Parallel()
+	reg := &healthStubRegistry{
+		engines: map[engine.Name]engine.Engine{
+			"primary":   &healthStubEngine{name: "primary"},
+			"secondary": &healthStubEngine{name: "secondary", err: errors.New("flaky upstream")},
+		},
+		order: []engine.Name{"primary", "secondary"},
+	}
+	h := &Health{
+		Registry: reg,
+		Required: map[string]struct{}{"primary": {}},
+	}
+
+	rec := httptest.NewRecorder()
+	h.Readiness(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code,
+		"non-required engine failure MUST NOT flip the pod to 503")
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, "ready", body["status"])
+	engines, _ := body["engines"].(map[string]any)
+	require.Equal(t, "ok", engines["primary"])
+	require.Equal(t, "unhealthy", engines["secondary"])
+	require.Contains(t, body, "degraded")
+	require.ElementsMatch(t, []any{"secondary"}, body["degraded"])
+}
+
+// TestReadiness_TieredFailsWhenRequiredEngineFails — the inverse: a
+// REQUIRED engine going down MUST flip the pod 503 even when every
+// other probe is fine.
+func TestReadiness_TieredFailsWhenRequiredEngineFails(t *testing.T) {
+	t.Parallel()
+	reg := &healthStubRegistry{
+		engines: map[engine.Name]engine.Engine{
+			"primary":   &healthStubEngine{name: "primary", err: errors.New("down")},
+			"secondary": &healthStubEngine{name: "secondary"},
+		},
+		order: []engine.Name{"primary", "secondary"},
+	}
+	h := &Health{
+		Registry: reg,
+		Required: map[string]struct{}{"primary": {}},
+	}
+
+	rec := httptest.NewRecorder()
+	h.Readiness(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}

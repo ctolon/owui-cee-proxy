@@ -16,6 +16,7 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/propagation"
+	"golang.org/x/time/rate"
 
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/authutil"
@@ -146,8 +147,26 @@ func New(cfg config.EngineConfig) (*Client, error) {
 	// observability disabled). production tracing.go ALSO sets the
 	// global to the same composite; tests need not.
 	// (C-19, P1 observability review.)
+	var underlying http.RoundTripper = transport
+	// Per-engine rate limit (C-24). The YAML `engines.<n>.rate_limit`
+	// knob now drives a token-bucket limiter that gates every
+	// outbound request. RPS == 0 disables — operators who never
+	// configured rate_limit (or set both fields to 0) see no
+	// behaviour change. Sits BELOW the otelhttp + Instrumented
+	// wraps so the limiter's wait time is captured in the trace
+	// span and the metric duration.
+	if cfg.RateLimit.RPS > 0 {
+		burst := cfg.RateLimit.Burst
+		if burst <= 0 {
+			burst = 1
+		}
+		underlying = &RateLimitedTransport{
+			Limiter: rate.NewLimiter(rate.Limit(cfg.RateLimit.RPS), burst),
+			Next:    underlying,
+		}
+	}
 	rt := otelhttp.NewTransport(
-		transport,
+		underlying,
 		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator(
 			propagation.TraceContext{}, propagation.Baggage{},
 		)),

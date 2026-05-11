@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -46,7 +47,7 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 
 	metrics := observability.NewMetrics()
 
-	registry, err := buildRegistry(cfg, logger, metrics)
+	registry, engineTransports, err := buildRegistry(cfg, logger, metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +71,9 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 			&taskLifecycleAdapter{m: metrics},
 			&queueDepthAdapter{m: metrics},
 		)
+		// HMAC pepper (C-28). Empty when unconfigured → orchestrator
+		// keeps the legacy plain-SHA-256 fingerprint path.
+		orch.WithFingerprintPepper([]byte(cfg.Security.ProxyAPIKeyFingerprintPepper))
 		redisHealth = orch.HealthCheck()
 		worker, err = tasks.NewWorker(cfg.Tasks, orch, registry, logger)
 		if err != nil {
@@ -90,15 +94,16 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 	logRoutingBootstrap(logger, cfg, registry, len(cfg.Mimedetect.ExtensionOverrides))
 
 	handler, err := httptransport.NewRouter(httptransport.RouterDeps{
-		Config:        cfg,
-		Logger:        logger,
-		Metrics:       metrics,
-		Registry:      registry,
-		Orchestrator:  orch,
-		RedisHealth:   redisHealth,
-		SSRFResolver:  resolver,
-		HealthMetrics: &healthMetricsAdapter{m: metrics},
-		MimeResolver:  mimeResolver,
+		Config:           cfg,
+		Logger:           logger,
+		Metrics:          metrics,
+		Registry:         registry,
+		Orchestrator:     orch,
+		RedisHealth:      redisHealth,
+		SSRFResolver:     resolver,
+		HealthMetrics:    &healthMetricsAdapter{m: metrics},
+		MimeResolver:     mimeResolver,
+		EngineTransports: engineTransports,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("router: %w", err)
@@ -131,17 +136,23 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 //
 // Tests bypass app.go and construct adapters directly, so the
 // metric/log seams degrade to Nop when not wired (see httpclient.Client.Auth).
-func buildRegistry(cfg *config.Config, logger zerolog.Logger, metrics *observability.Metrics) (engine.Registry, error) {
+func buildRegistry(cfg *config.Config, logger zerolog.Logger, metrics *observability.Metrics) (engine.Registry, map[string]*http.Transport, error) {
 	authM := &authMetricsAdapter{m: metrics}
 	upstreamM := &upstreamStatusAdapter{m: metrics}
 	entries := map[engine.Name]engine.RegistryEntry{}
+	// transports collects the per-engine raw *http.Transport so the
+	// passthrough mount can reuse it instead of falling back to
+	// http.DefaultTransport (which would share its connection pool
+	// across every engine, violating CLAUDE.md's per-engine
+	// isolation invariant — C-25).
+	transports := make(map[string]*http.Transport, len(cfg.Engines))
 	for name, ec := range cfg.Engines {
 		if !ec.Enable {
 			continue
 		}
 		client, err := httpclient.New(ec)
 		if err != nil {
-			return nil, fmt.Errorf("engine %s: httpclient: %w", name, err)
+			return nil, nil, fmt.Errorf("engine %s: httpclient: %w", name, err)
 		}
 		client.
 			WithAuthMetrics(authM).
@@ -156,18 +167,23 @@ func buildRegistry(cfg *config.Config, logger zerolog.Logger, metrics *observabi
 		br := breaker.New(name, ec.Breaker, breakerStateHook(logger, metrics))
 		ad, err := newAdapterByCompat(engine.Name(name), ec, client, br)
 		if err != nil {
-			return nil, fmt.Errorf("engine %s: %w", name, err)
+			return nil, nil, fmt.Errorf("engine %s: %w", name, err)
 		}
 		entries[engine.Name(name)] = engine.RegistryEntry{
 			Engine:     ad,
 			MimeTypes:  ec.MimeTypes,
 			Extensions: ec.Extensions,
 		}
+		transports[name] = client.InnerTransport()
 	}
 	if len(entries) == 0 {
-		return nil, errors.New("no engines enabled")
+		return nil, nil, errors.New("no engines enabled")
 	}
-	return engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultEngine), cfg.Routing.Strategy)
+	reg, err := engine.NewRegistry(entries, engine.Name(cfg.Routing.DefaultEngine), cfg.Routing.Strategy)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reg, transports, nil
 }
 
 // logEngineBootstrap emits one info line per enabled engine + one warn

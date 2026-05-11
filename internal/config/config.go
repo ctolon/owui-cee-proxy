@@ -77,6 +77,33 @@ const (
 	CompatTika            CompatType = "tika"
 )
 
+// compatTypes is THE registered set of compat_type values the proxy
+// recognises. The custom validator (registered in Validate) reads
+// off this slice, the bootstrap log enumerates it, and
+// acceptedFacades's switch is structurally coupled to it. Adding a
+// new compat_type is now THREE single-line edits: one const above,
+// one entry here, one acceptedFacades arm — the validator tag no
+// longer needs hand-syncing.
+//
+// (C-26 from REVIEW-FAANG.md: previously the validator tag carried a
+// duplicate `oneof=docling external docling-external tika` literal
+// that drifted from the Compat* consts on every new compat type.)
+var compatTypes = []CompatType{
+	CompatDocling,
+	CompatExternal,
+	CompatDoclingExternal,
+	CompatTika,
+}
+
+// CompatTypes returns a defensive copy of the registered compat_type
+// set. Adapter packages and enginetest contracts consult this to
+// stay in lockstep with the validator's allowed list.
+func CompatTypes() []CompatType {
+	out := make([]CompatType, len(compatTypes))
+	copy(out, compatTypes)
+	return out
+}
+
 // AuthScheme controls how an API key is rendered on outbound
 // requests. Typed for the same reason as CompatType — switch arms
 // against a misspelled scheme literal would otherwise silently
@@ -163,6 +190,31 @@ type RoutingConfig struct {
 	Strategy    RoutingStrategy   `koanf:"strategy" validate:"omitempty,oneof=mime extension mime_then_extension extension_then_mime"`
 	Facade      FacadeConfig      `koanf:"facade"`
 	Passthrough PassthroughConfig `koanf:"passthrough"`
+	// Fallback enables the engine-fallback chain (C-31). When ON,
+	// a 5xx / breaker-open from the primary engine pick triggers
+	// dispatch to the next candidate in the registry's order list
+	// for the same facade. Default OFF — the legacy "first match
+	// wins, errors propagate" behaviour. Bounded by MaxAttempts;
+	// each attempt counts the engine's name in a
+	// `fallback_attempts` field on the access log.
+	Fallback FallbackConfig `koanf:"fallback"`
+}
+
+// FallbackConfig drives the optional engine fallback chain. Activated
+// only when an engine returns a 5xx, signals breaker-open, or
+// reports a transport-level error. Non-engine-specific errors (400
+// from the proxy itself, multipart parse failure) NEVER trigger
+// fallback — those are caller-side problems, not engine flakes.
+type FallbackConfig struct {
+	// Enabled toggles the chain. Default false preserves the
+	// "errors propagate, no retry" semantics every existing
+	// deployment relies on.
+	Enabled bool `koanf:"enabled"`
+	// MaxAttempts caps the total attempt count (primary + fallbacks).
+	// 0 → 2 (primary + one fallback). Operators bump higher when
+	// they have many sibling engines and a true high-availability
+	// requirement.
+	MaxAttempts int `koanf:"max_attempts"`
 }
 
 // MimedetectConfig configures the MIME resolution layer.
@@ -211,7 +263,12 @@ type PassthroughConfig struct {
 type EngineConfig struct {
 	Enable bool `koanf:"enable"`
 	// CompatType selects the adapter wire-protocol family.
-	CompatType CompatType `koanf:"compat_type" validate:"required_if=Enable true,omitempty,oneof=docling external docling-external tika"`
+	// CompatType selects the adapter wire-protocol family.
+	// `compat_type_valid` is the custom validator (registered in
+	// Validate) that consults the compatTypes slice — keeps the
+	// allowed-list in lockstep with the Compat* consts without a
+	// hand-maintained tag literal.
+	CompatType CompatType `koanf:"compat_type" validate:"required_if=Enable true,omitempty,compat_type_valid"`
 	URL        string     `koanf:"url" validate:"required_if=Enable true,omitempty,url"`
 	APIKeyEnv  string     `koanf:"api_key_env"`
 	APIKey     Secret     `koanf:"-"`
@@ -337,13 +394,23 @@ type RateLimitConfig struct {
 }
 
 type SecurityConfig struct {
-	ProxyAPIKeysEnv   string     `koanf:"proxy_api_keys_env"`
-	ProxyAPIKeyHeader string     `koanf:"proxy_api_key_header"`
-	ProxyAPIKeys      []Secret   `koanf:"-"`
-	RequireAPIKey     bool       `koanf:"require_api_key"`
-	TrustedProxies    []string   `koanf:"trusted_proxies"`
-	CORS              CORSConfig `koanf:"cors"`
-	SSRF              SSRFConfig `koanf:"ssrf"`
+	ProxyAPIKeysEnv   string   `koanf:"proxy_api_keys_env"`
+	ProxyAPIKeyHeader string   `koanf:"proxy_api_key_header"`
+	ProxyAPIKeys      []Secret `koanf:"-"`
+	RequireAPIKey     bool     `koanf:"require_api_key"`
+	// ProxyAPIKeyFingerprintPepperEnv names the env var holding a
+	// per-process secret HMAC'd into caller-API-key fingerprints
+	// stored in Redis. With this set, an attacker who exfils Redis
+	// cannot recover the API keys via offline rainbow tables
+	// against the fingerprint — they would need to ALSO steal the
+	// pepper from the proxy process. Empty value (the legacy
+	// default) falls back to plain SHA-256 fingerprints, which
+	// keeps existing deployments working. (C-28 from REVIEW-FAANG.md.)
+	ProxyAPIKeyFingerprintPepperEnv string     `koanf:"proxy_api_key_fingerprint_pepper_env"`
+	ProxyAPIKeyFingerprintPepper    Secret     `koanf:"-"`
+	TrustedProxies                  []string   `koanf:"trusted_proxies"`
+	CORS                            CORSConfig `koanf:"cors"`
+	SSRF                            SSRFConfig `koanf:"ssrf"`
 }
 
 // SSRFConfig tunes the /v1/convert/source policy.
@@ -772,6 +839,9 @@ func resolveSecrets(c *Config) {
 	if c.Tasks.RedisURLEnv != "" {
 		c.Tasks.RedisURL = Secret(os.Getenv(c.Tasks.RedisURLEnv))
 	}
+	if c.Security.ProxyAPIKeyFingerprintPepperEnv != "" {
+		c.Security.ProxyAPIKeyFingerprintPepper = Secret(os.Getenv(c.Security.ProxyAPIKeyFingerprintPepperEnv))
+	}
 }
 
 func splitAndTrim(s string) []string {
@@ -789,6 +859,19 @@ func splitAndTrim(s string) []string {
 // Validate runs struct validation and cross-field rules.
 func Validate(c *Config) error {
 	v := validator.New(validator.WithRequiredStructEnabled())
+	// compat_type_valid: registered before v.Struct(c) so the
+	// EngineConfig.CompatType tag resolves at struct-validation
+	// time. The set of accepted values comes from compatTypes (the
+	// SoT for the validator) — no hand-maintained `oneof=` literal.
+	_ = v.RegisterValidation("compat_type_valid", func(fl validator.FieldLevel) bool {
+		val := CompatType(fl.Field().String())
+		for _, c := range compatTypes {
+			if val == c {
+				return true
+			}
+		}
+		return false
+	})
 	if err := v.Struct(c); err != nil {
 		return fmt.Errorf("config validation: %w", err)
 	}

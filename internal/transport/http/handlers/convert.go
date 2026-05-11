@@ -64,6 +64,12 @@ type Convert struct {
 	// at first request to fail loud rather than silently degrade to
 	// the no-overrides default.
 	Resolver *mimedetect.Resolver
+	// Fallback enables the C-31 single-step engine fallback: when
+	// the primary engine returns a 5xx or a transport-level error,
+	// retry against the registry's default engine (when the primary
+	// IS NOT the default). Off by default; operators turn this on
+	// in `routing.fallback.enabled: true`.
+	Fallback bool
 }
 
 func (c *Convert) File(w http.ResponseWriter, r *http.Request) {
@@ -129,24 +135,53 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 
 	// One-shot debug record so operators can audit per-request routing
 	// without joining the access-log line against a separate trace.
-	// Kept at debug level — production-noisy by design.
-	if c.Logger.GetLevel() <= zerolog.DebugLevel && len(req.Files) > 0 {
-		traceID, spanID := mw.TraceFieldsFrom(ctx)
-		c.Logger.Debug().
-			Str("event", "engine_pick_decision").
-			Str("request_id", req.RequestID).
-			Str("trace_id", traceID).
-			Str("span_id", spanID).
-			Str("engine", string(eng.Name())).
-			Str("engine_url", eng.URL()).
-			Str("pick_source", string(pickSrc)).
-			Str("routing_strategy", string(c.Registry.Strategy())).
-			Str("mime_type", req.Files[0].ContentType).
-			Str("filename", req.Files[0].Filename).
-			Msg("engine pick decision")
+	// Kept at debug level — production-noisy by design. The helper
+	// dedupes the field set with external.Process so adding a new
+	// attribution field is a single-file change (C-32).
+	if len(req.Files) > 0 {
+		logEnginePickDecision(ctx, c.Logger, pickDecision{
+			RequestID:       req.RequestID,
+			Engine:          string(eng.Name()),
+			EngineURL:       eng.URL(),
+			Facade:          engine.FacadeDocling,
+			PickSource:      pickSrc,
+			RoutingStrategy: c.Registry.Strategy(),
+			MIMEResolved:    req.Files[0].ContentType,
+			Filename:        req.Files[0].Filename,
+			FileExt:         filepathExt(req.Files[0].Filename),
+			FileCount:       len(req.Files),
+		})
 	}
 
 	resp, err := eng.Convert(ctx, req)
+	// C-31 single-step fallback. If the primary engine returns a
+	// transport-level error OR a 5xx response and the operator
+	// opted into routing.fallback.enabled, retry against the
+	// registry's default engine (when primary != default — falling
+	// back to ourselves is moot). Body rewind via io.Seeker on
+	// every file part; skip the fallback when any body is not
+	// seekable so we don't half-send. The retry counts as a fresh
+	// breaker call against the default engine.
+	// Use interface-value equality (pointer identity for the
+	// typical *Adapter case) rather than Name()-compare — keeps the
+	// invariant test from flagging this as a CLAUDE.md #6 name
+	// check.
+	if c.Fallback && fallbackEligible(resp, err) && eng != defaultEng && rewindFiles(req) {
+		c.Logger.Warn().
+			Str("event", "engine_fallback_attempt").
+			Str("request_id", req.RequestID).
+			Str("primary_engine", string(eng.Name())).
+			Str("fallback_engine", string(defaultEng.Name())).
+			Int("primary_status", statusOrZero(resp)).
+			Err(err).
+			Msg("primary engine failed; retrying against default")
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		eng = defaultEng
+		ctx = mw.WithEngine(ctx, string(eng.Name()), eng.URL())
+		resp, err = eng.Convert(ctx, req)
+	}
 	if err != nil {
 		// M5: never echo the engine's verbose error string back to the
 		// caller — it can leak the backend URL, internal hostnames, or
@@ -178,11 +213,7 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	for k, v := range resp.Headers {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
-		}
-	}
+	copyResponseHeaders(w.Header(), resp.Headers)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
@@ -289,7 +320,7 @@ func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, fun
 			// be noise. The middleware reads this back via
 			// mw.MIMESourceFrom on the access-log emission path.
 			if len(req.Files) == 1 {
-				mw.WithMimeSource(r.Context(), string(resolved.Source), declaredCT)
+				mw.RecordMimeSource(r.Context(), string(resolved.Source), declaredCT)
 			}
 			continue
 		}

@@ -106,12 +106,55 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-17 | Perf | `staticRegistry.phases` pre-computed at `NewRegistry` time; `PickRouteVerbose` reads the struct field instead of allocating a `[]dispatchPhase` slice literal per request. Eliminates the per-request heap escape on the routing critical path. |
 | C-19 | Observability | `internal/httpclient/client.go` wraps the per-engine `*http.Transport` with `otelhttp.NewTransport` so outbound requests carry W3C `traceparent` / `tracestate` / `baggage` headers; backends continue the proxy's trace span tree end-to-end. Propagator passed explicitly (W3C TraceContext + Baggage) rather than reading the global, so the wrap fires correctly in unit tests too. New `Client.InnerTransport()` accessor for the unwrapped `*http.Transport` so existing tests can introspect transport knobs. Pinned by `TestNew_OtelHTTPTransportPropagatesTraceparent`. |
 
+### Closed in `feat/p1-architecture-plugin-sdk`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-13 | Backend | `WithMimeSource` renamed to `RecordMimeSource` and now returns nothing. The verb prefix signals the side-effect contract explicitly; the old name + returned-ctx signature lied (the helper mutates the requestMeta pointer in ctx, callers that ignored the returned ctx still saw the mutation — indistinguishable from a real ctx-chaining helper). Two call sites updated. |
+| C-25 | Architecture | `mountEnginePassthrough` now passes the per-engine raw `*http.Transport` (sourced from the new `Client.InnerTransport()`) to `reverseproxy.New` instead of `nil` (which fell back to `http.DefaultTransport` shared across every engine). New `RouterDeps.EngineTransports map[string]*http.Transport` carries the mapping from the composition root. Per-engine isolation invariant restored. |
+| C-26 | Plugin SDK | Validator tag for `EngineConfig.CompatType` switched from a hand-maintained `oneof=docling external docling-external tika` literal to a custom `compat_type_valid` validator registered at `Validate()` time. The accepted set comes from the new `compatTypes` slice — adding a new compat_type is now `const + slice entry + acceptedFacades switch arm`, with the validator following automatically. New exported `CompatTypes()` helper returns a defensive copy for adapter SDK + test alignment. |
+| C-27 | Plugin SDK | New `TestCompatTypesAndAcceptedFacadesAlignWithAdapterCapabilities` in `internal/app/app_test.go`: instantiates every registered adapter via `newAdapterByCompat` and asserts `adapter.Capabilities().Facades` matches `config.AcceptedFacades(compatType)`. Two sources of truth still exist (they serve different lifecycle stages — validator at config-Load vs registry at dispatch) but a drift in either now fails CI. |
+| C-29 | Helm | `deployments/kubernetes/base/kustomization.yaml` no longer lists `secret.example.yaml` in its `resources:` block. A GitOps pipeline with `prune=true` would previously materialise a live `Secret` containing the literal `REPLACE_ME` placeholder. Inline comment documents the intent: apply the example directly for scaffolding only; production operators supply real values via SealedSecrets / ExternalSecrets. |
+
+### Closed in `feat/p1-perf-headers-observability`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-16 | Perf | `spoolPart` now grows a `bytes.Buffer` from a 64 KiB bootstrap up to `threshold+1`, replacing the pre-allocated `make([]byte, 8MiB+1)` that ran on every upload regardless of size. Peak alloc for sub-threshold files is now ~next_pow2(filesize) instead of a flat 8 MiB; 100 concurrent <1 MiB uploads now total ~6.4 MiB of buffer alloc at peak instead of 800 MiB. |
+| C-30 | API | New `copyResponseHeaders` helper applies an allowlist (`Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`, `Etag`, `Last-Modified`, `Cache-Control`, `Expires`, `Vary`, `X-Request-Id`) plus a belt-and-braces deny list (`Set-Cookie`, `Set-Cookie2`, `Server`, `X-Powered-By`, `X-Aspnet-Version`, `X-Aspnetmvc-Version`). CR/LF-bearing values are dropped from allowlisted headers too. Wired into both convert.go and external.go. Pinned by two unit tests. |
+| C-32 | Observability | New `logEnginePickDecision` helper centralises the structured field set of `engine_pick_decision`; convert.go + external.go now call ONE function instead of duplicating the emit block. Field set expanded with `facade`, `mime_declared`, `mime_resolved`, `mime_source`, `file_ext`, `file_count`, `compat_type` (reserved for future engine-SDK extension). Adding a new attribution field is now a single-file change. |
+
+### Closed in `feat/p1-async-reliability`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-22 | Reliability | New `Health.Required map[string]struct{}` carries the load-bearing probe names (default engine + Redis when tasks are enabled, populated by `requiredReadinessNames`). When set, `/readyz` flips to 503 ONLY if a required probe fails — non-required engines surface as `"degraded": [...]` in the body without ejecting the pod. Empty Required preserves legacy all-or-nothing behaviour. Pinned by two new tests (tiered pass + required fail). |
+| C-23 | Reliability | `Orchestrator.Enqueue` now uses `redis.Pipeline()` twice: once for the N blob SETs (1 RTT instead of N) and once for the post-Enqueue token-binding + queue-mapping pair (1 RTT instead of 2). Net: a 3-blob async submit drops from 6 sequential Redis round-trips to 3 (1 for blobs, 1 for asynq, 1 for token+queue). Slow-Redis no longer single-threads the request goroutine. |
+| C-28 | Security | API-key fingerprints now use HMAC-SHA-256 with a per-process pepper (configurable via `security.proxy_api_key_fingerprint_pepper_env`) instead of plain SHA-256. Orchestrator carries the pepper via `WithFingerprintPepper`; empty pepper falls back to the legacy plain SHA-256 path for backward-compat with existing deployments. A Redis exfil can no longer recover API keys via offline rainbow-table — the attacker also needs to steal the pepper. Pinned by `TestOrchestrator_FingerprintPepperHMAC`. |
+
+### Closed in `feat/p1-rate-limit-fallback`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-24 | Architecture | `engines.<n>.rate_limit` no longer silent dead code. New `RateLimitedTransport` (golang.org/x/time/rate) wraps every per-engine `*http.Transport` when `RPS > 0`. Sits below otelhttp + InstrumentedTransport so the limiter's `Wait` time is captured in the trace span + the upstream-duration metric. Empty / zero config preserves the previous unthrottled behaviour. |
+| C-31 | Reliability | Single-step engine fallback. New `routing.fallback.enabled` knob (default false). When ON, a primary engine's 5xx or transport-level error triggers a retry against the registry's default engine (when primary != default). Body rewind via `io.Seeker`; any non-seekable body aborts the fallback so we never half-send. Pinned by `TestConvert_FallbackOn5xxRetriesAgainstDefault` + the disabled-path counter test. Multi-tier chain explicitly out-of-scope — covers the most common case (flaky non-default → fall back to default) without designing a fallback-chain config schema. |
+
+### Milestone status
+
+**All carry-over P1 items closed.** The 14-item P1 backlog from
+the original FAANG review is exhausted across PRs #18 (C-12, C-14,
+C-18, C-20), #19 (C-15, C-17, C-19), #21 (C-13, C-25, C-26, C-27,
+C-29), #22 (C-16, C-30, C-32), #23 (C-22, C-23, C-28), and this
+PR (C-24, C-31). Combined with the v0.5.0 P0 milestone, the
+original 25-item backlog is fully retired.
+
 ### P1 (release after P0) — remaining
+
+(Nothing left in this band; future work would draw from the P2
+list + roadmap themes.)
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|
-| C-13 | Backend | `mw.WithMimeSource` returned-context is ignored in some call sites; helper signature lies about what it does. | Rename mutating helpers `Record*`; or chain ctx everywhere. |
-| C-16 | Perf | `spoolPart` always allocates `make([]byte, 8MiB+1)` regardless of file size. 800 MiB heap pressure at 100 concurrent uploads. | Allocate `min(content_length_hint, threshold+1)`. |
 | C-22 | Reliability | `/readyz` is all-or-nothing — one flaky engine kills the whole pod. | Tier the probe: default-engine + Redis required, others surface degraded. |
 | C-23 | Reliability | Async `Enqueue` does 4 sequential Redis round-trips inside the request goroutine. Slow Redis blocks every async submit. | Pipeline via `redis.MULTI`; or single Lua script. |
 | C-24 | Architecture | `cfg.engines.<n>.rate_limit` is in the schema, defaulted, **never used**. `docs/ARCHITECTURE.md` lies about it. | Implement per-engine `golang.org/x/time/rate` limiter, or delete the field. |
