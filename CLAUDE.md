@@ -40,11 +40,35 @@ The proxy exposes:
 5. **Operational endpoints**: `/healthz`, `/readyz`, `/metrics` (Prom),
    `/version`.
 
-Engine selection within a facade is **MIME-driven**: the first uploaded
-file's `Content-Type` is matched against each non-default enabled
-engine's `engines.<name>.mime_types` list (exact matches and
-`type/*` wildcards). The first match wins.
-`routing.default_engine` is the catch-all when no list matches.
+Engine selection within a facade is **strategy-driven**. The
+`routing.strategy` knob selects how the registry picks an engine from
+the first file's MIME + filename. Four values:
+
+| Strategy              | Match order                                |
+|-----------------------|--------------------------------------------|
+| `mime`                | MIME allowlist only                        |
+| `extension`           | filename-extension allowlist only          |
+| `mime_then_extension` | MIME first; extension fallback (DEFAULT)   |
+| `extension_then_mime` | extension first; MIME fallback             |
+
+Each non-default engine declares optional allowlists:
+
+- `engines.<name>.mime_types` — exact matches and `type/*` wildcards
+- `engines.<name>.extensions` — case-insensitive, leading dot
+  optional (`".pdf"` / `"pdf"` / `".PDF"` canonicalise to `.pdf`)
+
+The first match wins. `routing.default_engine` is the catch-all when
+no list matches. Empty `routing.strategy` resolves to
+`mime_then_extension`, so v0.4.x configs preserve their MIME-only
+behaviour without change.
+
+The proxy also runs a **MIME resolution stage** in front of dispatch.
+It sniffs magic bytes when the client's declared Content-Type is
+generic, and falls back to the filename extension for Compound File
+Binary containers (`.msg`, `.doc`, `.xls`, `.ppt` all share the
+`D0CF11E0` header that `mimetype.Detect` cannot disambiguate from
+sniffed bytes alone). The built-in 10-entry extension→MIME map is
+extensible via `mimedetect.extension_overrides` in YAML.
 
 ## Load-bearing invariants — DO NOT VIOLATE
 
@@ -98,6 +122,48 @@ make compose-up         # docker compose up -d (full local stack)
 make helm-lint          # helm lint + template
 make kustomize-build    # kustomize overlays build
 ```
+
+## Pre-commit invariants — DO NOT SKIP
+
+Before **every** `git add` / `git commit` (including amends, fixups,
+and squashes), run the local verification suite. Treat this as a
+hard gate — a clean diff is worthless if it doesn't compile, fails
+race-detected tests, or trips the linter.
+
+```sh
+go test -race -count=1 ./...                            # unit + race
+go vet -tags=integration ./test/integration/...         # integration vet (compile-only when Docker unavailable)
+golangci-lint run --timeout 5m                          # lint (style + bugs + sec)
+```
+
+Optional but recommended when changing deployment artefacts:
+`make helm-lint && make kustomize-build`.
+
+Rules:
+
+1. **No commit may land while any of the three checks above is red.**
+   Fixing CI after-the-fact is not an acceptable workflow — it
+   wastes a runner slot, confuses bisect, and pollutes the
+   `chore(release):`-driven changelog. Reproduce the failure locally
+   first.
+2. **Never bypass with `--no-verify` or `--no-gpg-sign`** unless the
+   user explicitly asked. A hook failure means a real check failed;
+   investigate and fix the underlying issue.
+3. **Don't amend a previous commit when a pre-commit hook fails.**
+   The commit didn't happen; `--amend` would rewrite the OLDER
+   commit. Re-stage and create a NEW commit.
+4. **When working on an in-flight branch, run the relevant subset
+   while iterating, then the full sweep before the final commit.**
+   Iteration: `go test -race ./internal/<package>/`. Final:
+   the three-command block above.
+5. **Capture the verification results in the commit message body**
+   when the change is substantial (multi-file feature, schema
+   migration, security-relevant fix). One line is enough:
+   `Verified: go test ./... race-clean, golangci-lint 0 issues,
+   integration vet clean.`
+
+These rules are load-bearing: future code that bypasses them often
+re-introduces the bug the rule was added to prevent.
 
 ## Layout map
 

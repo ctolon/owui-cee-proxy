@@ -12,6 +12,8 @@ import (
 
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/authutil"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/observability"
 	"github.com/ctolon/owui-cee-proxy/internal/tasks"
 	"github.com/ctolon/owui-cee-proxy/internal/transport/http/handlers"
@@ -34,6 +36,10 @@ type RouterDeps struct {
 	// HealthMetrics records per-engine readiness probe outcomes +
 	// durations. Nil disables metric recording (tests).
 	HealthMetrics handlers.HealthMetrics
+	// MimeResolver carries the merged built-in + operator-supplied
+	// extension→MIME map; Convert, External, and Async share the
+	// same instance so MIME resolution is identical across facades.
+	MimeResolver *mimedetect.Resolver
 }
 
 func NewRouter(d RouterDeps) (http.Handler, error) {
@@ -47,6 +53,15 @@ func NewRouter(d RouterDeps) (http.Handler, error) {
 	r.Use(mw.BodyLimit(d.Config.Server.MaxBodyBytes))
 	r.Use(mw.AccessLog(d.Logger, d.Config.Observability.Log.SilencePaths...))
 	r.Use(mw.Metrics(d.Metrics))
+	// Optional sensitive audit-capture; default OFF. When enabled,
+	// emits one `request_full_capture` debug record per request with
+	// headers (redacted) + body prefix (base64). See
+	// FullCaptureConfig for the redaction allowlist.
+	r.Use(mw.FullCapture(d.Logger, mw.FullCaptureConfig{
+		Enabled:            d.Config.Observability.Upstream.FullCapture,
+		BodyBytes:          d.Config.Observability.Upstream.FullCaptureBodyBytes,
+		RedactExtraHeaders: buildRedactHeaderList(d.Config),
+	}))
 
 	health := &handlers.Health{
 		Registry:            d.Registry,
@@ -117,6 +132,7 @@ func mountFacadeDocling(r chi.Router, d RouterDeps) {
 		Registry:    d.Registry,
 		Logger:      d.Logger,
 		UpstreamLog: resolveUpstreamLog(d.Config),
+		Resolver:    d.MimeResolver,
 	}
 	if d.SSRFResolver != nil {
 		convert.ResolveURL = d.SSRFResolver.Resolve
@@ -124,7 +140,19 @@ func mountFacadeDocling(r chi.Router, d RouterDeps) {
 	r.Post(facade+"/convert/file", convert.File)
 	r.Post(facade+"/convert/source", convert.Source)
 
-	async := &handlers.Async{Registry: d.Registry, Orchestrator: d.Orchestrator}
+	async := &handlers.Async{
+		Registry:     d.Registry,
+		Orchestrator: d.Orchestrator,
+		Resolver:     d.MimeResolver,
+		// APIKeyHeader is load-bearing: the orchestrator binds each
+		// task token to the caller's API-key fingerprint and refuses
+		// poll/result for any other caller. Without it set, the
+		// fingerprint is empty for every request, so the binding
+		// short-circuits and any holder of a task token can fetch any
+		// task's result. Set it at wire time from the same knob that
+		// drives the inbound APIKey middleware.
+		APIKeyHeader: d.Config.Security.ProxyAPIKeyHeader,
+	}
 	r.Post(facade+"/convert/file/async", async.SubmitFile)
 	r.Post(facade+"/convert/source/async", async.SubmitSource)
 	r.Get(facade+"/status/poll/{id}", async.Poll)
@@ -142,13 +170,41 @@ func mountFacadeExternal(r chi.Router, d RouterDeps) {
 		Logger:      d.Logger,
 		MaxBytes:    d.Config.Server.MaxBodyBytes,
 		UpstreamLog: resolveUpstreamLog(d.Config),
+		Resolver:    d.MimeResolver,
 	}
 	r.Put(processPath, ext.Process)
 }
 
+// buildRedactHeaderList collects every header name that should be
+// redacted in the full-capture log: the global proxy API-key header
+// plus every enabled engine's singular AuthHeader plus every
+// AuthHeaders entry. Operators add custom credential header names
+// here when they introduce a new compat_type that uses a non-default
+// stamping convention.
+func buildRedactHeaderList(cfg *config.Config) []string {
+	out := make([]string, 0, 1+len(cfg.Engines)*2)
+	if cfg.Security.ProxyAPIKeyHeader != "" {
+		out = append(out, cfg.Security.ProxyAPIKeyHeader)
+	}
+	for _, ec := range cfg.Engines {
+		if !ec.Enable {
+			continue
+		}
+		if ec.AuthHeader != "" {
+			out = append(out, ec.AuthHeader)
+		}
+		for _, ah := range ec.AuthHeaders {
+			if ah.Header != "" {
+				out = append(out, ah.Header)
+			}
+		}
+	}
+	return out
+}
+
 func mountEnginePassthrough(r chi.Router, d RouterDeps, name string, ec config.EngineConfig) error {
 	prefix := "/" + name
-	rp, err := reverseproxy.New(ec.URL, prefix, ec.AuthHeader, string(ec.APIKey), string(ec.AuthScheme), nil, d.Config.Security.TrustedProxies)
+	rp, err := reverseproxy.New(ec.URL, prefix, authutil.FormatHeaderValuesMulti(ec), nil, d.Config.Security.TrustedProxies)
 	if err != nil {
 		return err
 	}

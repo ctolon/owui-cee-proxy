@@ -33,7 +33,13 @@ import (
 //
 // An empty trustedProxies list means "trust nobody": all caller-set
 // forwarded-for headers are stripped. This is the safe default.
-func New(baseURL, prefix, apiKeyHeader, apiKey, authScheme string, transport http.RoundTripper, trustedProxies []string) (*httputil.ReverseProxy, error) {
+// authStamps is a header-name → wire-value map ALREADY in final form
+// (i.e., "Bearer " prefix applied where the scheme is bearer). Caller
+// builds the map via authutil.FormatHeaderValuesMulti(cfg) so the
+// passthrough mount and the facade adapters stamp byte-identical
+// values for the same engine config. Nil/empty map means the engine
+// is public — no auth stamps applied.
+func New(baseURL, prefix string, authStamps map[string]string, transport http.RoundTripper, trustedProxies []string) (*httputil.ReverseProxy, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -66,12 +72,11 @@ func New(baseURL, prefix, apiKeyHeader, apiKey, authScheme string, transport htt
 			}
 			out.Header = sanitizeHeaders(cloned)
 
-			if apiKey != "" && apiKeyHeader != "" {
-				value := apiKey
-				if authScheme == "bearer" {
-					value = "Bearer " + apiKey
+			for name, value := range authStamps {
+				if name == "" || value == "" {
+					continue
 				}
-				out.Header.Set(apiKeyHeader, value)
+				out.Header.Set(name, value)
 			}
 			pr.SetXForwarded()
 		},

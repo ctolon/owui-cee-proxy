@@ -32,13 +32,18 @@ import (
 //	                 the first WriteHeader (captures handler time
 //	                 spent assembling the response before bytes flow)
 type requestMeta struct {
-	mu             sync.Mutex
-	engine         string
-	engineURL      string
-	filename       string
-	mimeType       string
-	mimeSource     string // "declared" | "sniffed" | "fallback"
+	mu        sync.Mutex
+	engine    string
+	engineURL string
+	filename  string
+	mimeType  string
+	// mimeSource is one of:
+	//   declared | sniffed | sniffed_then_extension | extension | fallback
+	// matching the engine.mimedetect.Source set.
+	mimeSource     string
 	mimeDeclared   string // the original Content-Type the client sent
+	pickSource     string // "mime" | "extension" | "default"
+	routingStrat   string // "mime" | "extension" | "mime_then_extension" | "extension_then_mime"
 	fileCount      int
 	upstreamStart  time.Time
 	upstreamDur    time.Duration
@@ -114,11 +119,11 @@ func MimeTypeFrom(ctx context.Context) string {
 }
 
 // WithMimeSource records (a) how the resolved MIME was chosen
-// (`declared` | `sniffed` | `fallback`) and (b) the original
-// declared value the client sent. Both surface as separate
-// access-log fields so an operator can tell "client sent
-// application/octet-stream, we sniffed application/pdf, routed to
-// docling" in one log line.
+// (`declared` | `sniffed` | `sniffed_then_extension` | `extension` |
+// `fallback`) and (b) the original declared value the client sent.
+// Both surface as separate access-log fields so an operator can tell
+// "client sent application/octet-stream, we sniffed application/pdf,
+// routed to docling" in one log line.
 func WithMimeSource(ctx context.Context, source, declared string) context.Context {
 	if m := metaFrom(ctx); m != nil {
 		m.mu.Lock()
@@ -127,6 +132,40 @@ func WithMimeSource(ctx context.Context, source, declared string) context.Contex
 		m.mu.Unlock()
 	}
 	return ctx
+}
+
+// WithPickDecision records WHY a particular engine was picked:
+//
+//   - source is the matcher that won the dispatch:
+//     `mime` | `extension` | `default`.
+//   - strategy is the registry's configured routing strategy:
+//     `mime` | `extension` | `mime_then_extension` | `extension_then_mime`.
+//
+// Surfaced as separate access-log fields so operators can answer
+// "why did .msg route to kreuzberg?" with a single log record
+// (mime_source=sniffed_then_extension pick_source=extension
+// routing_strategy=mime_then_extension).
+func WithPickDecision(ctx context.Context, source, strategy string) context.Context {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		m.pickSource = source
+		m.routingStrat = strategy
+		m.mu.Unlock()
+	}
+	return ctx
+}
+
+// PickDecisionFrom reads back the recorded pick decision (matcher,
+// strategy). Used by handlers that want to emit a dedicated
+// `engine_pick_decision` debug event alongside the request-scoped
+// access log.
+func PickDecisionFrom(ctx context.Context) (source, strategy string) {
+	if m := metaFrom(ctx); m != nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.pickSource, m.routingStrat
+	}
+	return "", ""
 }
 
 // StartUpstream records the moment an adapter begins dispatching to
@@ -267,6 +306,7 @@ func AccessLog(logger zerolog.Logger, silencePaths ...string) func(http.Handler)
 			meta.mu.Lock()
 			engineName, engineURL := meta.engine, meta.engineURL
 			mimeSource, mimeDeclared := meta.mimeSource, meta.mimeDeclared
+			pickSource, routingStrat := meta.pickSource, meta.routingStrat
 			filename, fileCount := meta.filename, meta.fileCount
 			mimeType := meta.mimeType
 			upstreamDur, upstreamStatus := meta.upstreamDur, meta.upstreamStatus
@@ -298,6 +338,8 @@ func AccessLog(logger zerolog.Logger, silencePaths ...string) func(http.Handler)
 				Str("mime_type", mimeType).
 				Str("mime_source", mimeSource).
 				Str("mime_declared", mimeDeclared).
+				Str("pick_source", pickSource).
+				Str("routing_strategy", routingStrat).
 				Int("file_count", fileCount).
 				Msg("request_completed")
 		})

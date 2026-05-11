@@ -130,7 +130,7 @@ func (a *Adapter) convertOne(ctx context.Context, f engine.FileBlob) (item, int,
 		r.Header.Set("Content-Type", f.ContentType)
 	}
 	r.Header.Set("Accept", "application/json")
-	authutil.Apply(r.Header, string(a.name), a.cfg, a.client.Auth())
+	authutil.ApplyMulti(r.Header, string(a.name), a.cfg, a.client.Auth())
 	if v := a.cfg.ForwardOptions["x_tika_pdf_extract_inline_images"]; v == "true" {
 		r.Header.Set("X-Tika-PDFextractInlineImages", "true")
 	}

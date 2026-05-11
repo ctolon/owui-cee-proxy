@@ -117,7 +117,7 @@ func (a *Adapter) callOnce(ctx context.Context, req *engine.ConvertRequest, f en
 		hreq.Header.Set("Content-Type", f.ContentType)
 	}
 	hreq.Header.Set("X-Filename", url.PathEscape(SafeFilename(f.Filename)))
-	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
+	authutil.ApplyMulti(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	if req.RequestID != "" {
 		hreq.Header.Set("X-Request-ID", req.RequestID)
 	}

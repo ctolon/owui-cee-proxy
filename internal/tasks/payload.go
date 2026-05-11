@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 )
 
 // TypeConvert is the asynq task type for engine convert jobs.
@@ -50,11 +51,17 @@ type BlobRef struct {
 // Enqueue is called. cleanup MUST be invoked by the caller. maxBlob
 // caps any single file part (0 disables); validateBlobLimits in the
 // orchestrator additionally enforces an aggregate cap.
-func PayloadFromRequest(r *http.Request, source bool, maxBlob int64) (*Payload, func(), error) {
+//
+// resolver MUST be non-nil for the multipart path. It applies the
+// same MIME-resolution contract as the sync handlers (declared →
+// sniff → filename extension) so async dispatch picks the same
+// engine the sync path would have. JSON / source-mode bodies bypass
+// the resolver entirely (no upload signal).
+func PayloadFromRequest(r *http.Request, source bool, maxBlob int64, resolver *mimedetect.Resolver) (*Payload, func(), error) {
 	if source {
 		return payloadFromJSON(r)
 	}
-	return payloadFromMultipart(r, maxBlob)
+	return payloadFromMultipart(r, maxBlob, resolver)
 }
 
 // asyncSpoolThreshold mirrors the sync-path threshold (8 MiB) and is
@@ -65,7 +72,12 @@ func PayloadFromRequest(r *http.Request, source bool, maxBlob int64) (*Payload, 
 // avoid holding multiple 500 MiB slabs concurrently while parsing.
 const asyncSpoolThreshold = 8 << 20
 
-func payloadFromMultipart(r *http.Request, maxBlob int64) (*Payload, func(), error) {
+// asyncSniffHeadBytes is the prefix size used for the magic-byte
+// sniff on each drained part buffer. Mirrors the sync handler's
+// mimeSniffHeadBytes (512) — every mimetype.Detect signature fits.
+const asyncSniffHeadBytes = 512
+
+func payloadFromMultipart(r *http.Request, maxBlob int64, resolver *mimedetect.Resolver) (*Payload, func(), error) {
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
 		return nil, noop, fmt.Errorf("parse content-type: %w", err)
@@ -91,7 +103,7 @@ func payloadFromMultipart(r *http.Request, maxBlob int64) (*Payload, func(), err
 			// past the threshold — fail fast.
 			sr, err := spoolPart(part, asyncSpoolThreshold, maxBlob)
 			fname := part.FileName()
-			ctype := part.Header.Get("Content-Type")
+			declaredCT := part.Header.Get("Content-Type")
 			_ = part.Close()
 			if err != nil {
 				if errors.Is(err, errSpoolTooLarge) {
@@ -110,10 +122,25 @@ func payloadFromMultipart(r *http.Request, maxBlob int64) (*Payload, func(), err
 				return nil, noop, fmt.Errorf("drain spool: %w", err)
 			}
 			_ = sr.Close()
+
+			// MIME resolution mirrors the sync path: peek the head, run
+			// the resolver, write the resolved MIME to the BlobRef so
+			// the worker dispatches via the same engine the sync facade
+			// would have picked. Closes the pre-existing gap where
+			// async trusted the client's declared Content-Type verbatim.
+			resolvedCT := declaredCT
+			if resolver != nil {
+				head := buf.Bytes()
+				if len(head) > asyncSniffHeadBytes {
+					head = head[:asyncSniffHeadBytes]
+				}
+				resolvedCT = resolver.Resolve(declaredCT, head, fname).MIME
+			}
+
 			bufs = append(bufs, buf)
 			p.BlobKeys = append(p.BlobKeys, BlobRef{
 				Filename:    fname,
-				ContentType: ctype,
+				ContentType: resolvedCT,
 				Size:        int64(buf.Len()),
 			})
 			continue

@@ -145,7 +145,7 @@ func (a *Adapter) convertFile(ctx context.Context, req *engine.ConvertRequest) (
 		return nil, err
 	}
 	hreq.Header.Set("Content-Type", mw.FormDataContentType())
-	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
+	authutil.ApplyMulti(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	ApplyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 
 	return a.do(hreq)
@@ -165,7 +165,7 @@ func (a *Adapter) convertSource(ctx context.Context, req *engine.ConvertRequest)
 		return nil, err
 	}
 	hreq.Header.Set("Content-Type", "application/json")
-	authutil.Apply(hreq.Header, string(a.name), a.cfg, a.client.Auth())
+	authutil.ApplyMulti(hreq.Header, string(a.name), a.cfg, a.client.Auth())
 	ApplyForwardHeaders(hreq.Header, req.Headers, req.RequestID)
 	return a.do(hreq)
 }

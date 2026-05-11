@@ -13,9 +13,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
+	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
 type recordingEngine struct {
@@ -57,7 +59,7 @@ func TestConvert_RoutesByMIME(t *testing.T) {
 		"default-eng": {Engine: d},
 		"pdf-eng":     {Engine: pdf, MimeTypes: []string{"application/pdf"}},
 		"img-eng":     {Engine: img, MimeTypes: []string{"image/*"}},
-	}, "default-eng")
+	}, "default-eng", "")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry}
@@ -97,7 +99,7 @@ func TestConvert_SourceModeUsesDefault(t *testing.T) {
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
 		"default-eng": {Engine: d},
 		"other-eng":   {Engine: o, MimeTypes: []string{"application/pdf"}},
-	}, "default-eng")
+	}, "default-eng", "")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry}
@@ -144,7 +146,7 @@ func TestConvert_EngineErrorIsRedacted(t *testing.T) {
 	}
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
 		"primary": {Engine: fe},
-	}, "primary")
+	}, "primary", "")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry}
@@ -183,7 +185,7 @@ func TestConvert_ResolveURLDefaultsWhenNil(t *testing.T) {
 	d := &recordingEngine{name: "primary", hits: &atomic.Int32{}}
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
 		"primary": {Engine: d},
-	}, "primary")
+	}, "primary", "")
 	require.NoError(t, err)
 
 	h := &Convert{Registry: registry, ResolveURL: nil}
@@ -206,7 +208,7 @@ func TestConvert_ResolveURLOverride(t *testing.T) {
 	d := &recordingEngine{name: "primary", hits: &atomic.Int32{}}
 	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
 		"primary": {Engine: d},
-	}, "primary")
+	}, "primary", "")
 	require.NoError(t, err)
 
 	calls := 0
@@ -233,10 +235,18 @@ func TestConvert_ResolveURLOverride(t *testing.T) {
 
 func buildMultipart(t *testing.T, body, contentType string) (io.Reader, string) {
 	t.Helper()
+	return buildMultipartNamed(t, body, contentType, "x")
+}
+
+// buildMultipartNamed is buildMultipart with an explicit filename so
+// extension-routing tests can drive the dispatch by filename instead
+// of MIME.
+func buildMultipartNamed(t *testing.T, body, contentType, filename string) (io.Reader, string) {
+	t.Helper()
 	buf := &bytes.Buffer{}
 	mw := multipart.NewWriter(buf)
 	h := make(map[string][]string)
-	h["Content-Disposition"] = []string{`form-data; name="files"; filename="x"`}
+	h["Content-Disposition"] = []string{`form-data; name="files"; filename="` + filename + `"`}
 	h["Content-Type"] = []string{contentType}
 	w, err := mw.CreatePart(h)
 	require.NoError(t, err)
@@ -244,4 +254,171 @@ func buildMultipart(t *testing.T, body, contentType string) (io.Reader, string) 
 	require.NoError(t, err)
 	require.NoError(t, mw.Close())
 	return buf, mw.FormDataContentType()
+}
+
+// TestConvert_RoutesByExtensionWhenMimeMisses exercises the default
+// strategy (mime_then_extension). When the MIME phase matches no
+// engine but the filename's extension does, dispatch must pick the
+// extension-matching engine instead of falling all the way through
+// to default. Mirrors the .msg bug fix from the integration suite.
+func TestConvert_RoutesByExtensionWhenMimeMisses(t *testing.T) {
+	t.Parallel()
+	defaultHits, msgHits := &atomic.Int32{}, &atomic.Int32{}
+	d := &recordingEngine{name: "default-eng", hits: defaultHits}
+	msg := &recordingEngine{name: "msg-eng", hits: msgHits}
+
+	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
+		"default-eng": {Engine: d},
+		"msg-eng":     {Engine: msg, Extensions: []string{".msg"}},
+	}, "default-eng", engine.StrategyMimeThenExt)
+	require.NoError(t, err)
+
+	h := &Convert{Registry: registry}
+	srv := httptest.NewServer(http.HandlerFunc(h.File))
+	defer srv.Close()
+
+	body, ct := buildMultipartNamed(t, "x", "text/plain", "report.msg")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", ct)
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.EqualValues(t, 1, msgHits.Load(), "extension match must beat default fallback")
+	require.EqualValues(t, 0, defaultHits.Load())
+}
+
+// TestConvert_ExtensionDoesNotOverrideMimeMatch — if both phases
+// would claim the request, the registry must respect the strategy's
+// declared order. For mime_then_extension that means MIME wins; the
+// filename's .msg is irrelevant when the engine ALREADY has a MIME
+// claim on the declared Content-Type.
+func TestConvert_ExtensionDoesNotOverrideMimeMatch(t *testing.T) {
+	t.Parallel()
+	pdfHits, msgHits := &atomic.Int32{}, &atomic.Int32{}
+	d := &recordingEngine{name: "default-eng", hits: &atomic.Int32{}}
+	pdf := &recordingEngine{name: "pdf-eng", hits: pdfHits}
+	msg := &recordingEngine{name: "msg-eng", hits: msgHits}
+
+	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
+		"default-eng": {Engine: d},
+		"pdf-eng":     {Engine: pdf, MimeTypes: []string{"application/pdf"}},
+		"msg-eng":     {Engine: msg, Extensions: []string{".msg"}},
+	}, "default-eng", engine.StrategyMimeThenExt)
+	require.NoError(t, err)
+
+	h := &Convert{Registry: registry}
+	srv := httptest.NewServer(http.HandlerFunc(h.File))
+	defer srv.Close()
+
+	body, ct := buildMultipartNamed(t, "x", "application/pdf", "x.msg")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", ct)
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.EqualValues(t, 1, pdfHits.Load(), "mime_then_extension: MIME phase wins when both match")
+	require.EqualValues(t, 0, msgHits.Load())
+}
+
+// TestConvert_AccessLogNeverEmptyEngineOnError exercises the
+// baseline-stamp fix for the user-reported symptom "engine + engine_url
+// come back empty in routing". When buildRequest fails (e.g.,
+// malformed Content-Type), the handler returns a 400 without ever
+// reaching the dispatch path. Pre-fix, the AccessLog line carried
+// empty `engine` + `engine_url`; post-fix the default engine is
+// stamped at handler entry so the access log can always attribute
+// the request.
+func TestConvert_AccessLogNeverEmptyEngineOnError(t *testing.T) {
+	t.Parallel()
+
+	defaultHits := &atomic.Int32{}
+	d := &recordingEngine{name: "default-eng", hits: defaultHits}
+	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
+		"default-eng": {Engine: d},
+	}, "default-eng", engine.StrategyMimeThenExt)
+	require.NoError(t, err)
+
+	// Capture AccessLog output via a buffered zerolog instance.
+	logBuf := &bytes.Buffer{}
+	logger := zerolog.New(logBuf).With().Timestamp().Logger()
+	h := &Convert{Registry: registry, Logger: logger}
+
+	// Wrap the handler in the AccessLog middleware exactly as routes.go
+	// does, so the test exercises the real end-to-end stamp pipeline.
+	handler := mw.AccessLog(logger)(http.HandlerFunc(h.File))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	// Force buildRequest to fail by sending a non-multipart Content-Type.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL,
+		strings.NewReader(`{"not":"multipart"}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"non-multipart request must 400 BEFORE engine dispatch")
+
+	// Scan the captured log buffer for the request_completed event and
+	// assert the engine fields are non-empty even though dispatch never
+	// fired.
+	var completed map[string]any
+	for _, line := range strings.Split(logBuf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &m))
+		if ev, _ := m["event"].(string); ev == "request_completed" {
+			completed = m
+		}
+	}
+	require.NotNil(t, completed, "AccessLog must emit request_completed even on 400")
+	require.Equal(t, "default-eng", completed["engine"],
+		"engine field MUST be stamped at handler entry, not just at dispatch")
+	require.NotEmpty(t, completed["engine_url"],
+		"engine_url MUST be non-empty on every access-log line for a routed request")
+	require.Equal(t, "default", completed["pick_source"],
+		"failed dispatch MUST surface pick_source=default")
+	require.Equal(t, "mime_then_extension", completed["routing_strategy"])
+}
+
+// TestConvert_StrategyExtensionThenMime flips the priority order:
+// the extension match wins even when the MIME phase would have
+// claimed the request too. Validates that strategy selection
+// genuinely controls the order, not just the fall-through.
+func TestConvert_StrategyExtensionThenMime(t *testing.T) {
+	t.Parallel()
+	pdfHits, msgHits := &atomic.Int32{}, &atomic.Int32{}
+	d := &recordingEngine{name: "default-eng", hits: &atomic.Int32{}}
+	pdf := &recordingEngine{name: "pdf-eng", hits: pdfHits}
+	msg := &recordingEngine{name: "msg-eng", hits: msgHits}
+
+	registry, err := engine.NewRegistry(map[engine.Name]engine.RegistryEntry{
+		"default-eng": {Engine: d},
+		"pdf-eng":     {Engine: pdf, MimeTypes: []string{"application/pdf"}},
+		"msg-eng":     {Engine: msg, Extensions: []string{".msg"}},
+	}, "default-eng", engine.StrategyExtThenMime)
+	require.NoError(t, err)
+
+	h := &Convert{Registry: registry}
+	srv := httptest.NewServer(http.HandlerFunc(h.File))
+	defer srv.Close()
+
+	body, ct := buildMultipartNamed(t, "x", "application/pdf", "x.msg")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", ct)
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.EqualValues(t, 1, msgHits.Load(), "extension_then_mime: extension wins")
+	require.EqualValues(t, 0, pdfHits.Load())
 }
