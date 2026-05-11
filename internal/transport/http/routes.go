@@ -47,13 +47,19 @@ type RouterDeps struct {
 	// would share the pool across every engine, violating the
 	// per-engine isolation invariant (C-25 from REVIEW-FAANG.md).
 	EngineTransports map[string]*http.Transport
+	// PanicRecorder is the observability seam the Recover middleware
+	// hits when it catches a panic. Composition root wires the
+	// Prometheus counter (`panics_total{path}`); nil falls back to
+	// the no-op recorder so tests that build a router without
+	// metrics still work. (C-39 from REVIEW-FAANG.md.)
+	PanicRecorder mw.PanicRecorder
 }
 
 func NewRouter(d RouterDeps) (http.Handler, error) {
 	r := chi.NewRouter()
 	var mountErr error
 
-	r.Use(mw.Recover(d.Logger))
+	r.Use(mw.Recover(d.Logger, d.PanicRecorder))
 	r.Use(mw.RequestID())
 	r.Use(mw.OTel(d.Config.Observability.Tracing.ServiceName))
 	r.Use(mw.GlobalRateLimit(d.Config.RateLimitGlobal.RPS, d.Config.RateLimitGlobal.Burst))

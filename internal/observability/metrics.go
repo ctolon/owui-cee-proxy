@@ -52,6 +52,12 @@ type Metrics struct {
 	// either GC-bound or under load; this metric surfaces it before
 	// the kubelet probe timeout fires.
 	HealthProbeDuration *prometheus.HistogramVec
+	// PanicsTotal counts panic-recovered requests, labeled by path
+	// so operators can group reproducers without log archaeology.
+	// Cardinality is bounded by chi route patterns; 404s use the
+	// literal "unknown" path label to avoid attacker-driven series
+	// explosion. (C-39 from REVIEW-FAANG.md.)
+	PanicsTotal *prometheus.CounterVec
 	// WorkerQueueDepth is the gauge polled from asynq.Inspector.
 	// Labels: queue (the asynq queue name). Spikes here precede
 	// SLO violations on async file conversions.
@@ -179,5 +185,10 @@ func NewMetrics() *Metrics {
 			Name:      "task_lifecycle_total",
 			Help:      "Async task lifecycle transitions per stage and outcome.",
 		}, []string{"stage", "outcome"}),
+		PanicsTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "owui_cee_proxy",
+			Name:      "panics_total",
+			Help:      "Panics caught by the Recover middleware, per request path.",
+		}, []string{"path"}),
 	}
 }

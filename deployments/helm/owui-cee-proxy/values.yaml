@@ -94,6 +94,29 @@ pdb:
   enabled: true
   minAvailable: 1
 
+# Spread Pods across topology zones so a node / zone outage doesn't
+# take down every replica simultaneously. Default off (empty list);
+# enable per cluster. The PDB above only enforces minAvailable —
+# without anti-affinity / topology spread, both replicas can land on
+# the same node and a single drain still breaks the SLA.
+#
+# Recommended production setting:
+#   topologySpreadConstraints:
+#     - maxSkew: 1
+#       topologyKey: kubernetes.io/hostname
+#       whenUnsatisfiable: ScheduleAnyway   # DoNotSchedule on multi-node clusters
+#       labelSelector:
+#         matchLabels:
+#           app.kubernetes.io/name: owui-cee-proxy
+topologySpreadConstraints: []
+
+# nodeSelector / tolerations / affinity are the standard k8s scheduling
+# levers, plumbed through the template so operators don't need to fork
+# the chart to deploy on tainted GPU nodes / dedicated node-pools.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
 networkPolicy:
   enabled: false
   # probeSources is the ALWAYS-emitted ingress allow rule that keeps
@@ -152,6 +175,10 @@ config:
       client_ca_file: ""
   routing:
     default_engine: "main-docling"
+    # strategy: pick from `mime | extension | mime_then_extension
+    # (default) | extension_then_mime`. Empty string resolves to
+    # `mime_then_extension`. (v0.5.0+)
+    strategy: "mime_then_extension"
     facade:
       docling:
         enabled: true
@@ -161,6 +188,22 @@ config:
         path: "/process"
     passthrough:
       enabled: true
+    # fallback: when ON, a primary engine's 5xx / transport error
+    # triggers a one-shot retry against the registry's default
+    # engine. Default false preserves the legacy "errors propagate"
+    # semantics. (v0.7.0+)
+    fallback:
+      enabled: false
+      max_attempts: 2
+
+  # mimedetect tunes the MIME resolution stage that runs in front of
+  # registry dispatch. Operator-supplied entries extend / override the
+  # built-in 10-entry CFB-disambiguation table. (v0.5.0+)
+  mimedetect:
+    extension_overrides: {}
+    # extension_overrides:
+    #   ".epub": "application/epub+zip"
+    #   ".msg":  "application/x-custom-msg"
   # User-defined engine map. Each entry's compat_type selects the
   # adapter (docling | external | docling-external | tika).
   engines:
@@ -174,6 +217,27 @@ config:
       request_timeout: 120s
       health_path: "/health"
       mime_types: []
+      # extensions: filename-extension allowlist consulted when
+      # routing.strategy uses an extension phase. Case-insensitive,
+      # leading dot optional. Empty = abstain. (v0.5.0+)
+      extensions: []
+      # auth_headers: optional multi-stamp auth list. When present,
+      # every entry stamps a separate header on every outbound
+      # request (e.g., backend requires BOTH X-Api-Key + Authorization).
+      # Singular auth_header / api_key_env above remains valid. (v0.5.0+)
+      # auth_headers:
+      #   - header: "Authorization"
+      #     api_key_env: "DOCLING_BEARER_TOKEN"
+      #     scheme: "bearer"
+      #   - header: "X-Tenant-Token"
+      #     api_key_env: "DOCLING_TENANT_TOKEN"
+      #     scheme: "raw"
+      # rate_limit: per-engine token bucket. RPS=0 disables (default,
+      # legacy unthrottled path). Enabled in v0.7.0+; previously a
+      # silent dead knob (C-24).
+      rate_limit:
+        rps: 0
+        burst: 0
       # Per-engine overrides for observability.upstream defaults.
       # Uncomment any field to override; omitted fields inherit global.
       # observability:
@@ -197,6 +261,19 @@ config:
     proxy_api_keys_env: "PROXY_API_KEYS"
     proxy_api_key_header: "X-Proxy-Api-Key"
     require_api_key: false
+    # When set, API-key fingerprints persisted in Redis (used to bind
+    # async task tokens to their caller) are HMAC-SHA-256(pepper, key)
+    # instead of plain SHA-256. A Redis exfil + offline rainbow table
+    # can no longer recover API keys without ALSO stealing the pepper
+    # from the proxy process. Empty value (the legacy default) keeps
+    # plain SHA-256. (v0.7.0+)
+    proxy_api_key_fingerprint_pepper_env: ""
+
+  # observability.upstream.full_capture: sensitive audit log channel
+  # that captures the full inbound + outbound request/response (headers
+  # + body prefix) per request. DEFAULT OFF. ON → write to a SEPARATE
+  # log sink, never the primary stream — log shippers should route the
+  # `sensitive_capture: true` field to cold-storage. (v0.5.0+)
   ratelimit_global:
     rps: 200
     burst: 400
