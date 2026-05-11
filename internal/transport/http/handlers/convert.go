@@ -129,21 +129,22 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 
 	// One-shot debug record so operators can audit per-request routing
 	// without joining the access-log line against a separate trace.
-	// Kept at debug level — production-noisy by design.
-	if c.Logger.GetLevel() <= zerolog.DebugLevel && len(req.Files) > 0 {
-		traceID, spanID := mw.TraceFieldsFrom(ctx)
-		c.Logger.Debug().
-			Str("event", "engine_pick_decision").
-			Str("request_id", req.RequestID).
-			Str("trace_id", traceID).
-			Str("span_id", spanID).
-			Str("engine", string(eng.Name())).
-			Str("engine_url", eng.URL()).
-			Str("pick_source", string(pickSrc)).
-			Str("routing_strategy", string(c.Registry.Strategy())).
-			Str("mime_type", req.Files[0].ContentType).
-			Str("filename", req.Files[0].Filename).
-			Msg("engine pick decision")
+	// Kept at debug level — production-noisy by design. The helper
+	// dedupes the field set with external.Process so adding a new
+	// attribution field is a single-file change (C-32).
+	if len(req.Files) > 0 {
+		logEnginePickDecision(ctx, c.Logger, pickDecision{
+			RequestID:       req.RequestID,
+			Engine:          string(eng.Name()),
+			EngineURL:       eng.URL(),
+			Facade:          engine.FacadeDocling,
+			PickSource:      pickSrc,
+			RoutingStrategy: c.Registry.Strategy(),
+			MIMEResolved:    req.Files[0].ContentType,
+			Filename:        req.Files[0].Filename,
+			FileExt:         filepathExt(req.Files[0].Filename),
+			FileCount:       len(req.Files),
+		})
 	}
 
 	resp, err := eng.Convert(ctx, req)
@@ -178,11 +179,7 @@ func (c *Convert) handle(w http.ResponseWriter, r *http.Request, source bool) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	for k, v := range resp.Headers {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
-		}
-	}
+	copyResponseHeaders(w.Header(), resp.Headers)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }

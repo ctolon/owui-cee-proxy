@@ -11,6 +11,14 @@ import (
 // to a temp file. 8 MiB matches the H1 mitigation in docs/REVIEW.md.
 const spoolThresholdDefault = 8 << 20
 
+// spoolInitialBuf is the bootstrap capacity for the in-memory buffer
+// used by spoolPart. Sized large enough to absorb a typical option
+// blob / short text payload in a single allocation, small enough
+// that 100 concurrent uploads of <1 MiB files allocate ~6.4 MiB
+// total at peak rather than the 800 MiB the old fixed pre-alloc
+// produced. (C-16 from REVIEW-FAANG.md.)
+const spoolInitialBuf = 64 << 10
+
 // spoolReader is the union return type of spoolPart. It implements
 // io.ReadSeekCloser so adapters that want to retry / restart can rewind
 // (the docling streaming writer does not, but other adapters might).
@@ -84,30 +92,44 @@ func (s *spoolReader) Size() int64 { return s.size }
 // temp file (O_TMPFILE on Linux when available, falling back to
 // os.CreateTemp). Returns ErrSpoolTooLarge if the source exceeds
 // maxBytes; the partial spool is cleaned up before returning.
+//
+// Memory growth: a bytes.Buffer grows geometrically from
+// spoolInitialBuf up to threshold+1. Pre-fix this function allocated
+// `make([]byte, threshold+1)` (= 8 MiB) regardless of actual file
+// size — 800 MiB heap pressure at 100 concurrent small uploads
+// (C-16 from REVIEW-FAANG.md). The buffer's amortised growth caps
+// peak alloc at next_pow2(filesize) for sub-threshold files, which
+// is what the budget actually targets.
 func spoolPart(r io.Reader, threshold, maxBytes int64) (*spoolReader, error) {
 	if threshold <= 0 {
 		threshold = spoolThresholdDefault
 	}
-	// Read up to threshold+1 to detect overflow without growing the
-	// in-memory buffer.
-	mem := make([]byte, threshold+1)
-	n, err := io.ReadFull(r, mem)
+	// Start the buffer at a sensible bootstrap size so tiny files
+	// don't thrash the first few growth steps. 64 KiB covers the
+	// "small option blob" + "short text payload" tail of the
+	// distribution at zero realistic cost.
+	buf := bytes.NewBuffer(make([]byte, 0, spoolInitialBuf))
+	// io.CopyN reads up to threshold+1 bytes. Returns:
+	//   * (threshold+1, nil)   → overflow; spill needed
+	//   * (n<threshold+1, EOF) → fit in memory; done
+	//   * (n, other-err)       → real transport error
+	n, err := io.CopyN(buf, r, threshold+1)
 	switch {
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-		// Whole part fit (n bytes).
-		if maxBytes > 0 && int64(n) > maxBytes {
+	case errors.Is(err, io.EOF):
+		if maxBytes > 0 && n > maxBytes {
 			return nil, ErrSpoolTooLarge
 		}
 		return &spoolReader{
-			memBuf: bytes.NewReader(mem[:n]),
-			size:   int64(n),
+			memBuf: bytes.NewReader(buf.Bytes()),
+			size:   n,
 		}, nil
 	case err != nil:
 		return nil, err
 	}
-	// Overflow: n == len(mem) and there is more left to read. Spill the
-	// already-read bytes to a temp file then continue copying from r.
-	memBytes := mem[:int64(n)]
+	// Overflow: n == threshold+1 and there is more left to read. Spill
+	// the already-buffered bytes to a temp file then continue copying
+	// from r.
+	memBytes := buf.Bytes()
 	f, path, ferr := openSpoolFile()
 	if ferr != nil {
 		return nil, ferr
