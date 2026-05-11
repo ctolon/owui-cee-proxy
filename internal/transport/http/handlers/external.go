@@ -115,24 +115,24 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	ctx = mw.WithPickDecision(ctx, string(pickSrc), string(e.Registry.Strategy()))
 	mw.RecordMimeSource(ctx, string(resolved.Source), declaredCT)
 
-	traceID, spanID := mw.TraceFieldsFrom(ctx)
-	if e.Logger.GetLevel() <= zerolog.DebugLevel {
-		e.Logger.Debug().
-			Str("event", "engine_pick_decision").
-			Str("request_id", req.RequestID).
-			Str("trace_id", traceID).
-			Str("span_id", spanID).
-			Str("engine", string(eng.Name())).
-			Str("engine_url", eng.URL()).
-			Str("pick_source", string(pickSrc)).
-			Str("routing_strategy", string(e.Registry.Strategy())).
-			Str("mime_type", contentType).
-			Str("filename", filename).
-			Msg("engine pick decision")
-	}
+	logEnginePickDecision(ctx, e.Logger, pickDecision{
+		RequestID:       req.RequestID,
+		Engine:          string(eng.Name()),
+		EngineURL:       eng.URL(),
+		Facade:          engine.FacadeExternal,
+		PickSource:      pickSrc,
+		RoutingStrategy: e.Registry.Strategy(),
+		MIMEDeclared:    declaredCT,
+		MIMEResolved:    contentType,
+		MIMESource:      string(resolved.Source),
+		Filename:        filename,
+		FileExt:         filepathExt(filename),
+		FileCount:       1,
+	})
 
 	resp, err := eng.Convert(ctx, req)
 	if err != nil {
+		traceID, spanID := mw.TraceFieldsFrom(ctx)
 		e.Logger.Error().
 			Err(err).
 			Str("event", "engine_convert_failed").
@@ -152,11 +152,7 @@ func (e *External) Process(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	for k, v := range resp.Headers {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
-		}
-	}
+	copyResponseHeaders(w.Header(), resp.Headers)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)

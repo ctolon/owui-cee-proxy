@@ -116,11 +116,18 @@ Verified locally: `go test -race -count=1 ./...` green;
 | C-27 | Plugin SDK | New `TestCompatTypesAndAcceptedFacadesAlignWithAdapterCapabilities` in `internal/app/app_test.go`: instantiates every registered adapter via `newAdapterByCompat` and asserts `adapter.Capabilities().Facades` matches `config.AcceptedFacades(compatType)`. Two sources of truth still exist (they serve different lifecycle stages — validator at config-Load vs registry at dispatch) but a drift in either now fails CI. |
 | C-29 | Helm | `deployments/kubernetes/base/kustomization.yaml` no longer lists `secret.example.yaml` in its `resources:` block. A GitOps pipeline with `prune=true` would previously materialise a live `Secret` containing the literal `REPLACE_ME` placeholder. Inline comment documents the intent: apply the example directly for scaffolding only; production operators supply real values via SealedSecrets / ExternalSecrets. |
 
+### Closed in `feat/p1-perf-headers-observability`
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-16 | Perf | `spoolPart` now grows a `bytes.Buffer` from a 64 KiB bootstrap up to `threshold+1`, replacing the pre-allocated `make([]byte, 8MiB+1)` that ran on every upload regardless of size. Peak alloc for sub-threshold files is now ~next_pow2(filesize) instead of a flat 8 MiB; 100 concurrent <1 MiB uploads now total ~6.4 MiB of buffer alloc at peak instead of 800 MiB. |
+| C-30 | API | New `copyResponseHeaders` helper applies an allowlist (`Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`, `Etag`, `Last-Modified`, `Cache-Control`, `Expires`, `Vary`, `X-Request-Id`) plus a belt-and-braces deny list (`Set-Cookie`, `Set-Cookie2`, `Server`, `X-Powered-By`, `X-Aspnet-Version`, `X-Aspnetmvc-Version`). CR/LF-bearing values are dropped from allowlisted headers too. Wired into both convert.go and external.go. Pinned by two unit tests. |
+| C-32 | Observability | New `logEnginePickDecision` helper centralises the structured field set of `engine_pick_decision`; convert.go + external.go now call ONE function instead of duplicating the emit block. Field set expanded with `facade`, `mime_declared`, `mime_resolved`, `mime_source`, `file_ext`, `file_count`, `compat_type` (reserved for future engine-SDK extension). Adding a new attribution field is now a single-file change. |
+
 ### P1 (release after P0) — remaining
 
 | ID  | Lens | Finding | Recommended action |
 |-----|------|---------|--------------------|
-| C-16 | Perf | `spoolPart` always allocates `make([]byte, 8MiB+1)` regardless of file size. 800 MiB heap pressure at 100 concurrent uploads. | Allocate `min(content_length_hint, threshold+1)`. |
 | C-22 | Reliability | `/readyz` is all-or-nothing — one flaky engine kills the whole pod. | Tier the probe: default-engine + Redis required, others surface degraded. |
 | C-23 | Reliability | Async `Enqueue` does 4 sequential Redis round-trips inside the request goroutine. Slow Redis blocks every async submit. | Pipeline via `redis.MULTI`; or single Lua script. |
 | C-24 | Architecture | `cfg.engines.<n>.rate_limit` is in the schema, defaulted, **never used**. `docs/ARCHITECTURE.md` lies about it. | Implement per-engine `golang.org/x/time/rate` limiter, or delete the field. |
