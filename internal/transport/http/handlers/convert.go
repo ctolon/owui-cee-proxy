@@ -179,6 +179,7 @@ func buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 			// File part: spool to memory (small) or disk (large). The
 			// global BodyLimit middleware already bounds the request
 			// stream, so this only adds the per-part overflow guard.
+			declaredCT := part.Header.Get("Content-Type")
 			sr, err := spoolPart(part, spoolThresholdDefault, maxFilePartBytes)
 			_ = part.Close()
 			if err != nil {
@@ -189,12 +190,31 @@ func buildFileRequest(r *http.Request) (*engine.ConvertRequest, func(), error) {
 				return nil, noop, fmt.Errorf("read part %q: %w", part.FormName(), err)
 			}
 			closers = append(closers, sr)
+
+			// Resolve effective MIME: declared wins when specific; fall
+			// back to magic-byte sniff when client sent
+			// application/octet-stream or empty. Fixes the user-reported
+			// "default engine catches PDFs because Content-Type is
+			// generic" routing bug.
+			resolved, srcerr := peekAndResolveMIME(declaredCT, sr)
+			if srcerr != nil {
+				cleanup()
+				return nil, noop, fmt.Errorf("mime detect %q: %w", part.FileName(), srcerr)
+			}
+
 			req.Files = append(req.Files, engine.FileBlob{
 				Filename:    part.FileName(),
-				ContentType: part.Header.Get("Content-Type"),
+				ContentType: resolved.MIME,
 				Size:        sr.Size(),
 				Body:        sr,
 			})
+			// Record the source for the FIRST file only — that's the
+			// file MIME-based routing uses; per-file source logs would
+			// be noise. The middleware reads this back via
+			// mw.MIMESourceFrom on the access-log emission path.
+			if len(req.Files) == 1 {
+				mw.WithMimeSource(r.Context(), string(resolved.Source), declaredCT)
+			}
 			continue
 		}
 		// Form-field part: assume small, read into memory.
