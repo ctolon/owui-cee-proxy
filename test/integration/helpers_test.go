@@ -57,12 +57,18 @@ func (c *logCapture) Bytes() []byte {
 	return append([]byte(nil), c.buf.Bytes()...)
 }
 
-// findEvent scans c for the first log line whose "event" field
+// findEvent scans c for the LAST log line whose "event" field
 // matches name and returns it as a decoded map. Returns nil when no
 // such line exists. Tests use this to assert observability fields
 // (engine_url, auth_key_present, upstream_status, body_snippet, …)
 // without coupling to the line ordering.
+//
+// Returning the *last* match instead of the first one lets tests
+// disregard incidental log lines (readiness probes hitting /healthz
+// before the test's own request) and zero in on the most recent
+// emission — which is the request the test just made.
 func (c *logCapture) findEvent(name string) map[string]any {
+	var last map[string]any
 	for _, line := range bytes.Split(c.Bytes(), []byte("\n")) {
 		if len(line) == 0 {
 			continue
@@ -72,10 +78,36 @@ func (c *logCapture) findEvent(name string) map[string]any {
 			continue
 		}
 		if ev, _ := m["event"].(string); ev == name {
-			return m
+			last = m
 		}
 	}
-	return nil
+	return last
+}
+
+// findEventForPath is the path-aware variant. It scans for the LAST
+// log line whose "event" matches AND whose "path" field equals
+// pathValue. Use this when a test makes multiple HTTP requests to
+// different paths (e.g., readiness probe + the request under test)
+// and needs to disambiguate them.
+func (c *logCapture) findEventForPath(name, pathValue string) map[string]any {
+	var last map[string]any
+	for _, line := range bytes.Split(c.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(line, &m); err != nil {
+			continue
+		}
+		if ev, _ := m["event"].(string); ev != name {
+			continue
+		}
+		if p, _ := m["path"].(string); p != pathValue {
+			continue
+		}
+		last = m
+	}
+	return last
 }
 
 // newProxyServerWithLogCapture builds the proxy with a parallel
