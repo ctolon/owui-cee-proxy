@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ctolon/owui-cee-proxy/deployments/helm/owui-cee-proxy/values.schema.json",
+  "title": "owui-cee-proxy Helm chart values",
+  "description": "Operator-facing schema for the chart. Catches typos at `helm install` time instead of letting them ride into the cluster as a CrashLoopBackOff. Keeps a flexible `config` subtree (operator-supplied YAML round-trips into the ConfigMap) — only the top-level structural knobs and a few load-bearing config keys are pinned.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image"],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Desired number of pod replicas."
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "digest": {"type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]},
+        "pullSecrets": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+    "podLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+    "podSecurityContext": {"type": "object"},
+    "containerSecurityContext": {"type": "object"},
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {"type": "object"},
+        "limits": {"type": "object"}
+      }
+    },
+    "terminationGracePeriodSeconds": {"type": "integer", "minimum": 0},
+    "service": {"type": "object"},
+    "ingress": {"type": "object"},
+    "gateway": {"type": "object"},
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "minReplicas": {"type": "integer", "minimum": 1},
+        "maxReplicas": {"type": "integer", "minimum": 1},
+        "targetCPUUtilizationPercentage": {"type": "integer", "minimum": 1, "maximum": 100},
+        "targetMemoryUtilizationPercentage": {"type": "integer", "minimum": 1, "maximum": 100}
+      }
+    },
+    "pdb": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "minAvailable": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+        "maxUnavailable": {"oneOf": [{"type": "integer"}, {"type": "string"}]}
+      }
+    },
+    "topologySpreadConstraints": {"type": "array", "items": {"type": "object"}},
+    "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+    "tolerations": {"type": "array", "items": {"type": "object"}},
+    "affinity": {"type": "object"},
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "probeSources": {"type": "array", "items": {"type": "object"}},
+        "ingressFrom": {"type": "array", "items": {"type": "object"}},
+        "egressTo": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "serviceMonitor": {"type": "object"},
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecretName": {"type": "string"},
+        "envFromKeys": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "config": {
+      "type": "object",
+      "description": "Proxy configuration. The chart serialises this subtree into the ConfigMap verbatim, so the full YAML schema accepted by the Go binary applies; we pin only a handful of load-bearing keys here to catch the most common operator footguns.",
+      "additionalProperties": true,
+      "properties": {
+        "routing": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "default_engine": {"type": "string", "minLength": 1},
+            "strategy": {
+              "type": "string",
+              "enum": ["", "mime", "extension", "mime_then_extension", "extension_then_mime"],
+              "description": "Empty resolves to mime_then_extension at runtime. v0.5.0+."
+            },
+            "fallback": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "max_attempts": {"type": "integer", "minimum": 0}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

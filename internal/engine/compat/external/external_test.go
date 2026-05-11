@@ -154,7 +154,7 @@ func TestExternal_Convert_HonoursPathOverride(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := newTestAdapter(t, srv.URL, config.EnginePathsConfig{ExternalProcess: "/custom/process"})
+	a := newTestAdapter(t, srv.URL, config.EnginePathsConfig{external.PathProcess: "/custom/process"})
 
 	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{
 		Facade: engine.FacadeExternal,

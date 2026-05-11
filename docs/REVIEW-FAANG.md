@@ -167,23 +167,53 @@ list + roadmap themes.)
 | C-31 | Reliability | No engine fallback chain. A 5xx from one engine kills the whole MIME class even when sibling engines are healthy. | Add `routing.fallback` ordered candidates; integrate with breaker state. Requires C-20 first. |
 | C-32 | Observability | `engine_pick_decision` debug event lacks `compat_type`, `facade`, `mime_declared`, `mime_resolved`, `mime_source`, `file_ext`, `trace_id`. Duplicated in `convert.go` ↔ `external.go`. | Promote to `mw.LogEnginePick(ctx, logger, decision)`; expand fields. Mirror as `engine_pick_total{facade, engine, pick_source}` counter. |
 
-### P2 (backlog)
+### Closed in `feat/p2-quick-wins` (v0.7.0 + 1)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-34 | Helm | `templates/deployment.yaml` now plumbs `topologySpreadConstraints`, `nodeSelector`, `tolerations`, `affinity` through to the Pod spec. `values.yaml` ships an opt-in stub with the canonical `maxSkew: 1, topologyKey: hostname` recipe in a comment. Multi-replica deployments can finally enforce zone/node spread the PDB was already gating on. |
+| C-39 | Observability | `Recover` middleware now emits the panic stack via `Str(...)` instead of `Bytes(...)` (the latter base64-encoded the stack in JSON, making it unreadable). Adds a new `owui_cee_proxy_panics_total{path}` counter wired through `PanicRecorder` interface + composition-root adapter. Path label is bounded by chi route patterns; the literal `"unknown"` covers the rare panic-before-routing case. |
+| C-42 | Helm | `values.yaml` extended with stubs for every YAML knob added in v0.5.0–v0.7.0: `routing.strategy`, `routing.fallback.{enabled,max_attempts}`, `engines.<n>.extensions`, `engines.<n>.auth_headers`, `engines.<n>.rate_limit`, `mimedetect.extension_overrides`, `security.proxy_api_key_fingerprint_pepper_env`. Each carries an inline comment pointing at the version it landed in. |
+| C-44 | Security | `validateSources` now mutates each `engine.HTTPSource` after a successful resolve: URL rewritten to use the resolved IP literal (IPv6 bracketed when needed), original hostname preserved in `Headers["Host"]`. The engine backend dialing the rewritten URL can no longer fall through to a fresh DNS lookup — the TOCTOU window between validation and dial is closed. Caller-supplied Host headers are preserved (operators driving a CDN front keep control). Pinned by 4 unit tests (IPv4 + IPv6 + caller-Host + rejection-propagation). |
+
+### Closed in `feat/p2-dx-ops-hardening` (v0.7.0 + 2)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-36 | Helm | New `deployments/helm/owui-cee-proxy/values.schema.json` (JSON Schema 2020-12). Pins the structural top-level knobs (`replicaCount`, `image.{repository,tag,digest,pullPolicy}`, `resources.{requests,limits}`, `secrets.existingSecretName`, autoscaling bounds, PDB) plus the load-bearing routing knob (`config.routing.strategy` enum + `config.routing.fallback.{enabled,max_attempts}` shape). The `config` subtree intentionally stays `additionalProperties: true` so operators can serialise their full YAML through; the Go binary remains the source of truth on the deep config schema. Typos like `replicaCount: "2"` or `strategy: ime` now fail `helm install` instead of landing in the cluster as a CrashLoopBackOff. |
+| C-40 | Architecture | `internal/app/app.go` split inside the same package (no exported API change): the 7 observability adapters (`authMetricsAdapter`, `ssrfMetricsAdapter`, `ssrfLoggerAdapter`, `taskLifecycleAdapter`, `queueDepthAdapter`, `healthMetricsAdapter`, `panicRecorderAdapter`, `upstreamStatusAdapter`) moved to `adapters.go`; the two bootstrap log emitters (`logEngineBootstrap`, `logRoutingBootstrap`) plus `breakerStateHook` moved to `bootstrap.go`. `app.go` shrank from 481 → 285 lines; each file now has a single responsibility. Moves intentionally kept INSIDE `package app` because the adapters import `handlers.SSRFRejectReason` + `authutil.Outcome` — relocating to `internal/observability` would have reversed the project's layering invariant. |
+| C-41 | DX | `README.md` "How engine selection works" section rewritten end-to-end. Now documents: (1) the four `routing.strategy` values + their match order; (2) the MIME resolution stage that runs in front of dispatch + the CFB disambiguation that closed the original `.msg` HTTP-400 bug; (3) per-engine multi-stamp `auth_headers` (v0.5.0+); (4) async idempotency via `Idempotency-Key` (v0.6.0+); (5) source-mode SSRF IP pinning (v0.7.0+). The matrix entries match `docs/ARCHITECTURE.md §4` so operators reading either doc land in the same mental model. |
+
+### Closed in `feat/p2-test-coverage-tls` (v0.7.0 + 3)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-37 | QA | New tests for `bodylimit`, `ratelimit`, `timeout`, and `recover` middlewares. 15 unit tests cover the cap-enforce path (under/over/disabled), counter context propagation, token-bucket burst behaviour (allow/reject/refill), context-deadline propagation + firing, and the panic recovery contract (stack as string per C-39, recorder hits + counter, nil-recorder fallback, legacy variadic form). Closes the only zero-coverage middleware files left in the package. |
+| C-43 | Helm | Both raw kustomize overlays now demonstrate TLS termination via a kubernetes.io/tls Secret named `owui-cee-proxy-tls`. `overlays/gateway-api-envoy/gateway.yaml` gains an HTTPS listener (`port: 443`, `tls.mode: Terminate`, `certificateRefs[0].name`); the existing HTTPRoute attaches to BOTH listeners by default (no `sectionName`). `overlays/ingress-nginx/ingress.yaml` gains the matching `spec.tls[]` stanza + a commented `ssl-redirect` annotation. Operators wiring cert-manager (or any external cert pipeline) reuse the same Secret name across overlays. Strict-HTTPS recipe documented inline (sectionName + RequestRedirect filter). |
+
+### Closed in `feat/p2-async-external-spool` (v0.7.0 + 4)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-38 | Backend | New `internal/spool/` package consolidates the two drift-prone copies of the multipart spool: the sync-path version (`handlers/spool.go`, which carried the C-16 geometric-growth fix + O_TMPFILE + Seek) and the async-path version (`tasks/spool.go`, which still allocated `make([]byte, threshold+1)` regardless of file size). Public API: `spool.Part(r, threshold, maxBytes) → *spool.Reader`, `spool.ErrTooLarge`, `spool.ThresholdDefault`, `spool.InitialBuf`. Build-tagged `openSpoolFile` moves with the package so the Linux O_TMPFILE preference applies on both code paths. handlers/ and tasks/ each lose ~110 lines; the `bytes.Buffer`-grow path is now the canonical one (the older fixed pre-alloc is gone). Existing tests carried over verbatim under the new package name. |
+
+### Closed in `feat/p2-async-external-facade` (v0.7.0 + 5)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-45 | API design | New async endpoint `POST /process/async` mirrors the synchronous External facade's input shape (raw body + Content-Type + optional X-Filename). New `tasks.PayloadFromExternalRequest` reuses the same spool + MIME-resolver path the sync handler uses so dispatch lands on the same engine either way. The handler (`Async.SubmitProcess`) is mounted alongside the sync `PUT /process` when `tasks.enabled: true`. Status/Result endpoints under the docling prefix already serve every facade (the TaskID is opaque), so the operator surface stays compact. Three unit tests pin the early-return contract (missing Content-Type, orchestrator disabled, no engine for external facade). Closes the facade-asymmetry C-45 flagged. |
+
+### Closed in `feat/p2-engine-paths-map` (v0.7.0 + 6, breaking change → v0.8.0)
+
+| ID  | Lens | Resolution |
+|-----|------|------------|
+| C-33 | Plugin SDK | `EnginePathsConfig` collapses from a fixed compat-prefixed struct (`docling_convert_file`, `external_process`, `tika_text`, …) into `map[string]string`. Adapter packages now own their key constants (`docling.PathConvertFile`, `docling.PathConvertSource`, `external.PathProcess`, `tika.PathText`). The previous N×M growth surface (each new compat type added M fields; each new path-key axis added N fields) reduces to zero schema cells per axis — out-of-tree adapters declare their own keys without touching `internal/config/config.go`. Breaking change — operators previously setting `paths.docling_convert_file: ...` must rename to `paths.convert_file: ...`. Migration recipe documented in `docs/MIGRATION-v0.8.0.md`; the change is the only breaking item slated for v0.8.0 so the migration cost stays bounded. |
+
+### P2 (backlog) — remaining
 
 A subset, ordered by likely ROI:
 
-- **C-33** `EnginePathsConfig` is a per-compat grab-bag struct that N×M-explodes; replace with `Paths map[string]string` per-engine. [Plugin SDK]
-- **C-34** No `topologySpreadConstraints` in chart; both replicas can land on the same node, defeating the PDB. [Helm]
-- **C-35** No OpenAPI/AsyncAPI spec — the single largest UX gap for client teams. [API design]
-- **C-36** No `values.schema.json` for the Helm chart; operator typos reach the cluster silently. [Helm]
-- **C-37** Body-limit middleware (`bodylimit.go`) has zero tests; ratelimit + timeout middleware same. [QA]
-- **C-38** Tasks duplicate spool implementation (`tasks/spool.go` vs `handlers/spool.go`) — unify into `internal/spool/`. [Backend]
-- **C-39** `Recover` middleware logs `Bytes("stack", debug.Stack())` which emits base64 in JSON; should be `Str(...)`. Add `panics_total` counter. [Observability]
-- **C-40** Composition root `app.go` is 444 lines and growing; extract observability adapters + bootstrap loggers. [Architecture]
-- **C-41** `docs/README.md` routing section still describes v0.2.x; doesn't mention `routing.strategy` or `extensions`. [DX]
-- **C-42** Helm chart values lack `routing.strategy`, `engines.*.extensions`, `mimedetect.extension_overrides` stubs. [Helm]
-- **C-43** Gateway API overlay has HTTP-only listener (no TLS); ingress-nginx overlay has TLS — parity gap. [Helm]
-- **C-44** SSRF policy doesn't pin the validated IP through to the dial; the engine adapter re-resolves by hostname → TOCTOU window. [Security]
-- **C-45** Async path supports only docling facade (`/v1/convert/*/async`); external `/process/async` is missing — facade asymmetry. [API design]
+- **C-35** No OpenAPI/AsyncAPI spec — the single largest UX gap for client teams. (Deferred to roadmap pending appetite for a >sprint-scale effort.) [API design]
 
 ---
 

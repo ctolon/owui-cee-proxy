@@ -18,6 +18,7 @@ import (
 
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
+	"github.com/ctolon/owui-cee-proxy/internal/spool"
 )
 
 // TypeConvert is the asynq task type for engine convert jobs.
@@ -108,12 +109,12 @@ func payloadFromMultipart(r *http.Request, maxBlob int64, resolver *mimedetect.R
 			// Spool to memory (small) or temp file (large). H1 + H2:
 			// the per-blob cap is enforced BEFORE the bytes are written
 			// past the threshold — fail fast.
-			sr, err := spoolPart(part, asyncSpoolThreshold, maxBlob)
+			sr, err := spool.Part(part, asyncSpoolThreshold, maxBlob)
 			fname := part.FileName()
 			declaredCT := part.Header.Get("Content-Type")
 			_ = part.Close()
 			if err != nil {
-				if errors.Is(err, errSpoolTooLarge) {
+				if errors.Is(err, spool.ErrTooLarge) {
 					return nil, noop, fmt.Errorf("blob %q exceeds max_blob_bytes %d", fname, maxBlob)
 				}
 				return nil, noop, fmt.Errorf("copy part: %w", err)
@@ -168,6 +169,63 @@ func payloadFromMultipart(r *http.Request, maxBlob int64, resolver *mimedetect.R
 	}
 	// Stash buffers in payload via temporary field (filled in Enqueue).
 	attachLocalBlobs(p, bufs)
+	return p, noop, nil
+}
+
+// PayloadFromExternalRequest parses an async submission shaped like
+// the synchronous external facade: raw body + Content-Type header
+// (drives engine selection) + optional X-Filename. Produces a single-
+// blob Payload whose Facade is set to FacadeExternal by the caller.
+//
+// resolver MUST be non-nil. The async path applies the same
+// declared → sniff → filename-extension MIME contract as the sync
+// External handler so dispatch lands on the same engine either way.
+// maxBlob caps the body (0 disables; the global BodyLimit middleware
+// is the request-wide ceiling).
+func PayloadFromExternalRequest(r *http.Request, filename string, maxBlob int64, resolver *mimedetect.Resolver) (*Payload, func(), error) {
+	declaredCT := r.Header.Get("Content-Type")
+	if declaredCT == "" {
+		return nil, noop, errors.New("missing Content-Type")
+	}
+	if filename == "" {
+		filename = "upload"
+	}
+
+	// Drain the body through the spool so we get the same heap-
+	// pressure budget as the sync path. After drain we still need
+	// the bytes in-memory for Redis SET, so we re-buffer.
+	sr, err := spool.Part(r.Body, asyncSpoolThreshold, maxBlob)
+	if err != nil {
+		if errors.Is(err, spool.ErrTooLarge) {
+			return nil, noop, fmt.Errorf("blob %q exceeds max_blob_bytes %d", filename, maxBlob)
+		}
+		return nil, noop, fmt.Errorf("read body: %w", err)
+	}
+	buf := &bytes.Buffer{}
+	if _, err := io.Copy(buf, sr); err != nil {
+		_ = sr.Close()
+		return nil, noop, fmt.Errorf("drain spool: %w", err)
+	}
+	_ = sr.Close()
+
+	resolvedCT := declaredCT
+	if resolver != nil {
+		head := buf.Bytes()
+		if len(head) > asyncSniffHeadBytes {
+			head = head[:asyncSniffHeadBytes]
+		}
+		resolvedCT = resolver.Resolve(declaredCT, head, filename).MIME
+	}
+
+	p := &Payload{
+		BlobKeys: []BlobRef{{
+			Filename:    filename,
+			ContentType: resolvedCT,
+			Size:        int64(buf.Len()),
+		}},
+		Options: map[string]string{},
+	}
+	attachLocalBlobs(p, []*bytes.Buffer{buf})
 	return p, noop, nil
 }
 

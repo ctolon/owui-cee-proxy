@@ -2,6 +2,13 @@
 // concrete adapter implementations and returns a runnable Application.
 // The HTTP transport, async worker, and observability subsystems all
 // receive their dependencies through this single seam.
+//
+// File split (kept inside the same package so no exported API moves):
+//   - app.go        : Application lifecycle (Build / Run / shutdown) +
+//     buildRegistry + newAdapterByCompat.
+//   - adapters.go   : The cross-layer observability bridges (auth /
+//     SSRF / task lifecycle / health / panic / upstream).
+//   - bootstrap.go  : Startup log emitters + the breaker state hook.
 package app
 
 import (
@@ -16,7 +23,6 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/breaker"
 	"github.com/ctolon/owui-cee-proxy/internal/config"
 	"github.com/ctolon/owui-cee-proxy/internal/engine"
-	"github.com/ctolon/owui-cee-proxy/internal/engine/authutil"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/docling"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/doclingexternal"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compat/external"
@@ -104,6 +110,7 @@ func Build(ctx context.Context, cfg *config.Config) (*Application, error) {
 		HealthMetrics:    &healthMetricsAdapter{m: metrics},
 		MimeResolver:     mimeResolver,
 		EngineTransports: engineTransports,
+		PanicRecorder:    &panicRecorderAdapter{m: metrics},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("router: %w", err)
@@ -184,188 +191,6 @@ func buildRegistry(cfg *config.Config, logger zerolog.Logger, metrics *observabi
 		return nil, nil, err
 	}
 	return reg, transports, nil
-}
-
-// logEngineBootstrap emits one info line per enabled engine + one warn
-// per non-fatal misconfiguration discovered at load time. Operators see
-// these in `kubectl logs` immediately after a rollout; together they
-// answer "did my Secret reach the Pod?" without per-request log
-// archaeology.
-func logEngineBootstrap(logger zerolog.Logger, cfg *config.Config) {
-	for name, ec := range cfg.Engines {
-		if !ec.Enable {
-			continue
-		}
-		facades := config.AcceptedFacades(ec.CompatType)
-		logger.Info().
-			Str("event", "engine_initialised").
-			Str("engine", name).
-			Str("compat_type", string(ec.CompatType)).
-			Str("url", ec.URL).
-			Str("api_key_env", ec.APIKeyEnv).
-			Bool("api_key_resolved", ec.APIKey != "").
-			Int("api_key_len", len(string(ec.APIKey))).
-			Str("auth_header", ec.AuthHeader).
-			Str("auth_scheme", string(ec.AuthScheme)).
-			Strs("facades", facades).
-			Int("mime_types_count", len(ec.MimeTypes)).
-			Int("extensions_count", len(ec.Extensions)).
-			Msg("engine initialised")
-	}
-	for _, w := range cfg.AuthWarnings() {
-		logger.Warn().
-			Str("event", "engine_auth_warning").
-			Msg(w)
-	}
-}
-
-// logRoutingBootstrap emits a single record describing the effective
-// routing strategy + the number of operator-supplied MIME extension
-// overrides. Surface so operators can verify the YAML knobs landed
-// without diffing a logback config.
-func logRoutingBootstrap(logger zerolog.Logger, cfg *config.Config, reg engine.Registry, overrideCount int) {
-	logger.Info().
-		Str("event", "routing_strategy_initialised").
-		Str("configured_strategy", string(cfg.Routing.Strategy)).
-		Str("effective_strategy", string(reg.Strategy())).
-		Str("default_engine", cfg.Routing.DefaultEngine).
-		Int("mime_extension_overrides_count", overrideCount).
-		Msg("routing strategy initialised")
-}
-
-// breakerStateHook returns the OnStateChange callback bound to the
-// project's Prometheus gauge + structured logger. Lives here at the
-// composition root so internal/breaker stays observability-agnostic.
-//
-// The hook is purely additive: it does NOT influence the breaker's
-// state machine, only surfaces transitions to operators. Logged at
-// info level — half-open → open transitions warrant an alert
-// dashboard, not a paging line.
-func breakerStateHook(logger zerolog.Logger, metrics *observability.Metrics) breaker.StateChangeFunc {
-	return func(name, from, to string) {
-		if metrics != nil && metrics.BreakerStateGauge != nil {
-			metrics.BreakerStateGauge.WithLabelValues(name).Set(breaker.StateValue(to))
-		}
-		logger.Info().
-			Str("event", "breaker_state_changed").
-			Str("engine", name).
-			Str("from", from).
-			Str("to", to).
-			Msg("circuit breaker state changed")
-	}
-}
-
-// authMetricsAdapter bridges the authutil.AuthMetrics interface to
-// the Prometheus counter. Lives here (composition root) so the
-// engine/authutil package stays Prometheus-agnostic.
-type authMetricsAdapter struct{ m *observability.Metrics }
-
-func (a *authMetricsAdapter) RecordAuthAttempt(engineName, scheme string, outcome authutil.Outcome) {
-	if a.m == nil || a.m.EngineAuthAttached == nil {
-		return
-	}
-	a.m.EngineAuthAttached.WithLabelValues(engineName, scheme, string(outcome)).Inc()
-}
-
-// ssrfMetricsAdapter bridges handlers.SSRFMetrics to the SSRFRejected
-// + SSRFDNSCache Prometheus counters. The handlers package stays
-// metric-agnostic; metric label values come from the typed
-// SSRFRejectReason taxonomy.
-type ssrfMetricsAdapter struct{ m *observability.Metrics }
-
-func (s *ssrfMetricsAdapter) RecordRejection(reason handlers.SSRFRejectReason) {
-	if s.m == nil || s.m.SSRFRejected == nil {
-		return
-	}
-	s.m.SSRFRejected.WithLabelValues(string(reason)).Inc()
-}
-
-func (s *ssrfMetricsAdapter) RecordDNSCacheHit() {
-	if s.m == nil || s.m.SSRFDNSCache == nil {
-		return
-	}
-	s.m.SSRFDNSCache.WithLabelValues("hit").Inc()
-}
-
-func (s *ssrfMetricsAdapter) RecordDNSCacheMiss() {
-	if s.m == nil || s.m.SSRFDNSCache == nil {
-		return
-	}
-	s.m.SSRFDNSCache.WithLabelValues("miss").Inc()
-}
-
-func (s *ssrfMetricsAdapter) RecordDNSCacheBypass() {
-	if s.m == nil || s.m.SSRFDNSCache == nil {
-		return
-	}
-	s.m.SSRFDNSCache.WithLabelValues("bypass").Inc()
-}
-
-// ssrfLoggerAdapter writes a warn-level log line for every SSRF
-// rejection. The raw URL is logged as-is (not redacted) because it
-// is operator-facing audit data; the reason is what dashboards
-// alert on, not the URL.
-type ssrfLoggerAdapter struct{ logger zerolog.Logger }
-
-func (l *ssrfLoggerAdapter) LogRejection(host, raw string, reason handlers.SSRFRejectReason, err error) {
-	ev := l.logger.Warn().
-		Str("event", "ssrf_rejected").
-		Str("reason", string(reason)).
-		Str("host", host).
-		Str("url", raw)
-	if err != nil {
-		ev = ev.Err(err)
-	}
-	ev.Msg("SSRF policy rejected URL")
-}
-
-// taskLifecycleAdapter bridges tasks.LifecycleRecorder to the
-// TaskLifecycle Prometheus counter.
-type taskLifecycleAdapter struct{ m *observability.Metrics }
-
-func (a *taskLifecycleAdapter) RecordTaskLifecycle(stage, outcome string) {
-	if a.m == nil || a.m.TaskLifecycle == nil {
-		return
-	}
-	a.m.TaskLifecycle.WithLabelValues(stage, outcome).Inc()
-}
-
-// queueDepthAdapter bridges tasks.QueueDepthRecorder to the
-// WorkerQueueDepth gauge.
-type queueDepthAdapter struct{ m *observability.Metrics }
-
-func (a *queueDepthAdapter) SetQueueDepth(queue string, depth int) {
-	if a.m == nil || a.m.WorkerQueueDepth == nil {
-		return
-	}
-	a.m.WorkerQueueDepth.WithLabelValues(queue).Set(float64(depth))
-}
-
-// healthMetricsAdapter bridges handlers.HealthMetrics to the
-// HealthProbeTotal + HealthProbeDuration collectors.
-type healthMetricsAdapter struct{ m *observability.Metrics }
-
-func (h *healthMetricsAdapter) RecordHealthProbe(engineName, status string, dur time.Duration) {
-	if h.m == nil {
-		return
-	}
-	if h.m.HealthProbeTotal != nil {
-		h.m.HealthProbeTotal.WithLabelValues(engineName, status).Inc()
-	}
-	if h.m.HealthProbeDuration != nil {
-		h.m.HealthProbeDuration.WithLabelValues(engineName).Observe(dur.Seconds())
-	}
-}
-
-// upstreamStatusAdapter bridges httpclient.UpstreamStatusRecorder to
-// the EngineUpstreamStatus counter. Same rationale as above.
-type upstreamStatusAdapter struct{ m *observability.Metrics }
-
-func (u *upstreamStatusAdapter) RecordUpstreamStatus(engineName string, status int) {
-	if u.m == nil || u.m.EngineUpstreamStatus == nil {
-		return
-	}
-	u.m.EngineUpstreamStatus.WithLabelValues(engineName, observability.StatusClass(status)).Inc()
 }
 
 func newAdapterByCompat(name engine.Name, ec config.EngineConfig, client *httpclient.Client, br *breaker.Breaker) (engine.Engine, error) {

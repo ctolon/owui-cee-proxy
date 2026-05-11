@@ -3,6 +3,21 @@ kind: HTTPRoute
 metadata:
   name: owui-cee-proxy
 spec:
+  # No sectionName → this route attaches to every listener on the
+  # parent Gateway whose hostnames intersect ours. With the http +
+  # https listeners on owui-cee-gateway, the same matchers serve
+  # plain HTTP on :80 AND TLS-terminated HTTPS on :443.
+  #
+  # For strict-HTTPS deployments: change parentRefs to
+  #   - name: owui-cee-gateway
+  #     sectionName: https
+  # and ship a sibling HTTPRoute attached to sectionName=http that
+  # rewrites every request with a filter:
+  #   filters:
+  #     - type: RequestRedirect
+  #       requestRedirect:
+  #         scheme: https
+  #         statusCode: 301
   parentRefs:
     - name: owui-cee-gateway
   hostnames:

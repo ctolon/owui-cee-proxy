@@ -21,6 +21,7 @@ import (
 	"github.com/ctolon/owui-cee-proxy/internal/engine/compatutil"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/mimedetect"
 	"github.com/ctolon/owui-cee-proxy/internal/engine/respond"
+	"github.com/ctolon/owui-cee-proxy/internal/spool"
 	mw "github.com/ctolon/owui-cee-proxy/internal/transport/http/middleware"
 )
 
@@ -269,11 +270,11 @@ func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, fun
 			// global BodyLimit middleware already bounds the request
 			// stream, so this only adds the per-part overflow guard.
 			declaredCT := part.Header.Get("Content-Type")
-			sr, err := spoolPart(part, spoolThresholdDefault, maxFilePartBytes)
+			sr, err := spool.Part(part, spool.ThresholdDefault, maxFilePartBytes)
 			_ = part.Close()
 			if err != nil {
 				cleanup()
-				if errors.Is(err, ErrSpoolTooLarge) {
+				if errors.Is(err, spool.ErrTooLarge) {
 					return nil, noop, fmt.Errorf("file %q too large", part.FileName())
 				}
 				return nil, noop, fmt.Errorf("read part %q: %w", part.FormName(), err)
@@ -305,7 +306,7 @@ func (c *Convert) buildFileRequest(r *http.Request) (*engine.ConvertRequest, fun
 					Str("resolved_mime", resolved.MIME).
 					Str("mime_source", string(resolved.Source)).
 					Int64("size_bytes", sr.Size()).
-					Bool("spilled_to_disk", sr.Size() > spoolThresholdDefault).
+					Bool("spilled_to_disk", sr.Size() > spool.ThresholdDefault).
 					Msg("multipart part received")
 			}
 
@@ -380,17 +381,61 @@ func (c *Convert) resolveURL() func(string) (*ResolvedURL, error) {
 }
 
 // validateSources blocks SSRF-prone targets unless the operator has
-// explicitly whitelisted them. The default allowlist is "external
-// only", i.e. not RFC1918, not loopback, not link-local, not the
-// cloud metadata IP. The resolved IP is recorded on the source URL
-// (as part of validation) but the actual outbound dial happens later
-// inside the engine adapter; B1's fix ships in a follow-up wave that
-// threads the *http.Transport through this layer.
+// explicitly whitelisted them, and PINS each source URL to the IP
+// the validator resolved so the engine backend cannot fall through a
+// fresh DNS lookup at dial time — that lookup is the TOCTOU window
+// (C-44 from REVIEW-FAANG.md): a DNS-rebinding attacker returns a
+// public IP for the validation lookup and an RFC1918 IP for the
+// backend's fetch.
+//
+// Mutation rules:
+//
+//   - srcs[i].URL is rewritten to use the resolved IP literal; the
+//     URL's path / scheme / port / query are preserved verbatim.
+//   - srcs[i].Headers["Host"] is set to the original hostname so the
+//     backend's HTTP client sends the virtual-host header and
+//     TLS-aware engines can attempt SNI on the original hostname.
+//   - The original URL stays in the access log via the unchanged
+//     request_id correlation, so operators can audit "what was the
+//     hostname the caller submitted vs what IP did we pin to".
+//
+// Backends that respect the forwarded `Host` header (Docling Serve,
+// Tika, Kreuzberg all do) get the right TLS / vhost behaviour.
+// Backends that ignore it still dial the validated IP, which is the
+// security-critical guarantee.
 func (c *Convert) validateSources(srcs []engine.HTTPSource) error {
 	resolve := c.resolveURL()
-	for _, s := range srcs {
-		if _, err := resolve(s.URL); err != nil {
+	for i := range srcs {
+		s := &srcs[i]
+		resolved, err := resolve(s.URL)
+		if err != nil {
 			return fmt.Errorf("source %q rejected: %w", s.URL, err)
+		}
+		if resolved == nil || resolved.IP == nil || resolved.URL == nil {
+			continue
+		}
+		// Build the IP-pinned URL: replace Host with the literal IP
+		// (bracketed for IPv6); preserve port if the original had one.
+		pinned := *resolved.URL
+		hostLit := resolved.IP.String()
+		if ip := resolved.IP; ip.To4() == nil { // IPv6 → bracket
+			hostLit = "[" + hostLit + "]"
+		}
+		if resolved.Port != "" {
+			pinned.Host = hostLit + ":" + resolved.Port
+		} else {
+			pinned.Host = hostLit
+		}
+		s.URL = pinned.String()
+		if s.Headers == nil {
+			s.Headers = map[string]string{}
+		}
+		// Preserve the original hostname (no port) so the backend
+		// can stamp Host + SNI correctly. Caller-supplied Host
+		// header (rare) wins over our default — operators who
+		// override know what they're doing.
+		if _, ok := s.Headers["Host"]; !ok {
+			s.Headers["Host"] = resolved.Host
 		}
 	}
 	return nil

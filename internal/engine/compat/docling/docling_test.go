@@ -130,7 +130,7 @@ func TestDocling_Convert_PathOverride(t *testing.T) {
 	defer srv.Close()
 
 	a := newDoclingAdapter(t, srv.URL, func(c *config.EngineConfig) {
-		c.Paths = config.EnginePathsConfig{DoclingConvertFile: "/api/v2/extract"}
+		c.Paths = config.EnginePathsConfig{docling.PathConvertFile: "/api/v2/extract"}
 	})
 
 	resp, err := a.Convert(context.Background(), &engine.ConvertRequest{

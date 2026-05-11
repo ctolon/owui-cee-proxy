@@ -60,10 +60,11 @@ plus the matching `test-proxy-config.yaml`.
 
 ## How engine selection works
 
-Each engine declares a `compat_type` and a list of `mime_types`. The
-registry filters candidates by **inbound facade** first (only engines
-whose `Capabilities().Facades` includes the inbound facade are
-eligible) and then by MIME.
+Each engine declares a `compat_type` and (optionally) MIME +
+extension allowlists. The registry filters candidates by **inbound
+facade** first (only engines whose `Capabilities().Facades` includes
+the inbound facade are eligible) and then dispatches via the
+configured **routing strategy** (v0.5.0+).
 
 | compat_type        | Backend speaks                                       | Reachable via facade(s)        |
 |--------------------|------------------------------------------------------|---------------------------------|
@@ -72,19 +73,81 @@ eligible) and then by MIME.
 | `docling-external` | both endpoints (separate paths) on same backend      | docling **and** external        |
 | `tika`             | Tika `PUT /tika/text` raw + proprietary JSON         | docling **and** external (proxy adapts) |
 
-For multipart uploads the **first uploaded file's `Content-Type`**
-is matched against each non-default enabled engine's `mime_types`
-list. For `PUT /process` the inbound `Content-Type` header IS the
-file's MIME. First match wins; otherwise `routing.default_engine`
-catches the request (it must support the facade).
+### Routing strategies (v0.5.0+)
 
-Patterns may be exact (`application/pdf`) or top-level wildcards
-(`image/*`). Matching is case-insensitive and ignores params (e.g.
-`; charset=utf-8`).
+`routing.strategy` controls how the registry picks an engine from the
+first uploaded file's MIME + filename:
 
-`/v1/convert/source` JSON requests have no MIME hint at dispatch time
-(the proxy never dereferences URLs server-side), so they always use
-the default engine.
+| Strategy                | Match order                                              |
+|-------------------------|----------------------------------------------------------|
+| `mime`                  | MIME allowlist only                                      |
+| `extension`             | filename-extension allowlist only                        |
+| `mime_then_extension`   | MIME first; extension fallback (DEFAULT, v0.4.x parity)  |
+| `extension_then_mime`   | extension first; MIME fallback                           |
+
+Each non-default engine declares optional allowlists:
+
+- `engines.<name>.mime_types` — exact matches and `type/*` wildcards
+- `engines.<name>.extensions` — case-insensitive, leading dot
+  optional (`".pdf"` / `"pdf"` / `".PDF"` all canonicalise to `.pdf`)
+
+First match wins; `routing.default_engine` is the catch-all when no
+allowlist matches. Empty `routing.strategy` resolves to
+`mime_then_extension`, so v0.4.x configs preserve their MIME-only
+behaviour.
+
+### MIME resolution (v0.5.0+)
+
+A **resolution stage** runs in front of dispatch: it sniffs magic
+bytes when the client's declared Content-Type is generic
+(`application/octet-stream`, `binary/octet-stream`, empty), then
+falls back to the filename extension when the sniff is generic or
+CFB-ambiguous. The built-in 10-entry extension map covers
+`.msg/.doc/.xls/.ppt/.docx/.xlsx/.pptx/.eml/.csv/.tsv`. Operators
+extend or replace entries via `mimedetect.extension_overrides` in
+YAML.
+
+This is what fixed the long-standing `.msg` HTTP 400 bug: Outlook MSG
+files share the Compound File Binary header with `.doc/.xls/.ppt`,
+so `mimetype.Detect` collapsed them all to
+`application/vnd.ms-powerpoint`. The proxy now disambiguates by
+filename → routes `.msg` to engines that declare
+`application/vnd.ms-outlook` in `mime_types`.
+
+### Multi-stamp auth headers (v0.5.0+)
+
+Engines that need multiple credential headers
+(e.g., `X-Api-Key` AND `Authorization: Bearer ...`) declare them via
+`engines.<name>.auth_headers` — a list of `{header, api_key_env,
+scheme}` entries. The singular `auth_header` / `api_key_env` /
+`auth_scheme` triple remains valid and is automatically prepended.
+Duplicate header names across the two forms fail the bootstrap.
+
+### Engine fallback (v0.7.0+)
+
+`routing.fallback.enabled: true` enables a single-step retry: when
+the primary engine returns a 5xx or a transport-level error, the
+proxy retries against the registry's default engine. Body rewind via
+`io.Seeker`; any non-seekable body aborts the fallback so we never
+half-send. Off by default to preserve the legacy "errors propagate"
+contract.
+
+### Async idempotency (v0.6.0+)
+
+`POST /v1/convert/file/async` and `/v1/convert/source/async` honour
+the `Idempotency-Key` header. Submitting the same key twice within
+`tasks.result_ttl` returns the SAME task token; the engine work
+runs once. Keyed on `sha256(api_key) + sha256(idem)` so two tenants
+never collide on the same opaque string.
+
+### Source mode
+
+`/v1/convert/source` JSON requests have no upload signal at dispatch
+time, so they always use the default engine. With v0.7.0+ SSRF the
+proxy ALSO rewrites the source URL to the validated IP literal
+(original hostname kept in `Headers["Host"]`) — closes the DNS-
+rebinding TOCTOU window between the proxy's validation and the
+backend's dial.
 
 ## Configuration
 
